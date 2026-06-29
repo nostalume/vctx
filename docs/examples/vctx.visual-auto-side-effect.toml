@@ -1,0 +1,21 @@
+# vctx visual side-effect smoke template.
+# OCR intentionally uses RapidOCR's auto/default behavior; no manual OCR language profile.
+# Developers/operators can put OPENROUTER_API_KEY in a local .env for optional VLM descriptions.
+# .env is gitignored; do not commit real credentials.
+
+[runtime]
+workflow = "visual"
+cache_dir = ".cache/vctx-visual-smoke"
+env_files = [".env"]
+
+[source.yt_dlp]
+media_profile = "balanced"
+# Source acquisition preference only; not OCR translation.
+subtitle_languages = ["en", "ja", "zh-Hans", "zh-Hant"]
+
+[transforms.visual_context]
+enabled = "true"
+# OCR remains local RapidOCR auto/default when rapidocr is installed.
+# VLM is separate and optional; auto only resolves when policy, network, upload, and key allow it.
+model = "auto"
+# model = "openrouter:<vision-model-id>"
