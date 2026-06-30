@@ -4,6 +4,35 @@
 
 It is for people and agents who want source-grounded video context without a chat app, RAG stack, or hidden model workflow.
 
+## Install
+
+From PyPI with uv:
+
+```bash
+uv tool install "vctx[full]"
+```
+
+`[full]` is the recommended install for normal users; it includes local ASR and visual/OCR extras. Smaller installs are available when you only need part of the stack:
+
+```bash
+uv tool install vctx            # minimal transcript/URL workflows
+uv tool install "vctx[asr]"     # minimal + local faster-whisper ASR
+uv tool install "vctx[visual]"  # minimal + local OCR/visual extras
+```
+
+Then run:
+
+```bash
+vctx prepare INPUT --out DIR
+```
+
+For one-off use without installing the tool globally:
+
+```bash
+uvx vctx prepare INPUT --out DIR
+uvx --from "vctx[full]" vctx prepare INPUT --out DIR
+```
+
 ## Install for development
 
 ```bash
