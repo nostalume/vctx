@@ -33,6 +33,121 @@ Whitespace/path gate before commit:
 git diff --check -- docs src tests scripts pyproject.toml uv.lock
 ```
 
+
+## GitHub Actions CI
+
+The repository CI is defined in:
+
+```text
+.github/workflows/ci.yml
+```
+
+It uses the official uv setup action instead of hand-installing uv:
+
+```yaml
+- uses: astral-sh/setup-uv@v7
+  with:
+    python-version: "3.14"
+    enable-cache: true
+```
+
+CI runs on pushes to `main` and pull requests:
+
+```bash
+uv sync --locked --dev
+uv run python scripts/check_module_layout.py
+uv run ruff check .
+uv run ty check .
+uv run pytest -q -W error::DeprecationWarning
+uv build
+```
+
+Keep this aligned with the local full gate. If local verification changes, update CI in the same slice.
+
+## Publishing to PyPI
+
+The publish workflow is defined in:
+
+```text
+.github/workflows/publish.yml
+```
+
+It runs on:
+
+```text
+published GitHub releases
+version tags matching v*
+```
+
+The publish job repeats the quality gate, builds distributions, then publishes with uv:
+
+```bash
+uv build
+uv publish --trusted-publishing always
+```
+
+### Recommended PyPI authentication: trusted publishing
+
+This repo is configured for PyPI trusted publishing through GitHub OIDC. The workflow grants:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+```
+
+No PyPI API token is needed when trusted publishing is configured on PyPI.
+
+Configure it in PyPI:
+
+1. Open the PyPI project page for `vctx`.
+2. Go to project settings / publishing.
+3. Add a trusted publisher for GitHub Actions.
+4. Use this repository owner/name.
+5. Use workflow filename:
+
+```text
+publish.yml
+```
+
+6. Use environment name:
+
+```text
+pypi
+```
+
+The GitHub workflow job also declares:
+
+```yaml
+environment: pypi
+```
+
+If the PyPI project does not exist yet, create it with the first release path PyPI currently supports for trusted publishers, or publish once with an API token and then add the trusted publisher.
+
+### Alternative: PyPI API token secret
+
+Only use this if trusted publishing is unavailable.
+
+1. Create a PyPI API token, preferably scoped to the `vctx` project.
+2. In GitHub, open repository settings.
+3. Go to Secrets and variables -> Actions.
+4. Add a repository secret such as:
+
+```text
+PYPI_API_TOKEN
+```
+
+5. Change the publish step to:
+
+```yaml
+- name: Publish distributions to PyPI
+  env:
+    UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+  run: uv publish
+```
+
+Do not commit PyPI tokens, `.pypirc`, or secret values.
+
 ## Git hygiene
 
 Commit code/docs/tests only.
