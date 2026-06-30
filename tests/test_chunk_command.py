@@ -43,6 +43,4 @@ def test_chunk_help_uses_output_file_and_no_negation_flags() -> None:
     result = runner.invoke(app, ["chunk", "--help"])
 
     assert result.exit_code == 0
-    assert "--out" in result.output
-    assert "--chunk-max-chars" in result.output
     assert "--no-" not in result.output

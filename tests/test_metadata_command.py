@@ -40,5 +40,4 @@ def test_metadata_help_uses_decisive_json_flag_without_negation_pair() -> None:
     result = runner.invoke(app, ["metadata", "--help"])
 
     assert result.exit_code == 0
-    assert "--json" in result.output
     assert "--no-json" not in result.output

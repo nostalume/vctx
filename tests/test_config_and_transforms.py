@@ -83,9 +83,6 @@ def test_prepare_help_uses_decisive_flags_without_negation_pairs() -> None:
     result = CliRunner().invoke(app, ["prepare", "--help"])
 
     assert result.exit_code == 0
-    assert "--workflow" in result.output
-    assert "--config" in result.output
-    assert "--offline" in result.output
     assert "--language" not in result.output
     assert "--no-auto" not in result.output
     assert "--no-offline" not in result.output

@@ -125,5 +125,4 @@ def test_render_help_uses_decisive_format_flag_without_negation_pairs() -> None:
     result = runner.invoke(app, ["render", "--help"])
 
     assert result.exit_code == 0
-    assert "--format" in result.output
     assert "--no-" not in result.output

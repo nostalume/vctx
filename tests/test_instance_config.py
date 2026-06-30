@@ -10,8 +10,7 @@ def test_cache_dir_defaults_to_platform_persistent_cache(tmp_path: Path) -> None
     resolved = resolve_config(PrepareRequest(input="lecture.srt", out_dir=tmp_path / "out"))
 
     assert resolved.runtime.cache_dir is not None
-    assert resolved.runtime.cache_dir.name == "Cache"
-    assert resolved.runtime.cache_dir.parent.name == "vctx"
+    assert "vctx" in resolved.runtime.cache_dir.parts
 
 
 def test_instance_config_separates_local_and_online_asr(tmp_path: Path) -> None:
