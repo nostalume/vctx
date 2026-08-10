@@ -110,6 +110,54 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     assert "Provide a transcript file" in "\n".join(manifest["warnings"])
 
 
+def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import vctx.sources.ytdlp_source as module
+
+    monkeypatch.setattr(
+        module.yt_dlp,
+        "YoutubeDL",
+        lambda _params: pytest.fail("offline source admission attempted network access"),
+    )
+    out_dir = tmp_path / "out"
+    cache_dir = tmp_path / "cache"
+
+    result = runner.invoke(
+        app,
+        [
+            "prepare",
+            "https://video.example/watch?v=offline",
+            "--out",
+            str(out_dir),
+            "--offline",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+
+    assert result.exit_code == 6
+    assert "offline URL cache miss" in result.output
+    assert not out_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_prepare_offline_accepts_local_input(tmp_path: Path) -> None:
+    source = tmp_path / "local.srt"
+    source.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nlocal only\n", encoding="utf-8"
+    )
+    out_dir = tmp_path / "out"
+
+    result = runner.invoke(
+        app, ["prepare", str(source), "--out", str(out_dir), "--offline"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "transcript.clean.json").exists()
+
+
 def _step_status(manifest: dict[str, Any], name: str) -> str:
     steps = manifest["steps"]
     assert isinstance(steps, list)
