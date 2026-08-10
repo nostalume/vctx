@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from vctx.app.models import ModelLifecycleError, require_prepared_model
 from vctx.config import AsrInstanceConfig
 from vctx.models.media import MediaAsset
 from vctx.net import NetRequest, NetResponse, NetRuntime, UrllibNetRuntime
@@ -57,6 +58,18 @@ class FasterWhisperAsrAdapter:
 
     def transcribe(self, media_asset: MediaAsset) -> TranscriptPayload:
         model_id = self._model_id()
+        model_path = Path(model_id)
+        if not model_path.is_absolute() and not model_path.exists():
+            try:
+                receipt = require_prepared_model("asr", self.cache_root, asr_model_id=model_id)
+            except ModelLifecycleError as exc:
+                raise AsrExecutionError(str(exc)) from exc
+            if receipt.model_id != model_id:
+                raise AsrExecutionError(
+                    f"prepared ASR model is {receipt.model_id}, but {model_id} was selected; "
+                    "run: vctx models pull asr"
+                )
+            model_id = str(self.cache_root / receipt.cache_path)
         model_kwargs = self._model_kwargs(model_id)
         module = self._load_faster_whisper()
         try:
@@ -109,7 +122,7 @@ class FasterWhisperAsrAdapter:
                 f"Cache path: {model_cache}. Original error: {exc}"
             ) from exc
         kwargs["download_root"] = str(model_cache)
-        kwargs["local_files_only"] = self.offline
+        kwargs["local_files_only"] = True
         return kwargs
 
     def _load_faster_whisper(self) -> Any:

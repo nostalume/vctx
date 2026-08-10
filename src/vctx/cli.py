@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from platformdirs import user_config_path
@@ -11,6 +11,12 @@ from platformdirs import user_config_path
 from vctx.app.chunk import write_chunk_file
 from vctx.app.doctor import doctor_report
 from vctx.app.metadata import inspect_metadata, render_metadata_text
+from vctx.app.models import (
+    ModelLifecycleError,
+    manage_models,
+    render_model_receipts,
+    resolve_asr_model_id,
+)
 from vctx.app.prepare import PrepareRequest, prepare_context_pack
 from vctx.app.render import RenderFormat, write_render_file
 from vctx.config import WorkflowProfile
@@ -18,6 +24,68 @@ from vctx.errors import VctxError
 from vctx.io import model_to_json
 
 app = typer.Typer(no_args_is_help=True)
+models_app = typer.Typer(no_args_is_help=True)
+app.add_typer(models_app, name="models")
+
+
+def _models_command(
+    action: Literal["pull", "status", "verify"],
+    capabilities: list[str] | None,
+    cache_dir: Path | None,
+    json_output: bool,
+    config: Path | None,
+    asr: str | None,
+) -> None:
+    try:
+        asr_model_id = resolve_asr_model_id(
+            config_path=_select_config_path(config), cache_dir=cache_dir, selector=asr
+        )
+        receipts = manage_models(
+            action, capabilities, cache_dir=cache_dir, asr_model_id=asr_model_id
+        )
+    except ModelLifecycleError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(exc.exit_code) from exc
+    typer.echo(render_model_receipts(receipts, json_output=json_output), nl=False)
+
+
+@models_app.command("pull")
+def models_pull_command(
+    capabilities: Annotated[
+        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
+    ] = None,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    asr: Annotated[str | None, typer.Option("--asr")] = None,
+) -> None:
+    _models_command("pull", capabilities, cache_dir, json_output, config, asr)
+
+
+@models_app.command("status")
+def models_status_command(
+    capabilities: Annotated[
+        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
+    ] = None,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    asr: Annotated[str | None, typer.Option("--asr")] = None,
+) -> None:
+    _models_command("status", capabilities, cache_dir, json_output, config, asr)
+
+
+@models_app.command("verify")
+def models_verify_command(
+    capabilities: Annotated[
+        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
+    ] = None,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    asr: Annotated[str | None, typer.Option("--asr")] = None,
+) -> None:
+    _models_command("verify", capabilities, cache_dir, json_output, config, asr)
 
 
 @app.command("prepare")
@@ -38,6 +106,28 @@ def prepare_command(
             help="Preparation workflow instance: default, transcript, visual, full, or metadata.",
         ),
     ] = None,
+    asr: Annotated[
+        str | None,
+        typer.Option("--asr", help="ASR selector: auto, none, instance:<name>, or local:<model>."),
+    ] = None,
+    ocr: Annotated[
+        str | None,
+        typer.Option("--ocr", help="OCR selector: auto or none."),
+    ] = None,
+    vision: Annotated[
+        str | None,
+        typer.Option(
+            "--vision",
+            help="Vision selector: auto, none, instance:<name>, or openrouter:<model>.",
+        ),
+    ] = None,
+    no_retain_media: Annotated[
+        bool,
+        typer.Option(
+            "--no-retain-media",
+            help="Do not retain required source media in the output pack.",
+        ),
+    ] = False,
     offline: Annotated[
         bool | None,
         typer.Option(
@@ -74,6 +164,10 @@ def prepare_command(
                 cache_dir=cache_dir,
                 keep_temp=keep_temp,
                 workflow=workflow,
+                asr_use=asr,
+                ocr_use=ocr,
+                vision_use=vision,
+                retain_media=False if no_retain_media else None,
                 offline=offline,
                 config_path=_select_config_path(config),
             )
@@ -166,8 +260,31 @@ def render_command(
 
 
 @app.command("doctor")
-def doctor_command() -> None:
-    typer.echo(doctor_report(), nl=False)
+def doctor_command(
+    workflow: Annotated[WorkflowProfile | None, typer.Option("--workflow")] = None,
+    asr: Annotated[str | None, typer.Option("--asr")] = None,
+    ocr: Annotated[str | None, typer.Option("--ocr")] = None,
+    vision: Annotated[str | None, typer.Option("--vision")] = None,
+    offline: Annotated[bool | None, typer.Option("--offline")] = None,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    typer.echo(
+        doctor_report(
+            config_path=_select_config_path(config),
+            cache_dir=cache_dir,
+            workflow=workflow,
+            asr=asr,
+            ocr=ocr,
+            vision=vision,
+            offline=offline,
+            retain_media=False if no_retain_media else None,
+            json_output=json_output,
+        ),
+        nl=False,
+    )
 
 
 def main() -> None:

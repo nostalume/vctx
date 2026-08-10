@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from pathlib import Path
 
+from vctx.app.models import ModelLifecycleError, rapidocr_config_path, require_prepared_model
 from vctx.models.visual import FrameAsset
 
 
@@ -13,7 +15,8 @@ class OcrExecutionError(RuntimeError):
 class RapidOcrAdapter:
     provider_id = "rapidocr"
 
-    def __init__(self) -> None:
+    def __init__(self, *, cache_root: Path) -> None:
+        self.cache_root = cache_root
         self._engine: Callable[[str], object] | None = None
 
     def extract_text(self, frame: FrameAsset) -> str:
@@ -32,7 +35,11 @@ class RapidOcrAdapter:
             rapid_ocr = getattr(module, "RapidOCR", None)
             if not callable(rapid_ocr):
                 raise OcrExecutionError("rapidocr does not expose callable RapidOCR")
-            engine = rapid_ocr()
+            try:
+                require_prepared_model("ocr", self.cache_root)
+            except ModelLifecycleError as exc:
+                raise OcrExecutionError(str(exc)) from exc
+            engine = rapid_ocr(config_path=str(rapidocr_config_path(self.cache_root)))
             if not callable(engine):
                 raise OcrExecutionError("rapidocr RapidOCR() did not return a callable engine")
             self._engine = engine

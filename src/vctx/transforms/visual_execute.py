@@ -21,6 +21,7 @@ def run_visual_context(
     media_asset: MediaAsset,
     out_dir: Path,
     *,
+    cache_root: Path | None = None,
     env_files: list[Path] | None = None,
 ) -> VisualRecordSet:
     frames: list[FrameAsset] = []
@@ -32,9 +33,14 @@ def run_visual_context(
         if action.name == "sample":
             frames = _extract_frames(media_asset, action, frames_dir)
         elif action.name == "ocr":
+            if cache_root is None:
+                raise VisualExecutionError("OCR execution requires the managed model cache")
             if ocr_adapter is None:
-                ocr_adapter = RapidOcrAdapter()
-            records.extend(_ocr_records(frames, ocr_adapter))
+                ocr_adapter = RapidOcrAdapter(cache_root=cache_root)
+            try:
+                records.extend(_ocr_records(frames, ocr_adapter))
+            except OcrExecutionError as exc:
+                raise VisualExecutionError(str(exc)) from exc
         elif action.name == "capture":
             records.extend(_capture_records(frames, out_dir))
         elif action.name == "describe":
@@ -60,10 +66,7 @@ def _extract_frames(
 def _ocr_records(frames: list[FrameAsset], adapter: RapidOcrAdapter) -> list[VisualRecord]:
     records: list[VisualRecord] = []
     for index, frame in enumerate(frames, start=1):
-        try:
-            text = adapter.extract_text(frame)
-        except OcrExecutionError:
-            continue
+        text = adapter.extract_text(frame)
         if not text:
             continue
         records.append(
