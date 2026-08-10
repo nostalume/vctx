@@ -16,6 +16,8 @@ ArtifactKind = Literal[
     "visual_scores",
     "knowledge_flow",
     "visual_frame",
+    "source_media",
+    "source_media_metadata",
     "manifest",
 ]
 

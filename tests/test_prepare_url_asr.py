@@ -55,8 +55,9 @@ class FakeYoutubeDLMedia:
         return self.info
 
 
+@pytest.mark.parametrize("retain_media", [True, False])
 def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, retain_media: bool
 ) -> None:
     import vctx.sources.ytdlp_source as ytdlp_module
     import vctx.transforms.asr as asr_module
@@ -104,9 +105,7 @@ model = "tiny"
     )
     out_dir = tmp_path / "out"
 
-    result = runner.invoke(
-        app,
-        [
+    args = [
             "prepare",
             "https://video.example/watch?v=no-captions",
             "--out",
@@ -115,14 +114,24 @@ model = "tiny"
             str(tmp_path / "cache"),
             "--config",
             str(config_path),
-        ],
-    )
+        ]
+    if not retain_media:
+        args.append("--no-retain-media")
+    result = runner.invoke(app, args)
 
     assert result.exit_code == 0, result.output
     manifest = cast(JsonObject, json.loads((out_dir / "manifest.json").read_text(encoding="utf-8")))
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "source.media") == "ok"
     assert _step_status(manifest, "transform.asr") == "ok"
+    receipt = cast(list[JsonObject], manifest["source_media"])[0]
+    assert receipt["retained"] is retain_media
+    if retain_media:
+        assert receipt["path"] in {
+            item["path"] for item in cast(list[JsonObject], manifest["artifacts"])
+        }
+    else:
+        assert not (out_dir / "media").exists()
     assert manifest["transform_evidence"] == [
         {
             "capability": "asr",

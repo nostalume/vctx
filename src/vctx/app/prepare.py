@@ -5,6 +5,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 
 from vctx.app.credentials import (
@@ -12,6 +13,7 @@ from vctx.app.credentials import (
     env_with_credential_presence,
     resolve_env_credential,
 )
+from vctx.app.media_retention import materialize_source_media
 from vctx.app.result import PrepareResult, PrepareSummary
 from vctx.chunking import ChunkOptions, ChunkSet, chunk_transcript
 from vctx.config import (
@@ -21,7 +23,7 @@ from vctx.config import (
     WorkflowProfile,
     resolve_config,
 )
-from vctx.errors import NoTranscriptError
+from vctx.errors import NoTranscriptError, OfflineSourceError
 from vctx.io import (
     Cache,
     build_cache,
@@ -186,6 +188,12 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
 
 def _start(request: PrepareRequest) -> Run:
     resolved = resolve_config(request)
+    adapter = detect_source_adapter(request.input)
+    if resolved.runtime.offline and adapter.name == "yt-dlp":
+        raise OfflineSourceError(
+            "offline URL cache miss: no verified source cache is available"
+        )
+
     manifest = ManifestBuilder.start(input=request.input, tool_version=vctx_version())
 
     validate_output_policy(request.out_dir, overwrite=request.overwrite)
@@ -199,7 +207,6 @@ def _start(request: PrepareRequest) -> Run:
     )
     logger.debug("prepare.output formats=%s", ",".join(resolved.output.formats))
 
-    adapter = detect_source_adapter(request.input)
     manifest.add_step("source.detect", "ok", adapter.name)
     logger.info("source.detect adapter=%s", adapter.name)
 
@@ -499,6 +506,7 @@ def _visual_plan(
         motives=visual_motives_from_cases(cases),
         available_actions=discover_visual_actions(
             run.resolved.transforms.visual_context,
+            ocr_policy=run.resolved.transforms.ocr,
             vision_instance_configs=run.resolved.instances.vision,
             ai_routes=run.visual_ai_routes(),
             offline=run.resolved.runtime.offline,
@@ -539,6 +547,7 @@ def _visual_capture(run: Run, prepared: Prepared, assessment: VisualAssessment) 
                 assessment,
                 run.media,
                 run.request.out_dir,
+                cache_root=run.cache.root,
                 env_files=run.resolved.runtime.env_files,
             )
     except VisualExecutionError as visual_exc:
@@ -629,6 +638,7 @@ def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow)
         )
         artifact_refs = write_artifact_bundle(run.request.out_dir, bundle)
         artifact_refs.extend(visuals.frames)
+        artifact_refs.extend(_retain_media(run))
         final_manifest = run.manifest.finish(status="ok", artifacts=artifact_refs)
         write_manifest(run.request.out_dir, final_manifest)
     logger.info("prepare.finish status=ok artifacts=%s", len(artifact_refs))
@@ -657,20 +667,61 @@ def _partial(run: Run) -> PrepareResult:
             content=model_to_json(run.metadata),
         ),
     )
-    final_manifest = run.manifest.finish(status="partial", artifacts=[artifact_ref])
+    artifact_refs = [artifact_ref, *_retain_media(run)]
+    final_manifest = run.manifest.finish(status="partial", artifacts=artifact_refs)
     write_manifest(run.request.out_dir, final_manifest)
-    logger.info("prepare.finish status=partial artifacts=1")
+    logger.info("prepare.finish status=partial artifacts=%s", len(artifact_refs))
     return PrepareResult(
         out_dir=run.request.out_dir,
         manifest=final_manifest,
-        artifacts=[artifact_ref],
+        artifacts=artifact_refs,
         summary=PrepareSummary.from_run(
             request=run.request,
             resolved=run.resolved,
             manifest=final_manifest,
-            artifacts=[artifact_ref],
+            artifacts=artifact_refs,
         ),
     )
+
+
+def _retain_media(run: Run) -> list[ArtifactRef]:
+    media = run.media
+    if media is None and Path(run.request.input).is_file():
+        try:
+            media = run.adapter.extract_media(
+                run.request.input,
+                request=AsrAudioFetchRequest(
+                    source_url=run.request.input,
+                    output_dir=run.request.out_dir / "media",
+                    temp_dir=run.cache.path_for("tmp/retention"),
+                    source_options=run.resolved.source.yt_dlp,
+                ),
+            )
+        except NoTranscriptError:
+            media = None
+    refs, receipts = materialize_source_media(
+        media,
+        run.request.out_dir,
+        retain=run.resolved.output.retain_media,
+    )
+    for receipt in receipts:
+        run.manifest.add_source_media(receipt)
+    if not receipts:
+        return refs
+    receipt = receipts[0]
+    if receipt.retained:
+        run.manifest.add_step(
+            "source.media_retention",
+            "ok",
+            f"{receipt.path}; {receipt.bytes} bytes; sha256={receipt.sha256}",
+        )
+    else:
+        run.manifest.add_step(
+            "source.media_retention",
+            "skipped",
+            receipt.omission_reason,
+        )
+    return refs
 
 
 def _asr_environment(resolved: ResolvedConfig) -> TransformEnvironment:

@@ -21,5 +21,9 @@ class OutputExistsError(VctxError):
     exit_code = 5
 
 
+class OfflineSourceError(VctxError):
+    exit_code = 6
+
+
 class EmptyChunksError(VctxError):
     exit_code = 1

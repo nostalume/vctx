@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from vctx.models import SourceRef
 from vctx.models.artifacts import ArtifactKind
 
 StepStatus = Literal["ok", "skipped", "warning", "error"]
@@ -37,6 +38,18 @@ class ArtifactRef(BaseModel):
     media_type: str
 
 
+class SourceMediaReceipt(BaseModel):
+    source: SourceRef
+    media_id: str
+    purpose: Literal["input", "asr", "visual"]
+    selected_format: str
+    retained: bool
+    path: str | None = None
+    bytes: int | None = None
+    sha256: str | None = None
+    omission_reason: str | None = None
+
+
 class TransformEvidence(BaseModel):
     capability: CapabilityName
     selected_route: SelectedRoute
@@ -63,6 +76,7 @@ class Manifest(BaseModel):
     steps: list[ManifestStep]
     warnings: list[str] = Field(default_factory=list)
     transform_evidence: list[TransformEvidence] = Field(default_factory=list)
+    source_media: list[SourceMediaReceipt] = Field(default_factory=list)
 
 
 class ManifestBuilder:
@@ -72,6 +86,7 @@ class ManifestBuilder:
         self.steps: list[ManifestStep] = []
         self.warnings: list[str] = []
         self.transform_evidence: list[TransformEvidence] = []
+        self.source_media: list[SourceMediaReceipt] = []
 
     @classmethod
     def start(cls, input: str, tool_version: str) -> ManifestBuilder:
@@ -86,6 +101,9 @@ class ManifestBuilder:
     def add_transform_evidence(self, evidence: TransformEvidence) -> None:
         self.transform_evidence.append(evidence)
 
+    def add_source_media(self, receipt: SourceMediaReceipt) -> None:
+        self.source_media.append(receipt)
+
     def finish(self, status: RunStatus, artifacts: list[ArtifactRef]) -> Manifest:
         return Manifest(
             tool_version=self.tool_version,
@@ -96,4 +114,5 @@ class ManifestBuilder:
             steps=self.steps,
             warnings=self.warnings,
             transform_evidence=self.transform_evidence,
+            source_media=self.source_media,
         )
