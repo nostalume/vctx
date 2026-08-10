@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from platformdirs import user_cache_path
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    TypeAdapter,
+    model_validator,
+)
 
 from vctx.render.bundle import DEFAULT_FORMATS, OutputFormat
 
@@ -194,10 +202,14 @@ class PrepareRequest(BaseModel):
     keep_temp: bool | None = None
     formats: set[OutputFormat] | None = None
     workflow: WorkflowProfile | None = None
+    asr_use: TransformUse | str | None = None
+    ocr_use: TransformUse | str | None = None
+    vision_use: TransformUse | str | None = None
     offline: bool | None = None
     config_path: Path | None = None
     subtitle_languages: list[str] = Field(default_factory=list)
     output_language: str | None = None
+    retain_media: bool | None = None
 
 
 class RuntimeConfig(BaseModel):
@@ -250,12 +262,14 @@ class TransformInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     asr: CapabilityInput = Field(default_factory=CapabilityInput)
+    ocr: CapabilityInput = Field(default_factory=CapabilityInput)
     visual_context: CapabilityInput = Field(default_factory=CapabilityInput)
     knowledge_flow: CapabilityInput = Field(default_factory=CapabilityInput)
 
 
 class TransformConfig(BaseModel):
     asr: CapabilityPolicy
+    ocr: CapabilityPolicy
     visual_context: CapabilityPolicy
     knowledge_flow: CapabilityPolicy
 
@@ -265,6 +279,7 @@ class OutputConfig(BaseModel):
     chunk_max_chars: int
     chunk_max_seconds: int | None
     language: str = "native"
+    retain_media: bool = True
 
 
 class OutputInput(BaseModel):
@@ -274,6 +289,7 @@ class OutputInput(BaseModel):
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
     language: str | None = None
+    retain_media: StrictBool | None = None
 
 
 class VisionInstanceConfig(BaseModel):
@@ -475,6 +491,19 @@ def _resolve_policy(
     return CapabilityPolicy(enabled=enabled, use=raw.use)
 
 
+def _request_policy(raw: CapabilityInput, use: TransformUse | str | None) -> CapabilityInput:
+    if use is None:
+        return raw
+    if isinstance(use, str):
+        use = TypeAdapter(TransformUse).validate_python(use)
+    return raw.model_copy(
+        update={
+            "enabled": not isinstance(use, DisabledUse),
+            "use": use,
+        }
+    )
+
+
 def resolve_config(request: PrepareRequest) -> ResolvedConfig:
     """Resolve user request/config omissions into concrete default/auto policy."""
 
@@ -517,8 +546,15 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
         )
 
     transforms = TransformConfig(
-        asr=_resolve_policy(config.transforms.asr, asr),
-        visual_context=_resolve_policy(config.transforms.visual_context, visual_context),
+        asr=_resolve_policy(_request_policy(config.transforms.asr, request.asr_use), asr),
+        ocr=_resolve_policy(
+            _request_policy(config.transforms.ocr, request.ocr_use),
+            visual_context,
+        ),
+        visual_context=_resolve_policy(
+            _request_policy(config.transforms.visual_context, request.vision_use),
+            visual_context,
+        ),
         knowledge_flow=_resolve_policy(config.transforms.knowledge_flow, knowledge_flow),
     )
     instances = _resolve_instance_registry(config.instances, path_context)
@@ -547,6 +583,11 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
                 default=None,
             ),
             language=language,
+            retain_media=_coalesce(
+                request.retain_media,
+                config.output.retain_media,
+                default=True,
+            ),
         ),
         instances=instances,
     )

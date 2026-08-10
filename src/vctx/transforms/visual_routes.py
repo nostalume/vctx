@@ -24,6 +24,7 @@ RAPIDOCR_PROVIDER_ID = "rapidocr"
 def discover_visual_actions(
     policy: CapabilityPolicy,
     *,
+    ocr_policy: CapabilityPolicy | None = None,
     vision_instance_configs: dict[str, VisionInstanceConfig] | None = None,
     ai_routes: list[AiRoute] | None = None,
     env: Mapping[str, str] | None = None,
@@ -33,10 +34,11 @@ def discover_visual_actions(
     upload_allowed: bool = True,
 ) -> list[VisualAction]:
     actions = baseline_visual_actions()
+    selected_ocr_policy = ocr_policy or policy
+    if selected_ocr_policy.enabled and selected_ocr_policy.auto() and rapidocr_available():
+        actions.append(VisualAction.ocr(provider_id=RAPIDOCR_PROVIDER_ID))
     if not policy.enabled:
         return actions
-    if policy.auto() and rapidocr_available():
-        actions.append(VisualAction.ocr(provider_id=RAPIDOCR_PROVIDER_ID))
     selected_instance_config = _select_vision_instance_config(policy, vision_instance_configs or {})
     if selected_instance_config is not None:
         provider_id, instance_config = selected_instance_config
