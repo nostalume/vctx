@@ -13,7 +13,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-test:
+  support-profile:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }} / ${{ matrix.profile }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+        python: ["3.12", "3.13", "3.14"]
+        profile: [core, asr, visual, full]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install declared profile
+        shell: bash
+        run: |
+          if [ "${{ matrix.profile }}" = core ]; then
+            uv sync --locked --no-dev
+          else
+            uv sync --locked --no-dev --extra "${{ matrix.profile }}"
+          fi
+
+      - name: Smoke declared profile
+        shell: bash
+        run: |
+          uv run python -c "import vctx"
+          if [ "${{ matrix.profile }}" = asr ] || [ "${{ matrix.profile }}" = full ]; then
+            uv run python -c "import faster_whisper"
+          fi
+          if [ "${{ matrix.profile }}" = visual ] || [ "${{ matrix.profile }}" = full ]; then
+            uv run python -c "import av, onnxruntime, rapidocr"
+          fi
+          if [ "${{ matrix.profile }}" = core ] || [ "${{ matrix.profile }}" = asr ]; then
+            uv run python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') is None else 1)"
+          fi
+          if [ "${{ matrix.profile }}" = core ] || [ "${{ matrix.profile }}" = visual ]; then
+            uv run python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('faster_whisper') is None else 1)"
+          fi
+
+  quality:
     name: Lint, type-check, test
     runs-on: ubuntu-latest
 
@@ -32,6 +78,9 @@ jobs:
 
       - name: Check module layout
         run: uv run python scripts/check_module_layout.py
+
+      - name: Check behavior-suite LOC budget
+        run: uv run python scripts/check_test_ratio.py
 
       - name: Ruff
         run: uv run ruff check .
