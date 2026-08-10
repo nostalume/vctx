@@ -4,6 +4,50 @@ This document defines the initial public API for `vctx`: the CLI commands, artif
 
 `vctx` is a CLI-first tool. Python internals may change, but the CLI behavior and artifact shapes should be treated as the stable integration surface.
 
+## Architecture contract
+
+```text
+CLI request
+  -> app workflow and source admission
+  -> source adapters
+  -> normalized transcript/media models
+  -> bounded transforms
+  -> render bundle
+  -> artifacts + manifest
+```
+
+| Layer | Owns | Must not own |
+| --- | --- | --- |
+| `cli` | flags, request construction, summary printing | provider calls, workflow policy |
+| `app` | admission, workflow order, resolved policy, manifest steps | provider payloads, rendering internals |
+| `sources` | local/URL metadata, subtitles, media acquisition | chunking, rendering, transforms |
+| `transcript` / `subtitles` / `chunking` | deterministic normalization and chunks | provider calls, output policy |
+| `transforms` | ASR, OCR, VLM, and text-model products | final rendering, source acquisition |
+| `render` | Markdown/JSON projections from typed products | source, model, or network access |
+| `models` | artifact and domain schemas | app, CLI, providers |
+| `net` | HTTP transport | product semantics |
+
+Dependencies point inward toward typed models:
+
+```text
+cli -> app -> sources/transforms/render/io -> models
+                 transforms/provider leaves -> net
+```
+
+Forbidden dependencies are `models ->` higher layers, `render ->` acquisition
+or network, `sources ->` transforms/render, and pure transforms -> provider
+clients. Route objects describe a selected capability; they do not own clients,
+sessions, concurrency, or transport lifecycle.
+
+Visual evidence is transcript-motive-led: deterministic cases select bounded
+capture/OCR/VLM actions, `visual_records.json` stores evidence, and
+`visual_scores.json` stores satisfaction diagnostics. No transcript motive means
+no visual fetch. Missed satisfaction is a manifest warning.
+
+The output directory is the stable integration boundary. Internal modules may
+move, but CLI behavior, exit status, manifest discovery, and documented artifact
+schemas require explicit compatibility treatment.
+
 ## CLI principles
 
 - Non-interactive by default.
@@ -14,6 +58,21 @@ This document defines the initial public API for `vctx`: the CLI commands, artif
 - stdout is for final machine/human-consumable result lines.
 - stderr is for progress, warnings, and errors.
 - `manifest.json` is the first artifact a downstream agent should inspect.
+- Local model acquisition occurs only through `vctx models pull`; `prepare`,
+  `models status`, and `models verify` are network-free for local models.
+
+## Managed local models
+
+`vctx models pull [asr] [ocr]` prepares selected local models under the runtime
+cache and writes integrity receipts. `status` reports receipt presence without
+reading model contents; `verify` hashes cached files and reports `ready`,
+`missing`, or `corrupt`. All commands support `--json`, `--cache-dir`,
+`--config`, and the ASR selector `--asr`.
+
+Receipts expose capability, provider, model ID, cache-relative path, byte size,
+package version, and integrity. They never include credentials or absolute host
+paths. License data is omitted unless an upstream source supplies an
+authoritative identifier.
 
 ## How `vctx prepare` decides what to do
 
@@ -43,8 +102,8 @@ Workflow presets decide which branches are allowed:
 | --- | --- | --- | --- | --- |
 | `default` | deterministic transcript; ASR only if configured and needed | auto/optional | deterministic, optional configured supplement | manifest, metadata, transcript/chunks/context/readable |
 | `transcript` | transcript-focused; ASR only if configured and needed | off | off | transcript/chunks/context/readable |
-| `visual` | transcript plus visual evidence when video media exists | on; requires `ffmpeg` for frames | deterministic/auto | visual records and frame artifacts when captured |
-| `full` | transcript + visual + configured supplements | on; requires `ffmpeg` for frames | on when configured | all applicable artifacts |
+| `visual` | transcript plus visual evidence when video media exists | on; currently requires `ffmpeg` for frames | deterministic/auto | visual records and frame artifacts when captured |
+| `full` | transcript + visual + configured supplements | on; currently requires `ffmpeg` for frames | on when configured | all applicable artifacts |
 | `metadata` | metadata only | off | off | `metadata.json` + `manifest.json(status=partial)` |
 
 Configuration answers two questions:
@@ -55,6 +114,7 @@ Configuration answers two questions:
    - `output.*`
 2. If a workflow branch needs a model/tool, which implementation is selected?
    - `transforms.asr.use = "instance:<name>"` -> `[instances.asr.<name>]`, or use `auto`
+   - `transforms.ocr.use = "auto" | "none"` for local frame OCR
    - `transforms.visual_context.use` -> `auto`, `instance:<name>`, or `openrouter:<model-id>`
    - `transforms.knowledge_flow.use` for the current text-model supplement path
 
@@ -79,6 +139,7 @@ Base transcript workflows do not require ASR, OCR, VLM, or `ffmpeg`. Extra tools
 | --- | --- | --- |
 | `yt-dlp` Python package | URL metadata and subtitles; URL media download when ASR/visual media is needed | Project dependency. `vctx doctor` reports availability. |
 | `ffmpeg` executable | Visual/full workflows that extract video frames; not needed for transcript-only or metadata workflows | Install from your OS package manager or <https://ffmpeg.org/> and ensure `ffmpeg` is on `PATH`. `vctx doctor` checks it. |
+| `av` (PyAV) Python package | Declared visual-profile dependency for the in-process frame-extraction migration | Installed by `vctx[visual]` and `vctx[full]`. The current frame adapter still uses `ffmpeg`; this row is intentionally not a claim that the migration has landed. |
 | `rapidocr` + `onnxruntime` Python packages | Local OCR over extracted frames | Install the visual extra, for example `uv sync --extra visual` or package equivalent. If absent, local OCR action is unavailable. |
 | `faster_whisper` Python package | Local ASR through `type = "local-faster-whisper"` | Install the ASR extra, for example `uv sync --extra asr` or package equivalent. |
 | `vctx[full]` optional extra | Installs all local heavy feature extras currently declared by the project | Use `uv sync --extra full` when you want ASR + visual/OCR support in one environment. Default installs stay small. |
@@ -201,8 +262,16 @@ Options:
 | `--cache-dir DIR` | platform cache dir | Override cache location. |
 | `--keep-temp` | unset | Preserve temporary downloads/intermediate files. |
 | `--workflow NAME` | `default` | Select a preparation workflow: `default`, `transcript`, `visual`, `full`, or `metadata`. |
+| `--asr SELECTOR` | config/workflow default | ASR selector: `auto`, `none`, `instance:<name>`, or `local:<model>`. |
+| `--ocr SELECTOR` | config/workflow default | Frame OCR selector: `auto` or `none`. |
+| `--vision SELECTOR` | config/workflow default | Vision-description selector: `auto`, `none`, `instance:<name>`, or `openrouter:<model>`. |
+| `--no-retain-media` | unset | Omit required source media from the pack and record that omission in the manifest. |
 | `--offline` | unset | Use offline policy; network/model-service routes are unavailable. |
 | `--config PATH` | unset | Optional TOML config file. Missing fields keep built-in defaults; CLI/request values override config fields. |
+
+Offline admits local inputs and verified local assets only. Because URL-source
+cache admission is not implemented yet, an offline URL currently exits with an
+`offline URL cache miss` before invoking `yt-dlp` or creating an output pack.
 
 Default transcript-bearing output files:
 
@@ -316,7 +385,17 @@ CLI/request values
 
 `vctx` selects one config file by this precedence; it does not merge multiple config files. Missing fields are not errors. They resolve to built-in defaults or `auto` policy. Secrets are never stored directly; config references environment variable names. `.env` files are optional convenience inputs for those environment variables when listed by `runtime.env_files`.
 
-Downloaded URL media is an output-owned artifact. ASR/visual media downloads write final reusable files under `DIR/media/` plus a small `*.vctx-media.json` sidecar. Temporary/partial yt-dlp files use `runtime.cache_dir/tmp/yt-dlp`. A repeated run into the same output directory reuses matching sidecar+media unless `--overwrite` is used.
+`--workflow` supplies defaults only. Explicit `--asr`, `--ocr`, and `--vision`
+selectors override their own capability independently; none of them enables a
+different capability. CLI selectors override the chosen config file.
+
+Required URL and local media is an output-owned artifact by default. It is
+materialized under `DIR/media/`, indexed in `manifest.artifacts`, and described
+by `manifest.source_media` with source identity, purpose, selected format, byte
+size, and SHA-256 integrity. `--no-retain-media` (or
+`output.retain_media = false`) removes output-owned downloads and records an
+explicit omission receipt. Temporary yt-dlp files remain under
+`runtime.cache_dir/tmp/yt-dlp`.
 
 Example:
 
@@ -395,7 +474,9 @@ Field semantics:
 | `source.yt_dlp.playlist` | Optional playlist/multipart selector as `default` or `items:<spec>`. Omit unless the source URL resolves to the wrong playlist item. |
 | `source.yt_dlp.media_profile` | Visual media quality/speed preset: `fast`, `balanced`, or `high`. ASR always uses audio-only demand automatically. |
 | `output.formats` | Default render/artifact formats for `prepare`; the prepare CLI does not expose a `--format` flag. |
+| `output.retain_media` | Retain required URL/local media as manifest-listed pack artifacts; defaults to `true`. |
 | `transforms.asr.use` | ASR fallback selector: `auto`, `none`, `instance:<name>`, `local:<model-or-path>`, or `path:<local-path>`. Runs only if deterministic transcript acquisition fails and media is available. |
+| `transforms.ocr.use` | Local frame-OCR selector: `auto` uses available RapidOCR; `none` disables OCR without disabling visual capture or VLM description. |
 | `transforms.visual_context.use` | Visual-description selector: `auto`, `none`, `instance:<name>`, or `openrouter:<model-id>`. |
 | `instances.vision.<name>` | Named OpenAI-compatible VLM endpoint selected by `transforms.visual_context.use = "instance:<name>"`. |
 | `transforms.knowledge_flow.use` | Current text-model supplement selector. Deterministic knowledge-flow extraction does not need a model. |
@@ -523,19 +604,22 @@ transcript
 Inspect local environment.
 
 ```bash
-vctx doctor
+vctx doctor --workflow visual --offline --no-retain-media
+vctx doctor --json
 ```
 
-Checks:
+The report resolves the same user-facing policy as `prepare` and shows:
 
 - Python version
-- package versions
+- installed distribution profile (`core`, `asr`, `visual`, or `full`)
+- selected workflow, offline state, and media-retention policy
+- ASR, OCR, and vision selectors with readiness
 - `yt-dlp` import
 - cache directory writability
-- optional `ffmpeg` availability
-- optional ASR dependencies when installed
+- current host `ffmpeg` availability while the frame adapter still requires it
 
-No network calls by default.
+`doctor` is network-free. `--json` produces the same facts for automation and
+never includes credentials.
 
 ## Exit codes
 
@@ -547,6 +631,7 @@ No network calls by default.
 | `3` | Unsupported input/source. |
 | `4` | Transcript unavailable. |
 | `5` | Output directory or filesystem error. |
+| `6` | Offline policy rejected a source that is not available in verified local cache. |
 
 ## Artifact contract
 
@@ -616,6 +701,7 @@ Fields:
 | `status` | `ok`, `partial`, or `error`. |
 | `input` | Original user input string. |
 | `artifacts` | Files written relative to output directory. |
+| `source_media` | Retained-media or explicit-omission receipts with source identity, purpose, format, size, and integrity. |
 | `steps` | Ordered pipeline steps with compact status/details. |
 | `warnings` | Recoverable issues. |
 | `transform_evidence` | Structured route evidence for model-mediated capabilities, including selected route, provider/model id, upload/cost flags, deterministic flag, and reason. Secrets are never recorded. |

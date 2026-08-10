@@ -12,18 +12,31 @@ From PyPI with uv:
 uv tool install "vctx[full]"
 ```
 
-`[full]` is the recommended install for normal users; it includes local ASR and visual/OCR extras. Smaller installs are available when you only need part of the stack:
+`[full]` is the recommended install for normal users; it includes local ASR and visual/OCR extras. Visual installs include PyAV, RapidOCR, and ONNX Runtime. Smaller installs are available when you only need part of the stack:
 
 ```bash
 uv tool install vctx            # minimal transcript/URL workflows
 uv tool install "vctx[asr]"     # minimal + local faster-whisper ASR
-uv tool install "vctx[visual]"  # minimal + local OCR/visual extras
+uv tool install "vctx[visual]"  # minimal + PyAV + local OCR/visual extras
 ```
+
+Tier-1 installation coverage is Windows x64, Linux x64, and macOS Apple
+Silicon on Python 3.12–3.14. The CI matrix verifies each published profile on
+those environments. PyAV is packaged now; the visual runtime’s final migration
+away from its current host-ffmpeg frame adapter is tracked separately.
 
 Then run:
 
 ```bash
 vctx prepare INPUT --out DIR
+```
+
+Prepare local models explicitly; normal `prepare` never downloads them:
+
+```bash
+vctx models pull asr ocr
+vctx models status asr ocr
+vctx models verify asr ocr --json
 ```
 
 For one-off use without installing the tool globally:
@@ -67,6 +80,10 @@ uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes
 
 ```text
 --workflow default|transcript|visual|full|metadata
+--asr auto|none|instance:NAME|local:MODEL
+--ocr auto|none
+--vision auto|none|instance:NAME|openrouter:MODEL
+--no-retain-media
 --config PATH
 --offline
 --overwrite
@@ -85,6 +102,20 @@ Start with:
 DIR/manifest.json
 DIR/readable.md
 DIR/context.md
+```
+
+Required source media is copied into `DIR/media/` and indexed in the manifest
+by default, including local inputs. Use `--no-retain-media` only when pack size
+matters more than self-containment.
+
+`--offline` admits local inputs and verified local assets. URL-source caching is
+not implemented yet, so an offline URL fails before `yt-dlp` runs or an output
+pack is created.
+
+Inspect the resolved product policy without network access:
+
+```bash
+uv run vctx doctor --workflow visual --offline --json
 ```
 
 Core artifacts:
@@ -153,10 +184,8 @@ Transform config uses one selector field, `use`. Do not combine old-style `route
 
 ## Developer docs
 
-- [`docs/api.md`](docs/api.md) — CLI/config/artifacts.
-- [`docs/architecture.md`](docs/architecture.md) — boundaries.
-- [`docs/graph/README.md`](docs/graph/README.md) — module/API graphs.
-- [`docs/development.md`](docs/development.md) — develop/test/integration workflow.
+- [`docs/api.md`](docs/api.md) — architecture, CLI, config, and artifacts.
+- [`docs/AGENTS.md`](docs/AGENTS.md) — project goal, stack, and principles.
 
 ## License
 

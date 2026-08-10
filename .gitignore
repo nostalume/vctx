@@ -29,3 +29,4 @@ out/
 
 # Local development reports
 docs/report/
+.agents/
