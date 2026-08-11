@@ -1,28 +1,33 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from vctx.app.credentials import (
-    CredentialError,
-    env_with_credential_presence,
-    resolve_env_credential,
-)
 from vctx.app.media_retention import materialize_source_assets
-from vctx.app.models import ModelLifecycleError, require_prepared_model
 from vctx.app.progress import phase
-from vctx.app.visual import Visuals, visual_products
+from vctx.app.run import (
+    Run,
+    RunRuntimes,
+    open_run,
+    select_asr_instance,
+)
+from vctx.app.visual import VisualProducts, visual_products
 from vctx.artifact.content import Artifact
 from vctx.artifact.manifest import (
     ArtifactRef,
-    ManifestBuilder,
+    AsrStepReceipt,
     ManifestSource,
-    source_key,
 )
-from vctx.asr import AsrOutcome, run_asr
+from vctx.asr import (
+    AsrEnvironment,
+    AsrOutcome,
+    AsrPlan,
+    AsrReceipt,
+    plan_asr,
+    run_asr,
+)
 from vctx.config import (
     AsrInstanceConfig,
     PrepareRequest,
@@ -35,20 +40,11 @@ from vctx.io import (
     write_artifact,
     write_artifact_bundle,
 )
-from vctx.models.knowledge_flow import KnowledgeFlow
 from vctx.render.bundle import render_artifact_bundle
-from vctx.source.admission import admit_source
 from vctx.source.session import (
     AsrAudioRequest,
     MediaAsset,
-    MediaPermit,
-    ObservePermit,
-    SourceSession,
-    SubtitlePermit,
-    VideoMetadata,
-    VisualVideoRequest,
 )
-from vctx.source.store import SourceStore
 from vctx.transcript import (
     ChunkOptions,
     ChunkSet,
@@ -58,77 +54,9 @@ from vctx.transcript import (
     normalize_transcript,
     parse_transcript_payload,
 )
-from vctx.transforms.ai_routes import AiRoute, AiTaskKind, resolve_openrouter_ai_route
-from vctx.transforms.model_resolution import (
-    OPENROUTER_API_KEY_ENV,
-    ModelCapability,
-)
-from vctx.transforms.planning import RoutePlan, SourceState, TransformEnvironment, plan_asr
-from vctx.transforms.text_ai import OpenAiCompatibleTextAdapter
 
 logger = logging.getLogger(__name__)
 _ASR_MISSING_HINT = "Prepare the small ASR model with: vctx models pull asr"
-
-
-@dataclass
-class Run:
-    request: PrepareRequest
-    resolved: ResolvedConfig
-    manifest: ManifestBuilder
-    source_cache: SourceStore
-    model_root: Path
-    source: SourceSession
-    metadata: VideoMetadata
-    subtitle_permit: SubtitlePermit
-    media_permit: MediaPermit
-    runtime_cache: dict[str, object]
-    media: MediaAsset | None = None
-    subtitle: TranscriptPayload | None = None
-    artifacts: list[ArtifactRef] = field(default_factory=list)
-
-    def openrouter_env(self) -> dict[str, str]:
-        return env_with_credential_presence(
-            [OPENROUTER_API_KEY_ENV],
-            env_files=self.resolved.runtime.env_files,
-            base_env=os.environ,
-        )
-
-    def visual_ai_routes(self) -> list[AiRoute]:
-        route = resolve_openrouter_ai_route(
-            self.resolved.transforms.visual_context,
-            task="vision_description",
-            capability=ModelCapability.VISION_DESCRIPTION,
-            cache_root=self.model_root,
-            env=self.openrouter_env(),
-            offline=self.resolved.runtime.offline,
-        )
-        return [route] if route is not None else []
-
-    def text_product_ai_route(self, task: AiTaskKind) -> AiRoute | None:
-        return resolve_openrouter_ai_route(
-            self.resolved.transforms.knowledge_flow,
-            task=task,
-            capability=ModelCapability.ESSENTIAL_CASES,
-            cache_root=self.model_root,
-            env=self.openrouter_env(),
-            offline=self.resolved.runtime.offline,
-        )
-
-    def text_ai_adapter(self, route: AiRoute) -> OpenAiCompatibleTextAdapter:
-        return OpenAiCompatibleTextAdapter(
-            route=route,
-            api_key=resolve_env_credential(
-                route.api_key_env,
-                env_files=self.resolved.runtime.env_files,
-            ),
-        )
-
-    def visual_media_request(self) -> VisualVideoRequest:
-        return VisualVideoRequest(
-            temp_dir=self.source_cache.root / "tmp" / "yt-dlp",
-            profile=self.resolved.source.media_quality.value,
-            refresh=self.request.overwrite,
-        )
 
 
 @dataclass(frozen=True)
@@ -139,10 +67,9 @@ class Prepared:
 
 @dataclass(frozen=True)
 class AsrReady:
-    plan: RoutePlan
+    plan: AsrPlan
     media: MediaAsset
     instance: AsrInstanceConfig
-    api_key: str | None
 
 
 @dataclass(frozen=True)
@@ -159,13 +86,13 @@ def prepare_source(
     resolved: ResolvedConfig,
     occupied: dict[str, str],
     completed: set[str],
-    runtime_cache: dict[str, object],
+    runtimes: RunRuntimes,
     previous: dict[str, ManifestSource] | None = None,
     reset_lane: Callable[[str], None] | None = None,
     rollback_lane: Callable[[str], None] | None = None,
 ) -> SourcePrepared | None:
     logger.info("prepare.start input=%s out=%s", request.inputs[0], request.out_dir)
-    run = _start(request, resolved, occupied, runtime_cache)
+    run = open_run(request, resolved, occupied, runtimes)
     if run.source.record.source_id in completed:
         return None
     completed.add(run.source.record.source_id)
@@ -183,71 +110,14 @@ def prepare_source(
         if isinstance(transcript, SourcePrepared):
             return transcript
         prepared = _prepared(run, transcript)
-        visuals, flow = visual_products(run, prepared)
-        return _finish(run, prepared, visuals, flow)
+        products = visual_products(run, prepared)
+        return _finish(run, prepared, products)
     except (CacheError, ProviderError) as exc:
         return _error_result(run, exc)
     except VctxError:
         if rollback_lane is not None:
             rollback_lane(run.manifest.key)
         raise
-
-
-def _start(
-    request: PrepareRequest,
-    resolved: ResolvedConfig,
-    occupied: dict[str, str],
-    runtime_cache: dict[str, object],
-) -> Run:
-    network = "denied" if resolved.runtime.offline else "allowed"
-    permit = ObservePermit(operation="prepare", network=network)
-    cache = SourceStore(resolved.cache.source_dir)
-    source = admit_source(
-        request.inputs[0],
-        permit=permit,
-        options=resolved.source.yt_dlp,
-        store=cache,
-    )
-    if source.record.lifecycle != "finite":
-        raise NoTranscriptError(
-            f"source is {source.record.lifecycle}; prepare requires finite or archived media"
-        )
-    key = source_key(source.record.source_id, occupied)
-    occupied[key.casefold()] = source.record.source_id
-    lane_request = request.model_copy(update={"out_dir": request.out_dir / key})
-    manifest = ManifestBuilder.start(source.record, key, offline=resolved.runtime.offline)
-    logger.info(
-        "prepare.config workflow=%s cache=%s config=%s offline=%s",
-        resolved.runtime.workflow,
-        cache.root,
-        request.config_path or "built-in defaults + CLI",
-        resolved.runtime.offline,
-    )
-    logger.debug("prepare.output formats=%s", ",".join(resolved.output.formats))
-
-    manifest.add_step("source.detect", "ok", source.name)
-    logger.info("source.detect adapter=%s", source.name)
-
-    metadata = source.record.metadata
-    manifest.add_step("metadata.extract", "ok")
-    logger.info(
-        "metadata.extract status=ok id=%s source_type=%s",
-        metadata.id,
-        metadata.source_type,
-    )
-
-    return Run(
-        request=lane_request,
-        resolved=resolved,
-        manifest=manifest,
-        source_cache=cache,
-        model_root=resolved.cache.model_dir,
-        source=source,
-        metadata=metadata,
-        subtitle_permit=SubtitlePermit(network=permit.network),
-        media_permit=MediaPermit(network=permit.network),
-        runtime_cache=runtime_cache,
-    )
 
 
 def _transcript(run: Run) -> TranscriptPayload | Transcript | SourcePrepared:
@@ -264,8 +134,9 @@ def _transcript(run: Run) -> TranscriptPayload | Transcript | SourcePrepared:
     logger.info("transcript.extract status=ok provenance=%s", payload.provenance_label())
     asr_plan = plan_asr(
         run.resolved.transforms.asr,
-        TransformEnvironment(offline=run.resolved.runtime.offline),
-        SourceState(has_transcript=True, has_media=False),
+        AsrEnvironment(offline=run.resolved.runtime.offline),
+        has_transcript=True,
+        has_media=False,
     )
     run.manifest.add_transform_evidence(asr_plan.evidence_seed)
     run.manifest.add_step(
@@ -302,8 +173,7 @@ def _asr_transcript(
             ready.media,
             instance=ready.instance,
             cache_root=run.model_root,
-            api_key=ready.api_key,
-            runtime_cache=run.runtime_cache,
+            runtimes=run.runtimes.asr,
         )
     return _asr_outcome(run, outcome)
 
@@ -311,29 +181,30 @@ def _asr_transcript(
 def _asr_outcome(run: Run, outcome: AsrOutcome) -> Transcript | SourcePrepared:
     if outcome.kind == "ready":
         detail = f"{outcome.receipt.provider}:{outcome.receipt.model}"
-        run.manifest.add_step(
-            "transform.asr", "ok", detail, outcome.receipt.model_dump(exclude_none=True)
-        )
+        run.manifest.add_step("transform.asr", "ok", detail, _asr_step_receipt(outcome.receipt))
         logger.info("asr.execute status=ok provenance=%s", detail)
         return outcome.transcript
     detail = outcome.reason
     if outcome.receipt.failure is not None:
         detail = f"{outcome.receipt.failure}: {detail}"
-    run.manifest.add_step(
-        "transform.asr", "warning", detail, outcome.receipt.model_dump(exclude_none=True)
-    )
+    run.manifest.add_step("transform.asr", "warning", detail, _asr_step_receipt(outcome.receipt))
     run.manifest.warn(detail)
     logger.warning("asr.execute status=%s reason=%s", outcome.kind, detail)
     return _partial(run)
 
 
-def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | SourcePrepared:
+def _asr_step_receipt(receipt: AsrReceipt) -> AsrStepReceipt:
+    return AsrStepReceipt.model_validate(receipt, from_attributes=True)
+
+
+def _asr_source(run: Run, transcript_error: NoTranscriptError) -> AsrPlan | SourcePrepared:
     pre_media_asr_plan = plan_asr(
         run.resolved.transforms.asr,
-        _asr_environment(run.resolved),
-        SourceState(has_transcript=False, has_media=True),
+        run.load_asr_environment(),
+        has_transcript=False,
+        has_media=True,
     )
-    if pre_media_asr_plan.selected not in {"local", "configured-online"}:
+    if pre_media_asr_plan.selected != "local":
         run.manifest.add_transform_evidence(pre_media_asr_plan.evidence_seed)
         run.manifest.add_step("source.media", "skipped", "no executable ASR route selected")
         run.manifest.add_step("transform.asr", "warning", pre_media_asr_plan.reason)
@@ -348,13 +219,15 @@ def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | So
             request=AsrAudioRequest(
                 temp_dir=run.source_cache.root / "tmp" / "yt-dlp",
                 refresh=run.request.overwrite,
-            ), permit=run.media_permit,
+            ),
+            permit=run.media_permit,
         )
     except NoTranscriptError as media_exc:
         asr_plan = plan_asr(
             run.resolved.transforms.asr,
-            _asr_environment(run.resolved),
-            SourceState(has_transcript=False, has_media=False),
+            run.load_asr_environment(),
+            has_transcript=False,
+            has_media=False,
         )
         run.manifest.add_step("source.media", "warning", str(media_exc))
         run.manifest.add_transform_evidence(asr_plan.evidence_seed)
@@ -368,10 +241,11 @@ def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | So
     logger.info("source.media status=ok purpose=asr path=%s", run.media.local_path)
     asr_plan = plan_asr(
         run.resolved.transforms.asr,
-        _asr_environment(run.resolved),
-        SourceState(has_transcript=False, has_media=True),
+        run.load_asr_environment(),
+        has_transcript=False,
+        has_media=True,
     )
-    if asr_plan.selected not in {"local", "configured-online"}:
+    if asr_plan.selected != "local":
         run.manifest.add_transform_evidence(asr_plan.evidence_seed)
         run.manifest.add_step("transform.asr", "warning", asr_plan.reason)
         run.manifest.warn(_capitalize_warning(str(transcript_error)))
@@ -382,8 +256,8 @@ def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | So
     return asr_plan
 
 
-def _asr_ready(run: Run, asr_plan: RoutePlan) -> AsrReady | SourcePrepared:
-    instance = _selected_asr_instance(run.resolved)
+def _asr_ready(run: Run, asr_plan: AsrPlan) -> AsrReady | SourcePrepared:
+    instance = select_asr_instance(run.resolved)
     if instance is None:
         run.manifest.add_step("transform.asr", "warning", "ASR instance is not configured")
         run.manifest.warn("ASR instance is not configured")
@@ -391,26 +265,14 @@ def _asr_ready(run: Run, asr_plan: RoutePlan) -> AsrReady | SourcePrepared:
         return _partial(run)
 
     run.manifest.add_transform_evidence(asr_plan.evidence_seed)
-    api_key: str | None = None
-    if asr_plan.selected == "configured-online":
-        try:
-            api_key = resolve_env_credential(
-                instance.api_key_env,
-                env_files=run.resolved.runtime.env_files,
-            )
-        except CredentialError as credential_exc:
-            run.manifest.add_step("transform.asr", "warning", str(credential_exc))
-            run.manifest.warn(str(credential_exc))
-            logger.warning("asr.ready status=warning reason=%s", credential_exc)
-            return _partial(run)
     assert run.media is not None
     logger.info(
         "asr.ready status=ok provider=%s model=%s credential=%s",
         asr_plan.provider_id,
         asr_plan.model_id,
-        instance.api_key_env if asr_plan.selected == "configured-online" else "not-required",
+        "not-required",
     )
-    return AsrReady(plan=asr_plan, media=run.media, instance=instance, api_key=api_key)
+    return AsrReady(plan=asr_plan, media=run.media, instance=instance)
 
 
 def _prepared(run: Run, payload: TranscriptPayload | Transcript) -> Prepared:
@@ -438,24 +300,25 @@ def _prepared(run: Run, payload: TranscriptPayload | Transcript) -> Prepared:
     return Prepared(transcript=clean, chunks=chunks)
 
 
-def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow) -> SourcePrepared:
+def _finish(run: Run, prepared: Prepared, products: VisualProducts) -> SourcePrepared:
     with phase(logger, "prepare.finish"):
         bundle = render_artifact_bundle(
             metadata=run.metadata,
             transcript=prepared.transcript,
             chunks=prepared.chunks,
             formats=run.resolved.output.formats,
-            visual_records=visuals.records,
-            visual_scores=visuals.scores,
-            knowledge_flow=flow,
+            evidence=products.evidence,
+            evidence_plan=products.evidence_plan,
             output_language=run.resolved.output.language,
         )
         artifact_refs = write_artifact_bundle(run.request.out_dir, bundle)
-        artifact_refs.extend(visuals.frames)
+        artifact_refs.extend(products.frames)
         run.artifacts = artifact_refs
         _retain_or_error(run, artifact_refs)
         final_manifest = run.manifest.finish(
-            status="ok", artifacts=artifact_refs, receipts=run.source.receipts
+            status="partial" if products.partial else "ok",
+            artifacts=artifact_refs,
+            receipts=run.source.receipts,
         )
     logger.info("prepare.finish status=ok artifacts=%s", len(artifact_refs))
     return SourcePrepared(
@@ -499,7 +362,8 @@ def _retain_assets(run: Run) -> None:
             media = run.source.media(
                 request=AsrAudioRequest(
                     temp_dir=run.source_cache.path_for("tmp/retention"),
-                ), permit=run.media_permit,
+                ),
+                permit=run.media_permit,
             )
         except NoTranscriptError:
             media = None
@@ -553,9 +417,7 @@ def _error_result(run: Run, exc: CacheError | ProviderError) -> SourcePrepared:
         ]
     detail = "provider failure" if isinstance(exc, ProviderError) else "storage failure"
     run.manifest.add_step("source.failure", "error", detail)
-    failed = run.manifest.finish(
-        status="error", artifacts=artifacts, receipts=run.source.receipts
-    )
+    failed = run.manifest.finish(status="error", artifacts=artifacts, receipts=run.source.receipts)
     return SourcePrepared(
         source=failed,
         artifacts=artifacts,
@@ -565,57 +427,13 @@ def _error_result(run: Run, exc: CacheError | ProviderError) -> SourcePrepared:
     )
 
 
-def _asr_environment(resolved: ResolvedConfig) -> TransformEnvironment:
-    instance_name = resolved.transforms.asr.instance_name()
-    instance = _selected_asr_instance(resolved)
-    if instance is None:
-        return TransformEnvironment(offline=resolved.runtime.offline)
-    if instance.type == "local-faster-whisper":
-        prepared = instance_name is not None or _builtin_asr_ready(resolved.cache.model_dir)
-        return TransformEnvironment(
-            offline=resolved.runtime.offline,
-            installed_asr=prepared,
-            configured_asr_model_id=instance.model or "small",
-            configured_asr_cost_mode="local",
-        )
-    if instance.type == "openai-compatible-audio":
-        return TransformEnvironment(
-            offline=resolved.runtime.offline,
-            configured_asr=True,
-            configured_asr_provider_id=instance_name,
-            configured_asr_model_id=instance.model,
-            configured_asr_cost_mode="paid",
-        )
-    return TransformEnvironment(offline=resolved.runtime.offline)
-
-
-def _selected_asr_instance(resolved: ResolvedConfig) -> AsrInstanceConfig | None:
-    name = resolved.transforms.asr.instance_name()
-    if name is not None:
-        return resolved.instances.asr.get(name)
-    if resolved.transforms.asr.enabled:
-        return AsrInstanceConfig(type="local-faster-whisper", model="small")
-    return None
-
-
-def _builtin_asr_ready(model_root: Path) -> bool:
-    try:
-        require_prepared_model("asr", model_root, asr_model_id="small")
-    except (ModelLifecycleError, OSError):
-        return False
-    return True
-
-
 def _transcript_detail(payload: TranscriptPayload) -> str:
     provenance = payload.provenance
     if provenance.method == "local_file":
         return f"local transcript: {payload.format}"
     if provenance.method == "official_subtitles" or provenance.method == "automatic_subtitles":
         language = provenance.language or provenance.language_evidence.kind
-        return (
-            f"{provenance.provider or 'source'}:{provenance.method}:"
-            f"{language}:{payload.format}"
-        )
+        return f"{provenance.provider or 'source'}:{provenance.method}:{language}:{payload.format}"
     return payload.provenance_label()
 
 

@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from vctx.config import PrepareRequest, WorkflowProfile, resolve_config
+from vctx.config import ResolvedConfig
 from vctx.errors import VctxError
 from vctx.io import model_to_json
 
@@ -36,19 +36,7 @@ class ModelReceipt(BaseModel):
     message: str | None = None
 
 
-def resolve_asr_model_id(
-    *, config_path: Path | None, cache_dir: Path | None, selector: str | None
-) -> str:
-    resolved = resolve_config(
-        PrepareRequest(
-            inputs=["model-lifecycle"],
-            out_dir=Path("."),
-            workflow=WorkflowProfile.TRANSCRIPT,
-            config_path=config_path,
-            cache_dir=cache_dir,
-            asr_use=selector,
-        )
-    )
+def select_asr_model_id(resolved: ResolvedConfig) -> str:
     policy = resolved.transforms.asr
     model_ref = policy.model_ref()
     if model_ref is not None:
@@ -67,29 +55,34 @@ def resolve_asr_model_id(
     return model_id
 
 
-def resolve_model_dir(*, config_path: Path | None, cache_dir: Path | None) -> Path:
-    return resolve_config(
-        PrepareRequest(inputs=["model-lifecycle"], out_dir=Path("."), config_path=config_path,
-                       cache_dir=cache_dir)
-    ).cache.model_dir
-
-
-def manage_models(
-    action: Literal["pull", "status", "verify"],
+def pull_models(
     capabilities: list[str] | None,
     *,
     cache_dir: Path,
     asr_model_id: str = "small",
 ) -> list[ModelReceipt]:
-    cache_root = cache_dir
-    if action == "pull":
-        cache_root.mkdir(parents=True, exist_ok=True)
-    selected = _capabilities(capabilities)
-    if action == "pull":
-        return [_pull(capability, cache_root, asr_model_id=asr_model_id) for capability in selected]
+    cache_dir.mkdir(parents=True, exist_ok=True)
     return [
-        _inspect(capability, cache_root, verify=action == "verify", asr_model_id=asr_model_id)
-        for capability in selected
+        _pull(capability, cache_dir, asr_model_id=asr_model_id)
+        for capability in _capabilities(capabilities)
+    ]
+
+
+def model_status(
+    capabilities: list[str] | None, *, cache_dir: Path, asr_model_id: str = "small"
+) -> list[ModelReceipt]:
+    return [
+        _inspect(capability, cache_dir, verify=False, asr_model_id=asr_model_id)
+        for capability in _capabilities(capabilities)
+    ]
+
+
+def verify_models(
+    capabilities: list[str] | None, *, cache_dir: Path, asr_model_id: str = "small"
+) -> list[ModelReceipt]:
+    return [
+        _inspect(capability, cache_dir, verify=True, asr_model_id=asr_model_id)
+        for capability in _capabilities(capabilities)
     ]
 
 
@@ -97,8 +90,7 @@ def render_model_receipts(receipts: list[ModelReceipt], *, json_output: bool) ->
     if json_output:
         return json.dumps([item.model_dump(mode="json") for item in receipts], indent=2) + "\n"
     return "".join(
-        f"{item.capability}: {item.state} ({item.provider}/{item.model_id})\n"
-        for item in receipts
+        f"{item.capability}: {item.state} ({item.provider}/{item.model_id})\n" for item in receipts
     )
 
 

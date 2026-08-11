@@ -46,11 +46,23 @@ class FakeSubtitleRuntime:
             body=self.response_text.encode("utf-8"),
         )
 
+    def close(self) -> None:
+        pass
+
+
+class OfflineRuntime:
+    def request(self, request: NetRequest) -> NetResponse:
+        pytest.fail(f"offline transcript attempted network access: {request.url}")
+
+    def close(self) -> None:
+        pass
+
 
 def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    import vctx.app.run as run_module
     import vctx.source.ytdlp as module
 
     subtitle_url = "https://cdn.example/caption.vtt"
@@ -75,7 +87,7 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     }
     FakeYoutubeDL.observations = 0
     monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
-    monkeypatch.setattr(module, "UrllibNetRuntime", FakeSubtitleRuntime)
+    monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     out_dir = tmp_path / "out"
 
     result = runner.invoke(
@@ -98,8 +110,11 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert {path.name for path in lane.iterdir()} >= {
-        "metadata.json", "transcript.json", "chunks.json",
-        "context.md", "read.md", "knowledge_flow.json",
+        "metadata.json",
+        "transcript.json",
+        "chunks.json",
+        "context.md",
+        "read.md",
     }
     assert "manifest-secret" not in json.dumps(manifest)
     assert manifest["status"] == "ok"
@@ -132,22 +147,12 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "# Agent Context Pack" in context
     assert "The workflow takes a video URL" in context
-    assert "## Knowledge-flow summary" in context
-
-    readable = (lane / "read.md").read_text(encoding="utf-8")
-    assert "## Knowledge-flow summary" in readable
-
-    knowledge_flow = json.loads(
-        (lane / "knowledge_flow.json").read_text(encoding="utf-8")
-    )
-    assert _has_edge(knowledge_flow, "video URL", "knowledge-flow pack")
-    assert _has_edge(knowledge_flow, "download media", "transcribe audio")
-    assert _has_edge(knowledge_flow, "transcribe audio", "extract frames")
 
 
 def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    import vctx.app.run as run_module
     import vctx.source.ytdlp as module
 
     url = "https://video.example/watch?v=abc"
@@ -156,16 +161,14 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
         "title": "Cached Lecture",
         "webpage_url": url,
         "extractor": "example",
-        "subtitles": {
-            "en": [{"ext": "vtt", "url": "https://cdn.example/caption.vtt"}]
-        },
+        "subtitles": {"en": [{"ext": "vtt", "url": "https://cdn.example/caption.vtt"}]},
         "automatic_captions": {},
     }
     FakeSubtitleRuntime.response_text = (
         "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nCached transcript survives offline.\n"
     )
     monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
-    monkeypatch.setattr(module, "UrllibNetRuntime", FakeSubtitleRuntime)
+    monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     cache = tmp_path / "cache"
 
     online = runner.invoke(
@@ -180,9 +183,9 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
         lambda _params: pytest.fail("offline admission attempted provider discovery"),
     )
     monkeypatch.setattr(
-        module,
-        "UrllibNetRuntime",
-        lambda: pytest.fail("offline transcript attempted network access"),
+        run_module,
+        "HttpxNetRuntime",
+        OfflineRuntime,
     )
     offline_out = tmp_path / "offline"
     offline = runner.invoke(
@@ -215,22 +218,21 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
 def test_online_prepare_degrades_when_source_cache_cannot_be_written(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    import vctx.app.run as run_module
     import vctx.source.ytdlp as module
 
     FakeYoutubeDL.info = {
         "id": "abc",
         "webpage_url": "https://video.example/watch?v=abc",
         "extractor": "example",
-        "subtitles": {
-            "en": [{"ext": "vtt", "url": "https://cdn.example/caption.vtt"}]
-        },
+        "subtitles": {"en": [{"ext": "vtt", "url": "https://cdn.example/caption.vtt"}]},
         "automatic_captions": {},
     }
     FakeSubtitleRuntime.response_text = (
         "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nUncached result remains usable.\n"
     )
     monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
-    monkeypatch.setattr(module, "UrllibNetRuntime", FakeSubtitleRuntime)
+    monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     blocked_cache = tmp_path / "cache"
     blocked_cache.write_text("not a directory", encoding="utf-8")
 
@@ -281,9 +283,7 @@ def _has_edge(flow: dict[str, Any], source: str, target: str) -> bool:
     edges = flow["edges"]
     assert isinstance(nodes, list)
     assert isinstance(edges, list)
-    node_labels = {
-        node["id"]: node["label"] for node in nodes if isinstance(node, dict)
-    }
+    node_labels = {node["id"]: node["label"] for node in nodes if isinstance(node, dict)}
     for edge in edges:
         if not isinstance(edge, dict):
             continue

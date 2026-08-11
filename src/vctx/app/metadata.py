@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vctx.config import PrepareRequest, WorkflowProfile, resolve_config
-from vctx.source.admission import admit_source
+from vctx.config import PrepareRequest, WorkflowProfile, load_resolved_config
+from vctx.net import HttpxNetRuntime
+from vctx.source.admission import open_source, select_source
 from vctx.source.session import ObservePermit, VideoMetadata
 from vctx.source.store import SourceStore
 
@@ -15,7 +16,7 @@ def inspect_metadata(
     cache_dir: Path | None = None,
     offline: bool | None = None,
 ) -> VideoMetadata:
-    resolved = resolve_config(
+    resolved = load_resolved_config(
         PrepareRequest(
             inputs=[value],
             out_dir=Path("."),
@@ -25,15 +26,18 @@ def inspect_metadata(
             offline=offline,
         )
     )
-    session = admit_source(
-        value,
-        permit=ObservePermit(
-            operation="metadata",
-            network="denied" if resolved.runtime.offline else "allowed",
-        ),
-        options=resolved.source.yt_dlp,
-        store=SourceStore(resolved.cache.source_dir),
-    )
+    with HttpxNetRuntime() as net:
+        session = open_source(
+            select_source(value),
+            value,
+            permit=ObservePermit(
+                operation="metadata",
+                network="denied" if resolved.runtime.offline else "allowed",
+            ),
+            options=resolved.source.yt_dlp,
+            net=net,
+            store=SourceStore(resolved.cache.source_dir),
+        )
     return session.record.metadata
 
 

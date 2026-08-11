@@ -16,7 +16,7 @@ def test_doctor_reports_environment_checks() -> None:
     assert "python:" in result.output
     assert "yt-dlp:" in result.output
     assert "cache:" in result.output
-    assert "ffmpeg:" in result.output
+    assert "ffmpeg:" not in result.output
 
 
 def test_doctor_reports_selected_product_policy_as_json(tmp_path) -> None:

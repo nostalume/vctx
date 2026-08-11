@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -27,7 +27,7 @@ from vctx.errors import (
     OperationCancelledError,
     ProviderError,
 )
-from vctx.net import NetRequest, NetRuntime, UrllibNetRuntime
+from vctx.net import NetError, NetRequest, NetRuntime, RetryPolicy
 from vctx.source.session import (
     EffectReceipt,
     MediaAsset,
@@ -44,7 +44,6 @@ from vctx.source.session import (
 from vctx.transcript import TranscriptPayload, TranscriptProvenance, detected_language
 
 SubtitleKind = Literal["official_subtitles", "automatic_subtitles"]
-SourceNetFactory = Callable[[], NetRuntime]
 YtDlpScalar: TypeAlias = str | int | float | bool | None  # noqa: UP040
 YtDlpValue: TypeAlias = (  # noqa: UP040
     YtDlpScalar | list["YtDlpValue"] | dict[str, "YtDlpValue"]
@@ -87,7 +86,7 @@ class YtDlpSession:
     info: YtDlpInfo
     options: YtDlpSourceOptions
     record: SourceRecord
-    net_factory: SourceNetFactory
+    net: NetRuntime
     receipts: list[EffectReceipt] = field(default_factory=list)
 
     def transcript(self, *, permit: SubtitlePermit) -> TranscriptPayload:
@@ -105,11 +104,12 @@ class YtDlpSession:
             )
             raise NoTranscriptError(f"no subtitles found for input: {self.record.metadata.id}")
         try:
-            text = _read_subtitle_text(candidate.url, net=self.net_factory())
-        except (OSError, UnicodeError, NoTranscriptError):
+            text = _read_subtitle_text(candidate.url, net=self.net)
+        except (NetError, UnicodeError, NoTranscriptError) as exc:
+            attempts = exc.attempts if isinstance(exc, NetError) else 1
             self.receipts.append(
                 EffectReceipt(
-                    operation="subtitle", status="failed", attempts=1, purpose="transcript"
+                    operation="subtitle", status="failed", attempts=attempts, purpose="transcript"
                 )
             )
             raise
@@ -183,8 +183,8 @@ class YtDlpSession:
 class YtDlpSourceAdapter:
     name = "yt-dlp"
 
-    def __init__(self, *, net_factory: SourceNetFactory | None = None) -> None:
-        self._net_factory = net_factory or UrllibNetRuntime
+    def __init__(self, *, net: NetRuntime) -> None:
+        self._net = net
 
     def claim(self, value: str) -> Literal["fallback", "unsupported"]:
         parsed = urlparse(value)
@@ -205,7 +205,7 @@ class YtDlpSourceAdapter:
             info=info,
             options=options,
             record=_source_record(value, info),
-            net_factory=self._net_factory,
+            net=self._net,
             receipts=[EffectReceipt(operation="observe", status="succeeded", attempts=1)],
         )
 
@@ -267,9 +267,7 @@ def _plan_media(request: MediaRequest, info: YtDlpInfo) -> tuple[MediaRequest, s
 def _estimated_media_bytes(request: MediaRequest, info: YtDlpInfo) -> int | None:
     estimates: list[int] = []
     height_cap = (
-        _VISUAL_HEIGHT_CAPS.get(request.profile)
-        if request.kind == "visual_video"
-        else None
+        _VISUAL_HEIGHT_CAPS.get(request.profile) if request.kind == "visual_video" else None
     )
     for raw in _list_value(info.get("formats")):
         item = _mapping_value(raw)
@@ -313,9 +311,7 @@ def _media_receipt(
     selected: str | None = None,
     detail: str | None = None,
 ) -> EffectReceipt:
-    purpose: Literal["asr", "visual"] = (
-        "asr" if request.kind == "asr_audio" else "visual"
-    )
+    purpose: Literal["asr", "visual"] = "asr" if request.kind == "asr_audio" else "visual"
     requested = "audio" if request.kind == "asr_audio" else request.profile
     return EffectReceipt(
         operation="media",
@@ -572,6 +568,12 @@ def _fetch_text(url: str, *, net: NetRuntime) -> str:
             timeout_s=30,
             purpose="subtitle_fetch",
             provider_id="yt-dlp",
+            retry=RetryPolicy(
+                max_attempts=3,
+                statuses=(429, 500, 502, 503, 504),
+                retry_connect=True,
+                retry_timeouts=True,
+            ),
         )
     )
     if response.status_code < 200 or response.status_code >= 300:

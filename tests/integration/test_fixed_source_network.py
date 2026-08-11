@@ -8,9 +8,9 @@ from typer.testing import CliRunner
 
 from vctx.artifact.manifest import Manifest
 from vctx.cli import app
-from vctx.models.knowledge_flow import KnowledgeFlow
 from vctx.source.session import VideoMetadata
 from vctx.transcript import Transcript
+from vctx.visual.plan import EvidencePlan
 
 _FIXED_TED_URL = "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes"
 _RUN_NETWORK = os.environ.get("VCTX_RUN_NETWORK_INTEGRATION") == "1"
@@ -38,9 +38,7 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
 
     assert result.exit_code == 0, result.output
 
-    manifest = Manifest.model_validate_json(
-        (out_dir / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = Manifest.model_validate_json((out_dir / "manifest.json").read_text(encoding="utf-8"))
     lane = out_dir / manifest.sources[0].path
     _assert_required_artifacts(lane)
     assert manifest.status == "ok"
@@ -77,9 +75,9 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
     assert "Source:" in readable
     assert "tie" in readable.lower()
 
-    knowledge_flow_path = lane / "knowledge_flow.json"
-    if knowledge_flow_path.exists():
-        KnowledgeFlow.model_validate_json(knowledge_flow_path.read_text(encoding="utf-8"))
+    evidence_plan_path = lane / "evidence-plan.json"
+    if evidence_plan_path.exists():
+        EvidencePlan.model_validate_json(evidence_plan_path.read_text(encoding="utf-8"))
 
 
 def _assert_required_artifacts(out_dir: Path) -> None:

@@ -85,9 +85,7 @@ class LocalFileSession:
         del request, permit
         suffix = self.path.suffix.lower()
         if suffix not in SUPPORTED_MEDIA_SUFFIXES:
-            self.receipts.append(
-                EffectReceipt(operation="media", status="failed", purpose="input")
-            )
+            self.receipts.append(EffectReceipt(operation="media", status="failed", purpose="input"))
             raise NoTranscriptError("no media found for input")
         media_type: Literal["audio", "video", "unknown"] = "unknown"
         if suffix in AUDIO_SUFFIXES:
@@ -118,7 +116,7 @@ class LocalFileSourceAdapter:
     def claim(self, value: str) -> Literal["exact", "unsupported"]:
         path = Path(value)
         supported = SUPPORTED_TRANSCRIPT_SUFFIXES.keys() | SUPPORTED_MEDIA_SUFFIXES
-        return "exact" if path.exists() and path.suffix.lower() in supported else "unsupported"
+        return "exact" if path.suffix.lower() in supported else "unsupported"
 
     def observe(
         self, value: str, *, permit: ObservePermit, options: YtDlpSourceOptions
