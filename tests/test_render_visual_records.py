@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from vctx.chunking import ChunkSet, TranscriptChunk
-from vctx.models import SourceRef
-from vctx.models.metadata import VideoMetadata
 from vctx.models.visual import VisualEvidenceScore, VisualRecord, VisualRecordSet
 from vctx.render.markdown import render_context_markdown
+from vctx.source.session import SourceRef, VideoMetadata
 from vctx.transcript import Transcript, TranscriptProvenance, TranscriptSegment
 
 

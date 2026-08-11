@@ -3,8 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from vctx.models.media import MediaAsset
 from vctx.models.visual import EssentialVisualCase, FrameAsset
+from vctx.source.session import MediaAsset
 from vctx.transforms.visual_planning import Evidence, VisualAction
 
 

@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 
 from vctx.chunking import ChunkSet, TranscriptChunk
-from vctx.models import SourceRef
-from vctx.models.metadata import VideoMetadata
 from vctx.models.visual import VisualEvidenceScore, VisualRecord, VisualRecordSet
 from vctx.render.bundle import render_artifact_bundle
+from vctx.source.session import SourceRef, VideoMetadata
 from vctx.transcript import Transcript, TranscriptProvenance, TranscriptSegment
 from vctx.transforms.knowledge_flow import extract_knowledge_flow
 

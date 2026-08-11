@@ -4,8 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from vctx.artifact.manifest import CapabilityName, SelectedRoute, TransformEvidence
 from vctx.config import CapabilityPolicy
-from vctx.models.manifest import CapabilityName, SelectedRoute, TransformEvidence
 from vctx.transforms.ai_routes import AiRoute
 
 ProviderCostMode = Literal["free", "paid", "local", "unknown"]

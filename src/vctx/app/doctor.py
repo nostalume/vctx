@@ -9,7 +9,6 @@ from typing import Any
 
 from vctx.app.models import manage_models, resolve_asr_model_id
 from vctx.config import CapabilityPolicy, PrepareRequest, WorkflowProfile, resolve_config
-from vctx.io import build_cache
 
 
 def doctor_report(
@@ -26,7 +25,7 @@ def doctor_report(
 ) -> str:
     resolved = resolve_config(
         PrepareRequest(
-            input="doctor",
+            inputs=["doctor"],
             out_dir=Path("."),
             config_path=config_path,
             cache_dir=cache_dir,
@@ -44,7 +43,7 @@ def doctor_report(
     models = {
         item.capability: item
         for item in manage_models(
-            "status", ["asr", "ocr"], cache_dir=resolved.runtime.cache_dir,
+            "status", ["asr", "ocr"], cache_dir=resolved.cache.model_dir,
             asr_model_id=asr_model_id,
         )
     }
@@ -56,7 +55,7 @@ def doctor_report(
         "workflow": resolved.runtime.workflow.value,
         "offline": resolved.runtime.offline,
         "retention": "retain" if resolved.output.retain_media else "omit",
-        "cache": _cache_status(resolved.runtime.cache_dir),
+        "cache": _cache_status(resolved.cache.source_dir),
         "ffmpeg": _command_status("ffmpeg"),
         "capabilities": {
             "asr": _capability(
@@ -136,14 +135,11 @@ def _package_version(distribution: str) -> str:
 
 
 def _cache_status(cache_dir: Path) -> str:
-    try:
-        cache = build_cache(cache_dir)
-        probe = Path(cache.root) / ".doctor-write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-    except OSError as exc:
-        return f"error: {exc}"
-    return f"writable ({cache.root})"
+    if not cache_dir.exists():
+        return f"missing ({cache_dir})"
+    if not cache_dir.is_dir():
+        return f"error: not a directory ({cache_dir})"
+    return f"present ({cache_dir})"
 
 
 def _command_status(command: str) -> str:

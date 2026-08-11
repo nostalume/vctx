@@ -16,8 +16,6 @@ ArtifactKind = Literal[
     "visual_scores",
     "knowledge_flow",
     "visual_frame",
-    "source_media",
-    "source_media_metadata",
     "manifest",
 ]
 
@@ -33,7 +31,4 @@ class ArtifactBundle(BaseModel):
     artifacts: list[Artifact]
 
     def get(self, kind: ArtifactKind) -> Artifact | None:
-        for artifact in self.artifacts:
-            if artifact.kind == kind:
-                return artifact
-        return None
+        return next((artifact for artifact in self.artifacts if artifact.kind == kind), None)

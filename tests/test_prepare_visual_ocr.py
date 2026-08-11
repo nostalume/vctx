@@ -16,6 +16,7 @@ runner = CliRunner()
 def test_prepare_visual_workflow_runs_available_local_ocr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import vctx.transforms.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     import vctx.transforms.visual_ocr as visual_ocr_module
@@ -98,10 +99,13 @@ cache = "persistent"
     )
 
     assert result.exit_code == 0, result.output
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
     visual_records = json.loads(
-        (out_dir / "visual_records.json").read_text(encoding="utf-8")
+        (lane / "visual_records.json").read_text(encoding="utf-8")
     )
-    visual_scores = json.loads((out_dir / "visual_scores.json").read_text(encoding="utf-8"))
+    visual_scores = json.loads((lane / "visual_scores.json").read_text(encoding="utf-8"))
     assert [record["kind"] for record in visual_records["records"]] == ["ocr", "capture"]
     assert visual_records["records"][0]["text"] == "CAP theorem slide"
     assert "satisfaction" not in visual_records
@@ -110,32 +114,32 @@ cache = "persistent"
         "satisfied",
     ]
 
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert _step_status(manifest, "transform.visual_plan") == "ok"
     assert _step_detail(manifest, "transform.visual_plan") == "local OCR: rapidocr"
     assert _step_status(manifest, "transform.visual_capture") == "ok"
     assert _step_status(manifest, "transform.visual_satisfaction") == "ok"
-    assert {artifact["path"] for artifact in manifest["artifacts"]} >= {
+    assert {artifact["path"] for artifact in source_entry["artifacts"]} >= {
         "visual_records.json",
         "visual_scores.json",
     }
 
-    context = (out_dir / "context.md").read_text(encoding="utf-8")
+    context = (lane / "context.md").read_text(encoding="utf-8")
     assert (
         '<visual_ref id="frame-0001" timestamp="00:00:01" '
-        'path="visual/frames/frame-0001.png">'
+        'path="frame-0001.png">'
     ) in context
     assert "<ocr" in context
     assert "CAP theorem slide</ocr>" in context
 
-    readable = (out_dir / "readable.md").read_text(encoding="utf-8")
-    assert "![Frame frame-0001 at 00:00:01](visual/frames/frame-0001.png)" in readable
+    readable = (lane / "readable.md").read_text(encoding="utf-8")
+    assert "![Frame frame-0001 at 00:00:01](frame-0001.png)" in readable
     assert "- OCR: CAP theorem slide" in readable
 
 
 def test_prepare_visual_writes_satisfaction_warning_for_missed_formula_ocr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import vctx.transforms.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     import vctx.transforms.visual_ocr as visual_ocr_module
@@ -218,16 +222,18 @@ cache = "persistent"
     )
 
     assert result.exit_code == 0, result.output
-    visual_scores = json.loads((out_dir / "visual_scores.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    visual_scores = json.loads((lane / "visual_scores.json").read_text(encoding="utf-8"))
     assert any(
         check["status"] == "missed"
         and check["operation"] == "ocr"
         and check["reason"] == "formula_or_equation"
         for check in visual_scores["satisfaction"]
     )
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert _step_status(manifest, "transform.visual_satisfaction") == "warning"
-    assert any("visual satisfaction missed" in warning for warning in manifest["warnings"])
+    assert any("visual satisfaction missed" in warning for warning in source_entry["warnings"])
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:
@@ -239,7 +245,7 @@ def _step_detail(manifest: dict[str, Any], name: str) -> str:
 
 
 def _step_value(manifest: dict[str, Any], name: str, key: str) -> str:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)

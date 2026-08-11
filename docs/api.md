@@ -20,7 +20,7 @@ CLI request
 | --- | --- | --- |
 | `cli` | flags, request construction, summary printing | provider calls, workflow policy |
 | `app` | admission, workflow order, resolved policy, manifest steps | provider payloads, rendering internals |
-| `sources` | local/URL metadata, subtitles, media acquisition | chunking, rendering, transforms |
+| `source` | local/URL metadata, subtitles, media acquisition | chunking, rendering, transforms |
 | `transcript` / `subtitles` / `chunking` | deterministic normalization and chunks | provider calls, output policy |
 | `transforms` | ASR, OCR, VLM, and text-model products | final rendering, source acquisition |
 | `render` | Markdown/JSON projections from typed products | source, model, or network access |
@@ -30,7 +30,7 @@ CLI request
 Dependencies point inward toward typed models:
 
 ```text
-cli -> app -> sources/transforms/render/io -> models
+cli -> app -> source/transforms/render/io/artifact -> models
                  transforms/provider leaves -> net
 ```
 
@@ -74,13 +74,58 @@ package version, and integrity. They never include credentials or absolute host
 paths. License data is omitted unless an upstream source supplies an
 authoritative identifier.
 
+## Source-cache lifecycle
+
+```bash
+vctx cache status [--json] [--cache-dir DIR] [--config PATH]
+vctx cache prune [--dry-run] [--age 30d | --all] [--json]
+                 [--cache-dir DIR] [--config PATH]
+```
+
+`status` is read-only and reports `records`, `assets`, `blobs`, `temporary`, and
+`bytes`; a missing store is an empty inventory and is not created. `prune`
+without an age/all selector removes only validated orphan blobs and temporary
+files. `--age` accepts positive hours, days, or weeks such as `12h`, `30d`, or
+`4w`; it uses best-effort last use and falls back to acquisition time. `--all`
+is the only way to select every verified source record.
+
+Prune JSON reports `dry_run`, `examined`, `selected`, `removed`,
+`reclaimed_bytes`, and `failures`. Dry-run uses the same selection as a real
+prune but removes nothing. Catalog authority is retired transactionally before
+unreferenced blobs are deleted; shared blobs survive, and failed file deletion
+is reported for a later retry. Invalid catalogs, links, blob names, and busy
+writers refuse unsafe mutation. `--cache-dir` selects its `source/` child and
+overrides config; `[cache].source_dir` otherwise resolves relative to the config
+file. Neither command inspects or mutates `[cache].model_dir`.
+
+## Stage-2 acceptance matrix
+
+| Area | Accepted behavior | Observable boundary |
+| --- | --- | --- |
+| Local source | Local transcript/media is admitted without network access. | One independent source lane is published. |
+| URL source | Online prepare observes a URL once and may seed verified source-cache records. | Provider effects and freshness are recorded under that source only. |
+| Offline URL | A verified cache hit is usable; a miss, corrupt record, or unverified asset fails closed. | No provider runtime or output pack is created on admission failure. |
+| Transcript route | Official/manual subtitles win; ASR runs only when transcript text is absent and policy permits it. | Route evidence and retained inputs stay in the owning lane. |
+| Visual route | Visual work runs only when requested and useful; frames feed RapidOCR and optional VLM routes. | Captures, scores, warnings, and model evidence stay in the owning lane. |
+| Retention | Required media/subtitles are retained by default; explicit omission is supported. | Each asset has integrity metadata or an omission receipt. |
+| Batch result | Inputs execute independently in CLI order; duplicate identities collapse. | Successes survive sibling failures and the root status becomes `partial` or `error` as applicable. |
+| Existing pack | Add, reuse, replace, and forced rebuild are source-identity upserts. | Unrequested lanes remain byte-identical; unknown/corrupt packs are refused. |
+| Publication | Pack replacement uses staging, verification, backup, rename, and recovery. | Failure or cancellation preserves the last verified generation. |
+| Metadata | `metadata` shares source admission, config, cache, and offline policy with `prepare`. | It reports sanitized source facts without creating a pack. |
+| Cache operations | `status` is read-only; `prune` selects verified records/orphans and never model files. | Missing stores stay absent; dry-run and real selection agree. |
+
+The fixed-source network integration check is opt-in because it depends on a
+stable public source and real network access. All other rows are mandatory,
+network-free acceptance behavior.
+
 ## How `vctx prepare` decides what to do
 
-`vctx prepare INPUT --out DIR` is a branch workflow, not a provider menu. It resolves the requested workflow and config, then runs only the branches that are useful and available for the input.
+`vctx prepare INPUT... --out DIR` runs the same branch workflow independently
+for one or more explicit inputs. It never combines their content.
 
 ```text
-1. Detect the input source.
-2. Extract normalized metadata.
+1. Admit one source session per distinct input identity and observe each URL at most once.
+2. Project sanitized normalized metadata from that observation.
 3. Try deterministic transcript acquisition first:
    - local `.srt` / `.vtt` / transcript JSON
    - URL subtitles/captions through `yt-dlp`
@@ -189,7 +234,7 @@ Current ASR instance types:
 
 | Type | Behavior |
 | --- | --- |
-| `local-faster-whisper` | Runs local `faster_whisper`. `model_policy = "auto"` currently executes faster-whisper model id `base`. Managed model ids use `runtime.cache_dir/models/faster-whisper`; `path:<local-path>` uses local files only. |
+| `local-faster-whisper` | Runs local `faster_whisper`. `model_policy = "auto"` currently executes faster-whisper model id `base`. Managed model ids use `cache.model_dir`; `path:<local-path>` uses local files only. |
 | `openai-compatible-audio` | Sends multipart audio/media to `base_url` with `model` and credential from `api_key_env`; manifest records upload/cost evidence automatically. |
 
 ### Visual frames, OCR, and VLM descriptions
@@ -234,7 +279,7 @@ Deterministic knowledge-flow extraction does not need a model. Current LLM suppl
 Prepare a complete context pack from a URL or local transcript/media input.
 
 ```bash
-vctx prepare INPUT --out DIR [OPTIONS]
+vctx prepare INPUT... --out DIR [OPTIONS]
 ```
 
 Examples:
@@ -242,24 +287,30 @@ Examples:
 ```bash
 vctx prepare "https://www.youtube.com/watch?v=abc123" --out ./out/abc123
 vctx prepare ./lecture.vtt --out ./out/lecture
-vctx prepare ./captions.srt --out ./out/captions --overwrite
+vctx prepare ./part-1.vtt ./part-2.vtt --out ./out/course
 ```
 
 Inputs:
 
 | Argument | Description |
 | --- | --- |
-| `INPUT` | URL or local path. Initially URL via `yt-dlp`, `.vtt`, `.srt`, transcript JSON, or supported local media when ASR/visual branches need media. |
+| `INPUT...` | One or more explicit URL/local paths. Each locator must select one finite item; playlist expansion is not implicit. |
+
+Inputs run in CLI order. Repeated stable identities collapse to one lane. A
+controlled failure does not erase successful sibling lanes; the command exits
+nonzero and the root manifest is `partial`. Source effects, assets, warnings,
+and transform evidence never cross lane boundaries.
 
 Options:
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--out DIR` | required | Output directory for durable artifacts. |
-| `--overwrite` | unset | Allow reusing an existing output directory. |
+| `--overwrite` | unset | Force requested lanes to rebuild when upserting a verified schema-0.3 pack. |
 | `--chunk-max-chars INT` | `6000` | Maximum approximate characters per chunk before flushing. |
 | `--chunk-max-seconds INT` | unset | Optional maximum chunk duration. |
-| `--cache-dir DIR` | platform cache dir | Override cache location. |
+| `--cache-dir DIR` | platform cache dir | Override the base containing `source/` and `models/`. |
+| `--media-quality QUALITY` | `auto` | Source-media intent: `auto`, `fast`, `balanced`, or `high`. |
 | `--keep-temp` | unset | Preserve temporary downloads/intermediate files. |
 | `--workflow NAME` | `default` | Select a preparation workflow: `default`, `transcript`, `visual`, `full`, or `metadata`. |
 | `--asr SELECTOR` | config/workflow default | ASR selector: `auto`, `none`, `instance:<name>`, or `local:<model>`. |
@@ -269,38 +320,50 @@ Options:
 | `--offline` | unset | Use offline policy; network/model-service routes are unavailable. |
 | `--config PATH` | unset | Optional TOML config file. Missing fields keep built-in defaults; CLI/request values override config fields. |
 
-Offline admits local inputs and verified local assets only. Because URL-source
-cache admission is not implemented yet, an offline URL currently exits with an
-`offline URL cache miss` before invoking `yt-dlp` or creating an output pack.
+Offline admits local inputs and verified cached URL observations/subtitles. A
+miss exits with `offline URL cache miss` before invoking `yt-dlp`, constructing a
+network runtime, or creating an output pack. Source records live in
+`cache.source_dir/index.sqlite3`; verified content-addressed bytes live under
+`cache.source_dir/blobs/`. Raw locators, credentials, and signed subtitle URLs
+are not persisted.
+
+An absent or empty output creates a pack. An existing output is accepted only
+when its schema-0.3 manifest, owned lane set, retained assets, artifact sizes,
+and hashes verify. Prepare then upserts by stable source identity: a new source
+adds a lane, a matching revision reuses it, and a changed revision replaces only
+that lane. Unrequested lanes stay byte-identical. Publication uses sibling
+staging plus backup/rename/restore, so failure or cancellation cannot expose a
+mixed generation. `--overwrite` never bypasses ownership or integrity checks.
 
 Default transcript-bearing output files:
 
 ```text
 DIR/
   manifest.json
-  metadata.json
-  transcript.raw.json
-  transcript.clean.json
-  transcript.md
-  chunks.json
-  context.md
-  readable.md
+  youtube-abc123/
+    metadata.json
+    transcript.raw.json
+    transcript.clean.json
+    transcript.md
+    chunks.json
+    context.md
+    readable.md
 ```
 
 Visual/full or supplement branches may additionally write:
 
 ```text
-DIR/
+DIR/<source-key>/
   visual_records.json
   visual_scores.json
-  visual/frames/*.png
+  frame-*.png
   knowledge_flow.json
 ```
 
 Artifact orthogonality:
 
 ```text
-manifest.json          run audit and artifact index; inspect first
+manifest.json          pack audit and source-lane index; inspect first
 metadata.json          source metadata
 transcript.raw.json    source/ASR transcript before normalization
 transcript.clean.json  normalized transcript used by transforms
@@ -308,7 +371,7 @@ chunks.json            context-window chunks
 knowledge_flow.json    canonical evidence-linked flow graph
 visual_records.json    canonical OCR/VLM/capture evidence records
 visual_scores.json     visual satisfaction diagnostics
-visual/frames/*.png    frame artifacts referenced by visual records
+frame-*.png            frame artifacts referenced by visual records
 context.md             AI-agent context injection projection
 readable.md            human inspection projection
 transcript.md          human timestamped transcript projection
@@ -352,8 +415,9 @@ Successful stdout:
 ```text
 Wrote context pack: DIR
 Manifest: DIR/manifest.json
-Context: DIR/context.md
-Readable: DIR/readable.md
+Artifacts:
+  - SOURCE-KEY/context.md
+  - SOURCE-KEY/readable.md
 ```
 
 Warnings stderr example:
@@ -389,28 +453,33 @@ CLI/request values
 selectors override their own capability independently; none of them enables a
 different capability. CLI selectors override the chosen config file.
 
-Required URL and local media is an output-owned artifact by default. It is
-materialized under `DIR/media/`, indexed in `manifest.artifacts`, and described
-by `manifest.source_media` with source identity, purpose, selected format, byte
-size, and SHA-256 integrity. `--no-retain-media` (or
-`output.retain_media = false`) removes output-owned downloads and records an
-explicit omission receipt. Temporary yt-dlp files remain under
-`runtime.cache_dir/tmp/yt-dlp`.
+Required source bytes are retained by default inside their flat
+`DIR/<source-key>/` lane. Fixed names are `subtitle.<language>.<ext>`,
+`audio.<ext>`, `video.<ext>`, and `input.<ext>`. The corresponding
+`manifest.sources[].assets` records purpose, selected policy, size, and SHA-256
+integrity independently from that source's rendered `artifacts`.
+`--no-retain-media` records explicit omissions. Temporary yt-dlp files remain
+in the source cache.
 
 Example:
 
 ```toml
 [runtime]
 workflow = "transcript"          # default | transcript | visual | full | metadata
-cache_dir = ".cache/vctx"        # optional; relative paths resolve from this config file
 env_files = [".env"]             # optional; loaded only for provider credentials
 keep_temp = false
+
+[cache]
+source_dir = ".cache/vctx/source" # optional; config-relative
+model_dir = ".cache/vctx/models"  # optional; config-relative
+
+[source]
+media_quality = "auto"            # auto | fast | balanced | high
 
 [source.yt_dlp]
 session = "browser:chrome"       # optional: none | browser:<name> | cookies-file:<path>
 network = "proxy:socks5://127.0.0.1:1080" # optional: direct | proxy:<url>
 playlist = "items:1"             # optional: default | items:<yt-dlp item spec>
-media_profile = "balanced"       # fast | balanced | high; visual quality/speed preset
 
 [output]
 formats = ["json", "context", "readable", "transcript"]
@@ -423,7 +492,7 @@ use = "instance:local-default"   # arbitrary example name selected below
 [instances.asr.local-default]
 type = "local-faster-whisper"
 model_policy = "auto"            # currently executes faster-whisper model id "base"
-cache = "persistent"             # managed weights under runtime.cache_dir/models/faster-whisper
+cache = "persistent"             # managed weights under cache.model_dir
 
 [instances.asr.local-model]
 type = "local-faster-whisper"
@@ -467,12 +536,12 @@ Field semantics:
 | Field | Semantics |
 | --- | --- |
 | `runtime.workflow` | Default workflow profile when CLI `--workflow` is not supplied. |
-| `runtime.cache_dir` | Persistent tool/model/media cache. Defaults to the platform user cache directory, e.g. Windows `C:\Users\<user>\AppData\Local\vctx\Cache`. Relative config values resolve from the config file directory; CLI `--cache-dir` values stay relative to the caller CWD. |
+| `cache.source_dir` / `cache.model_dir` | Independent persistent source and model stores. Config-relative paths resolve from the config file; one-off `--cache-dir` overrides both with `source/` and `models/` children. |
 | `runtime.env_files` | Optional dotenv files to consult during credential resolution. Relative config values resolve from the config file directory. Secrets are not copied into manifests/config dumps. |
 | `source.yt_dlp.session` | Optional source session access as `none`, `browser:<name>`, or `cookies-file:<path>`. Omit unless yt-dlp needs login/session cookies. |
 | `source.yt_dlp.network` | Optional source network route as `direct` or `proxy:<url>`. Omit for direct network. |
 | `source.yt_dlp.playlist` | Optional playlist/multipart selector as `default` or `items:<spec>`. Omit unless the source URL resolves to the wrong playlist item. |
-| `source.yt_dlp.media_profile` | Visual media quality/speed preset: `fast`, `balanced`, or `high`. ASR always uses audio-only demand automatically. |
+| `source.media_quality` | Generic media intent: `auto`, `fast`, `balanced`, or `high`. ASR still selects audio for its purpose. |
 | `output.formats` | Default render/artifact formats for `prepare`; the prepare CLI does not expose a `--format` flag. |
 | `output.retain_media` | Retain required URL/local media as manifest-listed pack artifacts; defaults to `true`. |
 | `transforms.asr.use` | ASR fallback selector: `auto`, `none`, `instance:<name>`, `local:<model-or-path>`, or `path:<local-path>`. Runs only if deterministic transcript acquisition fails and media is available. |
@@ -483,7 +552,7 @@ Field semantics:
 | `instances.asr.<name>.type` | ASR implementation type: `local-faster-whisper` or `openai-compatible-audio`. The `<name>` is arbitrary. |
 | `instances.asr.<name>.model_policy` | Local faster-whisper managed model policy. Current `auto` executes model id `base`. |
 | `instances.asr.<name>.model` | Either a model id such as `tiny`/`base` for managed persistent cache, or `path:<local-path>` for local files only. Bare path-like strings are treated as model ids, not guessed as paths. |
-| `instances.asr.<name>.cache` | `persistent` stores managed faster-whisper weights under `runtime.cache_dir/models/faster-whisper`; `disabled` requires `path:<local-path>`. |
+| `instances.asr.<name>.cache` | `persistent` stores managed faster-whisper weights under `cache.model_dir`; `disabled` requires `path:<local-path>`. |
 | `instances.asr.<name>.api_key_env` | Environment variable containing an ASR credential. The config stores only the variable name. |
 | `instances.vision.<name>.type` | Vision implementation type. Current implemented value: `openai-compatible-vision`, using chat-completions style image messages. |
 | `instances.vision.<name>.base_url` | VLM chat-completions endpoint. |
@@ -509,7 +578,7 @@ Manifest route evidence semantics:
 API graph for model transformations:
 
 ```text
-prepare INPUT
+prepare INPUT...
   -> deterministic acquisition
        -> platform metadata
        -> official/manual subtitles
@@ -541,7 +610,7 @@ The CLI should not expose raw provider menus for normal usage. Prefix-style `use
 Print normalized metadata for an input without preparing a full context pack.
 
 ```bash
-vctx metadata INPUT [--json]
+vctx metadata INPUT [--json] [--config PATH] [--cache-dir DIR] [--offline]
 ```
 
 Purpose:
@@ -549,6 +618,7 @@ Purpose:
 - cheap source inspection
 - agent preflight
 - debugging extractor behavior
+- the same source admission/config policy as `prepare`, without creating a pack
 
 Output:
 
@@ -615,7 +685,7 @@ The report resolves the same user-facing policy as `prepare` and shows:
 - selected workflow, offline state, and media-retention policy
 - ASR, OCR, and vision selectors with readiness
 - `yt-dlp` import
-- cache directory writability
+- source-cache presence without creating or writing it
 - current host `ffmpeg` availability while the frame adapter still requires it
 
 `doctor` is network-free. `--json` produces the same facts for automation and
@@ -630,8 +700,10 @@ never includes credentials.
 | `2` | Invalid command usage or options. |
 | `3` | Unsupported input/source. |
 | `4` | Transcript unavailable. |
-| `5` | Output directory or filesystem error. |
+| `5` | Output, cache integrity/schema, or filesystem error. |
 | `6` | Offline policy rejected a source that is not available in verified local cache. |
+| `7` | Source provider failed or requires explicit refresh. |
+| `130` | Operation cancelled; the active temporary effect was cleaned. |
 
 ## Artifact contract
 
@@ -645,48 +717,37 @@ Shape:
 
 ```json
 {
-  "schema_version": "0.1",
+  "schema_version": "0.3",
   "tool": "vctx",
   "tool_version": "0.1.0",
+  "pack_id": "3db85608-8840-4dc7-afc2-9af6e4300f76",
+  "updated_run_id": "83d86ad6-fc75-4c60-ab9a-427611297b0f",
   "status": "ok",
-  "input": "https://www.youtube.com/watch?v=abc123",
   "created_at": "2026-06-07T12:00:00Z",
-  "artifacts": [
+  "updated_at": "2026-06-07T12:00:00Z",
+  "sources": [
     {
-      "kind": "metadata",
-      "path": "metadata.json",
-      "media_type": "application/json"
-    },
-    {
-      "kind": "context",
-      "path": "context.md",
-      "media_type": "text/markdown"
-    }
-  ],
-  "steps": [
-    {
-      "name": "source.detect",
+      "id": "youtube__abc123",
+      "key": "youtube-abc123",
+      "path": "youtube-abc123",
+      "kind": "url",
+      "revision": {"kind": "observed", "value": "sha256-fingerprint"},
+      "freshness": "observed-online",
+      "observed_at": "2026-06-07T11:59:58Z",
+      "title": "Example",
+      "duration_seconds": 120.0,
       "status": "ok",
-      "detail": "yt-dlp"
-    },
-    {
-      "name": "transcript.extract",
-      "status": "ok",
-      "detail": "official_subtitles:en:vtt"
-    },
-    {
-      "name": "transform.asr",
-      "status": "skipped",
-      "detail": "transcript already available"
-    }
-  ],
-  "warnings": [],
-  "transform_evidence": [
-    {
-      "capability": "asr",
-      "selected_route": "skipped",
-      "deterministic": true,
-      "reason": "transcript already available"
+      "artifacts": [
+        {"kind": "metadata", "path": "metadata.json", "media_type": "application/json", "bytes": 420, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+        {"kind": "context", "path": "context.md", "media_type": "text/markdown", "bytes": 2048, "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}
+      ],
+      "effects": [
+        {"operation": "observe", "status": "succeeded", "attempts": 1}
+      ],
+      "assets": [],
+      "steps": [],
+      "warnings": [],
+      "transform_evidence": []
     }
   ]
 }
@@ -698,13 +759,10 @@ Fields:
 | --- | --- |
 | `schema_version` | Artifact schema version. |
 | `tool_version` | Installed `vctx` version. |
+| `pack_id` | Stable UUID for the pack identity. |
+| `updated_run_id` | UUID for the publication attempt that produced this manifest. |
 | `status` | `ok`, `partial`, or `error`. |
-| `input` | Original user input string. |
-| `artifacts` | Files written relative to output directory. |
-| `source_media` | Retained-media or explicit-omission receipts with source identity, purpose, format, size, and integrity. |
-| `steps` | Ordered pipeline steps with compact status/details. |
-| `warnings` | Recoverable issues. |
-| `transform_evidence` | Structured route evidence for model-mediated capabilities, including selected route, provider/model id, upload/cost flags, deterministic flag, and reason. Secrets are never recorded. |
+| `sources` | Independent source entries. Each owns stable identity/key/path, revision, status, artifacts, effects, retained assets, steps, warnings, and transform evidence. Paths inside an entry are relative to its lane. |
 
 ### `metadata.json`
 
@@ -870,12 +928,12 @@ Shape:
 
 Recommended agent flow:
 
-1. Run `vctx prepare INPUT --out DIR`.
+1. Run `vctx prepare INPUT... --out DIR`.
 2. Read `DIR/manifest.json`.
-3. If `status` is `ok` or `partial`, select artifact:
-   - use `context.md` for context injection
-   - use `chunks.json` for programmatic chunk-by-chunk processing
-   - use `readable.md` for human-facing source review
+3. For each usable `sources[]` entry, enter its `path` and select artifacts:
+   - use `<path>/context.md` for context injection
+   - use `<path>/chunks.json` for programmatic chunk-by-chunk processing
+   - use `<path>/readable.md` for human-facing source review
 4. The agent performs summarization, knowledge-flow extraction, Q&A, or memory updates outside `vctx`.
 
 Example agent prompt wrapper:

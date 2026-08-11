@@ -28,7 +28,7 @@ away from its current host-ffmpeg frame adapter is tracked separately.
 Then run:
 
 ```bash
-vctx prepare INPUT --out DIR
+vctx prepare INPUT... --out DIR
 ```
 
 Prepare local models explicitly; normal `prepare` never downloads them:
@@ -39,11 +39,22 @@ vctx models status asr ocr
 vctx models verify asr ocr --json
 ```
 
+Inspect or explicitly prune the independent source cache:
+
+```bash
+vctx cache status
+vctx cache prune --dry-run --age 30d
+vctx cache prune --age 30d
+```
+
+Plain `cache prune` removes only orphan blobs and temporary files. Use `--all`
+to retire every cached source record. Source-cache commands never touch models.
+
 For one-off use without installing the tool globally:
 
 ```bash
-uvx vctx prepare INPUT --out DIR
-uvx --from "vctx[full]" vctx prepare INPUT --out DIR
+uvx vctx prepare INPUT... --out DIR
+uvx --from "vctx[full]" vctx prepare INPUT... --out DIR
 ```
 
 ## Install for development
@@ -65,7 +76,7 @@ uv sync --extra full
 ### Prepare a context pack
 
 ```bash
-uv run vctx prepare INPUT --out DIR
+uv run vctx prepare INPUT... --out DIR
 ```
 
 Examples:
@@ -73,6 +84,7 @@ Examples:
 ```bash
 uv run vctx prepare ./captions.srt --out ./out/captions
 uv run vctx prepare ./lecture.vtt --out ./out/lecture
+uv run vctx prepare ./part-1.vtt ./part-2.vtt --out ./out/course
 uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes" --workflow visual --out ./out/ted
 ```
 
@@ -80,6 +92,7 @@ uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes
 
 ```text
 --workflow default|transcript|visual|full|metadata
+--media-quality auto|fast|balanced|high
 --asr auto|none|instance:NAME|local:MODEL
 --ocr auto|none
 --vision auto|none|instance:NAME|openrouter:MODEL
@@ -94,23 +107,33 @@ uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes
 --debug
 ```
 
+Each URL operation performs one source observation. `metadata` and `prepare`
+share config, offline policy, source options, and sanitized source identity.
+
 ### Inspect output
 
 Start with:
 
 ```text
 DIR/manifest.json
-DIR/readable.md
-DIR/context.md
+DIR/<source-key>/readable.md
+DIR/<source-key>/context.md
 ```
 
-Required source media is copied into `DIR/media/` and indexed in the manifest
-by default, including local inputs. Use `--no-retain-media` only when pack size
-matters more than self-containment.
+Each input owns one independent `DIR/<source-key>/` lane. Required source media
+is retained flat inside that lane and indexed under the same source in the root
+manifest. Multiple inputs are never summarized together. Use
+`--no-retain-media` only when pack size matters more than self-containment.
 
-`--offline` admits local inputs and verified local assets. URL-source caching is
-not implemented yet, so an offline URL fails before `yt-dlp` runs or an output
-pack is created.
+Preparing into an existing verified pack performs a source-identity upsert. New
+sources are added, unchanged revisions are reused, and changed revisions replace
+only their lane. `--overwrite` forces requested lanes to rebuild. The complete
+pack is verified and swapped as one filesystem generation; unknown or corrupt
+output contents are always refused.
+
+`--offline` admits local inputs and verified cached URL observations/subtitles.
+A miss or unverified asset fails before `yt-dlp`, network construction, or output
+pack creation.
 
 Inspect the resolved product policy without network access:
 
@@ -133,7 +156,7 @@ Optional visual artifacts:
 ```text
 visual_records.json   OCR/VLM/capture evidence
 visual_scores.json    visual satisfaction diagnostics
-visual/frames/*.png   captured frames
+frame-*.png           captured frames
 ```
 
 Optional flow artifact:

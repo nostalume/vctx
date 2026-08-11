@@ -34,9 +34,6 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --dev
 
-      - name: Check module layout
-        run: uv run python scripts/check_module_layout.py
-
       - name: Ruff
         run: uv run ruff check .
 

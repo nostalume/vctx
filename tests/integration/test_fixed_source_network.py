@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from vctx.artifact.manifest import Manifest
 from vctx.cli import app
 from vctx.models.knowledge_flow import KnowledgeFlow
-from vctx.models.manifest import Manifest
-from vctx.models.metadata import VideoMetadata
+from vctx.source.session import VideoMetadata
 from vctx.transcript import Transcript
 
 _FIXED_TED_URL = "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes"
@@ -37,11 +37,12 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
     )
 
     assert result.exit_code == 0, result.output
-    _assert_required_artifacts(out_dir)
 
     manifest = Manifest.model_validate_json(
         (out_dir / "manifest.json").read_text(encoding="utf-8")
     )
+    lane = out_dir / manifest.sources[0].path
+    _assert_required_artifacts(lane)
     assert manifest.status == "ok"
     assert _step_status(manifest, "source.detect") == "ok"
     assert _step_status(manifest, "metadata.extract") == "ok"
@@ -49,7 +50,7 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
     assert _step_status(manifest, "transcript.parse") == "ok"
 
     metadata = VideoMetadata.model_validate_json(
-        (out_dir / "metadata.json").read_text(encoding="utf-8")
+        (lane / "metadata.json").read_text(encoding="utf-8")
     )
     assert metadata.source_type == "url"
     assert metadata.raw_provider == "yt-dlp"
@@ -58,7 +59,7 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
     assert "ted.com/talks/terry_moore_how_to_tie_your_shoes" in metadata.webpage_url
 
     raw = Transcript.model_validate_json(
-        (out_dir / "transcript.raw.json").read_text(encoding="utf-8")
+        (lane / "transcript.raw.json").read_text(encoding="utf-8")
     )
     assert raw.provenance.provider == "yt-dlp"
     assert raw.provenance.method in {"official_subtitles", "automatic_subtitles"}
@@ -69,26 +70,25 @@ def test_fixed_ted_source_writes_transcript_context_pack(tmp_path: Path) -> None
     assert all("#EXTM3U" not in segment.text for segment in raw.segments)
 
     clean = Transcript.model_validate_json(
-        (out_dir / "transcript.clean.json").read_text(encoding="utf-8")
+        (lane / "transcript.clean.json").read_text(encoding="utf-8")
     )
     transcript_chars = sum(len(segment.text) for segment in clean.segments)
     assert len(clean.segments) >= 5
     assert transcript_chars >= 1000
 
-    context = (out_dir / "context.md").read_text(encoding="utf-8")
-    readable = (out_dir / "readable.md").read_text(encoding="utf-8")
+    context = (lane / "context.md").read_text(encoding="utf-8")
+    readable = (lane / "readable.md").read_text(encoding="utf-8")
     assert "# Agent Context Pack" in context
     assert "Source:" in readable
     assert "tie" in readable.lower()
 
-    knowledge_flow_path = out_dir / "knowledge_flow.json"
+    knowledge_flow_path = lane / "knowledge_flow.json"
     if knowledge_flow_path.exists():
         KnowledgeFlow.model_validate_json(knowledge_flow_path.read_text(encoding="utf-8"))
 
 
 def _assert_required_artifacts(out_dir: Path) -> None:
     required = {
-        "manifest.json",
         "metadata.json",
         "transcript.raw.json",
         "transcript.clean.json",
@@ -102,7 +102,7 @@ def _assert_required_artifacts(out_dir: Path) -> None:
 
 
 def _step_status(manifest: Manifest, name: str) -> str:
-    for step in manifest.steps:
+    for step in manifest.sources[0].steps:
         if step.name == name:
             return step.status
     raise AssertionError(f"missing manifest step: {name}")

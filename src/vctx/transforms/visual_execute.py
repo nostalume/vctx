@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from vctx.app.credentials import CredentialError, resolve_env_credential
-from vctx.models.media import MediaAsset
 from vctx.models.visual import FrameAsset, VisualRecord, VisualRecordSet
+from vctx.source.session import MediaAsset
 from vctx.transforms import visual_frames
 from vctx.transforms.ai_routes import AiRoute
 from vctx.transforms.visual_ocr import OcrExecutionError, RapidOcrAdapter
@@ -23,35 +24,52 @@ def run_visual_context(
     *,
     cache_root: Path | None = None,
     env_files: list[Path] | None = None,
+    runtime_cache: dict[str, object] | None = None,
 ) -> VisualRecordSet:
     frames: list[FrameAsset] = []
     records: list[VisualRecord] = []
-    frames_dir = out_dir / "visual" / "frames"
+    frames_dir = out_dir
     ocr_adapter: RapidOcrAdapter | None = None
-
-    for action in assessment.recipe:
-        if action.name == "sample":
-            frames = _extract_frames(media_asset, action, frames_dir)
-        elif action.name == "ocr":
-            if cache_root is None:
-                raise VisualExecutionError("OCR execution requires the managed model cache")
-            if ocr_adapter is None:
-                ocr_adapter = RapidOcrAdapter(cache_root=cache_root)
-            try:
-                records.extend(_ocr_records(frames, ocr_adapter))
-            except OcrExecutionError as exc:
-                raise VisualExecutionError(str(exc)) from exc
-        elif action.name == "capture":
-            records.extend(_capture_records(frames, out_dir))
-        elif action.name == "describe":
-            records.extend(
-                _description_records(
-                    frames,
-                    action,
-                    env_files or [],
+    complete = False
+    try:
+        for action in assessment.recipe:
+            if action.name == "sample":
+                frames = _extract_frames(media_asset, action, frames_dir)
+            elif action.name == "ocr":
+                if cache_root is None:
+                    raise VisualExecutionError("OCR execution requires the managed model cache")
+                if ocr_adapter is None:
+                    cache = runtime_cache if runtime_cache is not None else {}
+                    key = f"ocr:{cache_root.resolve()}"
+                    ocr_adapter = cast(RapidOcrAdapter | None, cache.get(key))
+                    if ocr_adapter is None:
+                        ocr_adapter = RapidOcrAdapter(cache_root=cache_root)
+                        cache[key] = ocr_adapter
+                try:
+                    records.extend(_ocr_records(frames, ocr_adapter))
+                except OcrExecutionError as exc:
+                    raise VisualExecutionError(str(exc)) from exc
+            elif action.name == "capture":
+                records.extend(_capture_records(frames, out_dir))
+            elif action.name == "describe":
+                records.extend(
+                    _description_records(
+                        frames,
+                        action,
+                        env_files or [],
+                    )
                 )
-            )
-    return VisualRecordSet(records=records)
+        complete = True
+        return VisualRecordSet(records=records)
+    finally:
+        kept = {record.artifact_path for record in records if complete and record.artifact_path}
+        for frame in frames:
+            try:
+                relative = frame.path.relative_to(out_dir).as_posix()
+            except ValueError:
+                continue
+            if relative not in kept:
+                frame.path.unlink(missing_ok=True)
 
 
 def _extract_frames(

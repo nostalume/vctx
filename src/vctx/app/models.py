@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from vctx.config import PrepareRequest, WorkflowProfile, resolve_config
 from vctx.errors import VctxError
-from vctx.io import build_cache, model_to_json
+from vctx.io import model_to_json
 
 ModelCapability = Literal["asr", "ocr"]
 ModelState = Literal["ready", "missing", "corrupt"]
@@ -38,7 +38,7 @@ def resolve_asr_model_id(
 ) -> str:
     resolved = resolve_config(
         PrepareRequest(
-            input="model-lifecycle",
+            inputs=["model-lifecycle"],
             out_dir=Path("."),
             workflow=WorkflowProfile.TRANSCRIPT,
             config_path=config_path,
@@ -64,14 +64,23 @@ def resolve_asr_model_id(
     return "base" if model_id == "auto" else model_id
 
 
+def resolve_model_dir(*, config_path: Path | None, cache_dir: Path | None) -> Path:
+    return resolve_config(
+        PrepareRequest(inputs=["model-lifecycle"], out_dir=Path("."), config_path=config_path,
+                       cache_dir=cache_dir)
+    ).cache.model_dir
+
+
 def manage_models(
     action: Literal["pull", "status", "verify"],
     capabilities: list[str] | None,
     *,
-    cache_dir: Path | None,
+    cache_dir: Path,
     asr_model_id: str = "base",
 ) -> list[ModelReceipt]:
-    cache_root = build_cache(cache_dir).root
+    cache_root = cache_dir
+    if action == "pull":
+        cache_root.mkdir(parents=True, exist_ok=True)
     selected = _capabilities(capabilities)
     if action == "pull":
         return [_pull(capability, cache_root, asr_model_id=asr_model_id) for capability in selected]
@@ -103,7 +112,7 @@ def require_prepared_model(
 
 
 def rapidocr_config_path(cache_root: Path) -> Path:
-    return cache_root / "models" / "ocr" / "rapidocr" / "config.yaml"
+    return cache_root / "ocr" / "rapidocr" / "config.yaml"
 
 
 def _capabilities(values: list[str] | None) -> list[ModelCapability]:
@@ -127,11 +136,11 @@ def _identity(capability: ModelCapability, asr_model_id: str = "base") -> tuple[
 
 def _model_dir(capability: ModelCapability, cache_root: Path, *, asr_model_id: str) -> Path:
     _provider, model_id, _package = _identity(capability, asr_model_id)
-    return cache_root / "models" / capability / model_id
+    return cache_root / capability / model_id
 
 
 def _receipt_path(capability: ModelCapability, cache_root: Path) -> Path:
-    return cache_root / "models" / "receipts" / f"{capability}.json"
+    return cache_root / "receipts" / f"{capability}.json"
 
 
 def _pull(capability: ModelCapability, cache_root: Path, *, asr_model_id: str) -> ModelReceipt:
@@ -193,7 +202,7 @@ def _inspect(
 
 
 def _pull_model(capability: str, model_id: str, cache_root: Path) -> Path:
-    target = cache_root / "models" / capability / model_id
+    target = cache_root / capability / model_id
     target.mkdir(parents=True, exist_ok=True)
     try:
         if capability == "asr":

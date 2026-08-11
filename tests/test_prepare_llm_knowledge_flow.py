@@ -98,7 +98,7 @@ def test_prepare_explicit_llm_knowledge_flow_supplement_merges_into_artifact(
     tmp_path: Path,
 ) -> None:
     import vctx.app.prepare as prepare_module
-    import vctx.sources.ytdlp_source as ytdlp_module
+    import vctx.source.ytdlp as ytdlp_module
 
     FakeTextAdapter.calls = []
     FakeTextAdapter.seen_api_key = None
@@ -155,13 +155,15 @@ def test_prepare_explicit_llm_knowledge_flow_supplement_merges_into_artifact(
     assert result.exit_code == 0, result.output
     assert FakeTextAdapter.seen_api_key == "from-dotenv"
     assert len(FakeTextAdapter.calls) == 1
-    flow = json.loads((out_dir / "knowledge_flow.json").read_text(encoding="utf-8"))
-    assert _has_edge(flow, "extract subtitles", "build context pack")
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    flow = json.loads((lane / "knowledge_flow.json").read_text(encoding="utf-8"))
+    assert _has_edge(flow, "extract subtitles", "build context pack")
     assert _step_status(manifest, "knowledge_flow.llm_extract") == "ok"
-    assert manifest["transform_evidence"][-1]["capability"] == "knowledge_flow"
-    assert manifest["transform_evidence"][-1]["selected_route"] == "configured-online"
-    assert manifest["transform_evidence"][-1]["model_id"] == "test/text-model"
+    assert source_entry["transform_evidence"][-1]["capability"] == "knowledge_flow"
+    assert source_entry["transform_evidence"][-1]["selected_route"] == "configured-online"
+    assert source_entry["transform_evidence"][-1]["model_id"] == "test/text-model"
     assert "from-dotenv" not in json.dumps(manifest)
 
 
@@ -173,7 +175,7 @@ def _step_status(manifest: dict[str, Any], name: str) -> str:
 
 
 def _step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    for raw_step in manifest["steps"]:
+    for raw_step in manifest["sources"][0]["steps"]:
         assert isinstance(raw_step, dict)
         step = cast(dict[str, Any], raw_step)
         if step["name"] == name:

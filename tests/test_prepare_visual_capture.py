@@ -16,6 +16,7 @@ runner = CliRunner()
 def test_prepare_visual_workflow_writes_capture_records_and_frame_refs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import vctx.transforms.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     import vctx.transforms.visual_ocr as visual_ocr_module
@@ -98,39 +99,39 @@ cache = "persistent"
     )
 
     assert result.exit_code == 0, result.output
-    assert (out_dir / "visual_records.json").exists()
-    assert (out_dir / "visual" / "frames" / "frame-0001.png").exists()
-
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    assert (lane / "visual_records.json").exists()
+    assert (lane / "frame-0001.png").exists()
     visual_records = json.loads(
-        (out_dir / "visual_records.json").read_text(encoding="utf-8")
+        (lane / "visual_records.json").read_text(encoding="utf-8")
     )
     assert visual_records["records"][0]["kind"] == "capture"
-    assert visual_records["records"][0]["artifact_path"] == "visual/frames/frame-0001.png"
-
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert visual_records["records"][0]["artifact_path"] == "frame-0001.png"
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "transform.visual_plan") == "ok"
     assert _step_status(manifest, "transform.visual_capture") == "ok"
-    assert {artifact["path"] for artifact in manifest["artifacts"]} >= {
+    assert {artifact["path"] for artifact in source_entry["artifacts"]} >= {
         "visual_records.json",
-        "visual/frames/frame-0001.png",
+        "frame-0001.png",
     }
 
-    context = (out_dir / "context.md").read_text(encoding="utf-8")
+    context = (lane / "context.md").read_text(encoding="utf-8")
     assert "## Visual references" in context
     assert (
         '<visual_ref id="frame-0001" timestamp="00:00:01" '
-        'path="visual/frames/frame-0001.png">'
+        'path="frame-0001.png">'
     ) in context
 
-    readable = (out_dir / "readable.md").read_text(encoding="utf-8")
+    readable = (lane / "readable.md").read_text(encoding="utf-8")
     assert "## Visual references" in readable
     assert "### 00:00:01 — frame-0001" in readable
-    assert "![Frame frame-0001 at 00:00:01](visual/frames/frame-0001.png)" in readable
+    assert "![Frame frame-0001 at 00:00:01](frame-0001.png)" in readable
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)
@@ -145,7 +146,8 @@ def _step_status(manifest: dict[str, Any], name: str) -> str:
 def test_prepare_visual_no_motives_skips_visual_media_download(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.sources.ytdlp_source as ytdlp_module
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    import vctx.source.ytdlp as ytdlp_module
 
     class FakeYoutubeDL:
         calls: list[bool] = []
@@ -208,6 +210,7 @@ def test_prepare_visual_no_motives_skips_visual_media_download(
 
     assert result.exit_code == 0, result.output
     assert True not in FakeYoutubeDL.calls
-    assert not (out_dir / "visual_records.json").exists()
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    lane = out_dir / manifest["sources"][0]["path"]
+    assert not (lane / "visual_records.json").exists()
     assert _step_status(manifest, "transform.visual_plan") == "skipped"

@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 import typer
 from platformdirs import user_config_path
 
+from vctx.app.cache import manage_cache, render_cache
 from vctx.app.chunk import write_chunk_file
 from vctx.app.doctor import doctor_report
 from vctx.app.metadata import inspect_metadata, render_metadata_text
@@ -16,16 +17,58 @@ from vctx.app.models import (
     manage_models,
     render_model_receipts,
     resolve_asr_model_id,
+    resolve_model_dir,
 )
-from vctx.app.prepare import PrepareRequest, prepare_context_pack
+from vctx.app.pack import prepare_context_pack
 from vctx.app.render import RenderFormat, write_render_file
-from vctx.config import WorkflowProfile
+from vctx.config import MediaQuality, PrepareRequest, WorkflowProfile
 from vctx.errors import VctxError
 from vctx.io import model_to_json
 
 app = typer.Typer(no_args_is_help=True)
 models_app = typer.Typer(no_args_is_help=True)
+cache_app = typer.Typer(no_args_is_help=True)
 app.add_typer(models_app, name="models")
+app.add_typer(cache_app, name="cache")
+
+def _cache_command(
+    action: Literal["status", "prune"], cache_dir: Path | None, config: Path | None,
+    json_output: bool, *, age: str | None = None, all_records: bool = False,
+    dry_run: bool = False
+) -> None:
+    try:
+        report = manage_cache(
+            action, config_path=_select_config_path(config), cache_dir=cache_dir,
+            age=age, all_records=all_records, dry_run=dry_run
+        )
+    except VctxError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(exc.exit_code) from exc
+    typer.echo(render_cache(report, json_output=json_output), nl=False)
+
+@cache_app.command("status")
+def cache_status_command(
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    _cache_command("status", cache_dir, config, json_output)
+
+@cache_app.command("prune")
+def cache_prune_command(
+    age: Annotated[
+        str | None, typer.Option("--age", help="Prune entries older than 30d/12h/4w.")
+    ] = None,
+    all_records: Annotated[bool, typer.Option("--all", help="Prune every source record.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    _cache_command(
+        "prune", cache_dir, config, json_output,
+        age=age, all_records=all_records, dry_run=dry_run
+    )
 
 
 def _models_command(
@@ -40,8 +83,11 @@ def _models_command(
         asr_model_id = resolve_asr_model_id(
             config_path=_select_config_path(config), cache_dir=cache_dir, selector=asr
         )
+        model_dir = resolve_model_dir(
+            config_path=_select_config_path(config), cache_dir=cache_dir
+        )
         receipts = manage_models(
-            action, capabilities, cache_dir=cache_dir, asr_model_id=asr_model_id
+            action, capabilities, cache_dir=model_dir, asr_model_id=asr_model_id
         )
     except ModelLifecycleError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -90,14 +136,19 @@ def models_verify_command(
 
 @app.command("prepare")
 def prepare_command(
-    input: str,
+    inputs: list[str],
     out: Annotated[Path, typer.Option("--out", help="Output directory for durable artifacts.")],
     overwrite: Annotated[
-        bool, typer.Option("--overwrite", help="Allow writing into non-empty output directory.")
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Rebuild requested lanes when updating an existing verified pack.",
+        ),
     ] = False,
     chunk_max_chars: Annotated[int | None, typer.Option("--chunk-max-chars")] = None,
     chunk_max_seconds: Annotated[int | None, typer.Option("--chunk-max-seconds")] = None,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    media_quality: Annotated[MediaQuality | None, typer.Option("--media-quality")] = None,
     keep_temp: Annotated[bool | None, typer.Option("--keep-temp")] = None,
     workflow: Annotated[
         WorkflowProfile | None,
@@ -156,12 +207,13 @@ def prepare_command(
     try:
         result = prepare_context_pack(
             PrepareRequest(
-                input=input,
+                inputs=inputs,
                 out_dir=out,
                 overwrite=overwrite,
                 chunk_max_chars=chunk_max_chars,
                 chunk_max_seconds=chunk_max_seconds,
                 cache_dir=cache_dir,
+                media_quality=media_quality,
                 keep_temp=keep_temp,
                 workflow=workflow,
                 asr_use=asr,
@@ -181,13 +233,6 @@ def prepare_command(
     else:
         typer.echo(f"Wrote context pack: {result.out_dir}")
     typer.echo(f"Manifest: {result.out_dir / 'manifest.json'}")
-    artifact_paths = {artifact.path for artifact in result.artifacts}
-    if "metadata.json" in artifact_paths:
-        typer.echo(f"Metadata: {result.out_dir / 'metadata.json'}")
-    if "context.md" in artifact_paths:
-        typer.echo(f"Context: {result.out_dir / 'context.md'}")
-    if "readable.md" in artifact_paths:
-        typer.echo(f"Readable: {result.out_dir / 'readable.md'}")
     for line in result.summary.render_cli_lines():
         typer.echo(line)
 
@@ -199,9 +244,17 @@ def metadata_command(
         bool,
         typer.Option("--json", help="Print normalized VideoMetadata JSON."),
     ] = False,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    offline: Annotated[bool | None, typer.Option("--offline")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
 ) -> None:
     try:
-        metadata = inspect_metadata(input)
+        metadata = inspect_metadata(
+            input,
+            config_path=_select_config_path(config),
+            cache_dir=cache_dir,
+            offline=offline,
+        )
     except VctxError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(exc.exit_code) from exc

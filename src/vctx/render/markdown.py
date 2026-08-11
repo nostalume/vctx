@@ -5,8 +5,8 @@ from html import escape
 
 from vctx.chunking import ChunkSet
 from vctx.models.knowledge_flow import KnowledgeFlow, KnowledgeFlowEdge
-from vctx.models.metadata import VideoMetadata
 from vctx.models.visual import VisualRecord, VisualRecordSet
+from vctx.source.session import VideoMetadata
 from vctx.transcript import Transcript
 from vctx.util import format_timestamp
 

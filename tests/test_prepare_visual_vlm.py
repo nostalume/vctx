@@ -114,8 +114,10 @@ model = "vision-test"
     )
 
     assert result.exit_code == 0, result.output
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    lane = out_dir / manifest["sources"][0]["path"]
     visual_records = json.loads(
-        (out_dir / "visual_records.json").read_text(encoding="utf-8")
+        (lane / "visual_records.json").read_text(encoding="utf-8")
     )
     assert [record["kind"] for record in visual_records["records"]] == [
         "description",
@@ -126,15 +128,14 @@ model = "vision-test"
         == "A left-to-right service diagram from ingestion to context pack."
     )
 
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert _step_status(manifest, "transform.visual_plan") == "ok"
     assert _step_detail(manifest, "transform.visual_plan") == "configured VLM: test-vlm"
     assert _step_status(manifest, "transform.visual_capture") == "ok"
 
-    context = (out_dir / "context.md").read_text(encoding="utf-8")
+    context = (lane / "context.md").read_text(encoding="utf-8")
     assert (
         '<visual_ref id="frame-0001" timestamp="00:00:01" '
-        'path="visual/frames/frame-0001.png">'
+        'path="frame-0001.png">'
     ) in context
     assert "<description" in context
     assert (
@@ -142,8 +143,8 @@ model = "vision-test"
         in context
     )
 
-    readable = (out_dir / "readable.md").read_text(encoding="utf-8")
-    assert "![Frame frame-0001 at 00:00:01](visual/frames/frame-0001.png)" in readable
+    readable = (lane / "readable.md").read_text(encoding="utf-8")
+    assert "![Frame frame-0001 at 00:00:01](frame-0001.png)" in readable
     assert "- DESCRIPTION: A left-to-right service diagram" in readable
 
 
@@ -244,13 +245,14 @@ cache = "persistent"
     )
 
     assert result.exit_code == 0, result.output
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    lane = out_dir / manifest["sources"][0]["path"]
     visual_records = json.loads(
-        (out_dir / "visual_records.json").read_text(encoding="utf-8")
+        (lane / "visual_records.json").read_text(encoding="utf-8")
     )
     assert visual_records["records"][0]["text"] == (
         "A prefix-resolved OpenRouter VLM description."
     )
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert _step_detail(manifest, "transform.visual_plan") == (
         "free VLM: openrouter:nex-agi/nex-n2-pro:free"
     )
@@ -298,8 +300,10 @@ def test_prepare_visual_auto_uses_cached_openrouter_registry(
     config.write_text(
         f'''
 [runtime]
-cache_dir = "{cache_dir.as_posix()}"
 env_files = ["{env_file.name}"]
+
+[cache]
+model_dir = "{cache_dir.as_posix()}"
 
 [transforms.asr]
 use = "instance:local-default"
@@ -482,12 +486,13 @@ cache = "persistent"
     )
 
     assert result.exit_code == 0, result.output
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    lane = out_dir / manifest["sources"][0]["path"]
     visual_records = json.loads(
-        (out_dir / "visual_records.json").read_text(encoding="utf-8")
+        (lane / "visual_records.json").read_text(encoding="utf-8")
     )
     assert [record["kind"] for record in visual_records["records"]] == ["capture"]
 
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     assert _step_status(manifest, "transform.visual_plan") == "ok"
     assert _step_status(manifest, "transform.visual_capture") == "ok"
     assert "test-secret" not in json.dumps(manifest)
@@ -502,7 +507,7 @@ def _step_detail(manifest: dict[str, Any], name: str) -> str:
 
 
 def _step_value(manifest: dict[str, Any], name: str, key: str) -> str:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)

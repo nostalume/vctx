@@ -51,25 +51,27 @@ hello
     assert "Workflow: metadata" in result.output
     assert "Status: partial" in result.output
     assert "Warnings:" in result.output
-    assert "Metadata:" in result.output
+    assert "/metadata.json" in result.output
     assert "Context:" not in result.output
-    assert (out_dir / "metadata.json").exists()
     assert (out_dir / "manifest.json").exists()
-    assert not (out_dir / "transcript.clean.json").exists()
-    assert not (out_dir / "chunks.json").exists()
-    assert not (out_dir / "context.md").exists()
 
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    assert (lane / "metadata.json").exists()
+    assert not (lane / "transcript.clean.json").exists()
+    assert not (lane / "chunks.json").exists()
+    assert not (lane / "context.md").exists()
     assert manifest["status"] == "partial"
-    assert {artifact["path"] for artifact in manifest["artifacts"]} == {"metadata.json"}
-    assert manifest["warnings"] == ["metadata workflow selected; transcript pipeline skipped"]
+    assert {artifact["path"] for artifact in source_entry["artifacts"]} == {"metadata.json"}
+    assert source_entry["warnings"] == ["metadata workflow selected; transcript pipeline skipped"]
     assert _step_status(manifest, "transcript.extract") == "skipped"
 
 
 def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.sources.ytdlp_source as module
+    import vctx.source.ytdlp as module
 
     FakeYoutubeDL.info = {
         "id": "abc",
@@ -92,28 +94,28 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     assert "Workflow: default" in result.output
     assert "Status: partial" in result.output
     assert "Routes:" in result.output
-    assert "Metadata:" in result.output
+    assert "/metadata.json" in result.output
     assert "Context:" not in result.output
-    assert (out_dir / "metadata.json").exists()
     assert (out_dir / "manifest.json").exists()
-    assert not (out_dir / "transcript.clean.json").exists()
-    assert not (out_dir / "chunks.json").exists()
-
-    metadata = json.loads((out_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["id"] == "example__abc"
-
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    assert (lane / "metadata.json").exists()
+    assert not (lane / "transcript.clean.json").exists()
+    assert not (lane / "chunks.json").exists()
+    metadata = json.loads((lane / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["id"] == "example__abc"
     assert manifest["status"] == "partial"
     assert _step_status(manifest, "transcript.extract") == "warning"
     assert _step_status(manifest, "transform.asr") == "warning"
-    assert "No subtitles found" in "\n".join(manifest["warnings"])
-    assert "Provide a transcript file" in "\n".join(manifest["warnings"])
+    assert "No subtitles found" in "\n".join(source_entry["warnings"])
+    assert "Provide a transcript file" in "\n".join(source_entry["warnings"])
 
 
 def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.sources.ytdlp_source as module
+    import vctx.source.ytdlp as module
 
     monkeypatch.setattr(
         module.yt_dlp,
@@ -155,11 +157,35 @@ def test_prepare_offline_accepts_local_input(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert (out_dir / "manifest.json").exists()
-    assert (out_dir / "transcript.clean.json").exists()
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert (out_dir / manifest["sources"][0]["path"] / "transcript.clean.json").exists()
+
+
+@pytest.mark.parametrize("cache_inside_output", [False, True])
+def test_prepare_rejects_cache_output_containment_before_writing(
+    tmp_path: Path, cache_inside_output: bool
+) -> None:
+    source = tmp_path / "local.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\nlocal\n", encoding="utf-8")
+    if cache_inside_output:
+        out_dir = tmp_path / "out"
+        cache_dir = out_dir / "cache"
+    else:
+        cache_dir = tmp_path / "cache"
+        out_dir = cache_dir / "source" / "out"
+
+    result = runner.invoke(
+        app,
+        ["prepare", str(source), "--out", str(out_dir), "--cache-dir", str(cache_dir)],
+    )
+
+    assert result.exit_code == 2
+    assert "must not contain each other" in result.output
+    assert not out_dir.exists()
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)

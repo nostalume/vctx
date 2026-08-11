@@ -5,11 +5,16 @@
 
 [runtime]
 workflow = "visual"
-cache_dir = ".cache/vctx-visual-smoke"
 env_files = [".env"]
 
+[cache]
+source_dir = ".cache/vctx-visual-smoke/source"
+model_dir = ".cache/vctx-visual-smoke/models"
+
+[source]
+media_quality = "balanced"
+
 [source.yt_dlp]
-media_profile = "balanced"
 # Source acquisition preference only; not OCR translation.
 subtitle_languages = ["en", "ja", "zh-Hans", "zh-Hant"]
 

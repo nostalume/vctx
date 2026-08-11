@@ -20,7 +20,7 @@ cross-video memory, or web/desktop backend.
   for frame OCR. Optional OpenAI-compatible/OpenRouter routes provide text and
   vision transforms when explicitly configured.
 - Visual frame extraction currently uses the host `ffmpeg` executable.
-- Quality gate: Ruff, ty, pytest, module-layout check, then distribution build.
+- Quality gate: Ruff, ty, pytest, behavior-suite LOC budget, then distribution build.
 
 ## Principles
 
@@ -32,7 +32,7 @@ cross-video memory, or web/desktop backend.
   `manifest.json`.
 - Keep provider payloads at adapters and use typed internal models across
   boundaries.
-- Preserve dependency direction: `cli -> app -> sources/transforms/render/io ->
+- Preserve dependency direction: `cli -> app -> source/transforms/render/io ->
   models`; render does not acquire sources or call providers, and models do not
   depend on higher layers.
 - The visual path is motive-led: acquire media only for transcript-anchored

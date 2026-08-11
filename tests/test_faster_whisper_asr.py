@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from vctx.config import AsrInstanceConfig
-from vctx.models import SourceRef
-from vctx.models.media import LocalMediaAsset
+from vctx.source.local import LocalMediaAsset
+from vctx.source.session import SourceRef
 from vctx.transforms.asr import AsrExecutionError, FasterWhisperAsrAdapter
 
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from platformdirs import user_cache_path
 from pydantic import (
@@ -16,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+from vctx.errors import ConfigError
 from vctx.render.bundle import DEFAULT_FORMATS, OutputFormat
 
 
@@ -27,7 +29,8 @@ class WorkflowProfile(StrEnum):
     METADATA = "metadata"
 
 
-class MediaProfile(StrEnum):
+class MediaQuality(StrEnum):
+    AUTO = "auto"
     FAST = "fast"
     BALANCED = "balanced"
     HIGH = "high"
@@ -126,7 +129,6 @@ class YtDlpSourceOptions(BaseModel):
     session: SourceSession = Field(default_factory=NoSourceSession)
     network: SourceNetwork = Field(default_factory=DirectSourceNetwork)
     playlist: PlaylistSelection = Field(default_factory=DefaultPlaylistSelection)
-    media_profile: MediaProfile = MediaProfile.BALANCED
     subtitle_languages: list[str] = Field(default_factory=list)
 
 
@@ -134,16 +136,39 @@ class RuntimeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workflow: WorkflowProfile | None = None
-    cache_dir: Path | None = None
     keep_temp: bool = False
     offline: bool = False
     env_files: list[Path] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_old_cache(cls, value: object) -> object:
+        if isinstance(value, dict) and "cache_dir" in value:
+            raise ValueError("runtime.cache_dir was removed; use [cache].source_dir and model_dir")
+        return value
+
+
+class CacheInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_dir: Path | None = None
+    model_dir: Path | None = None
 
 
 class SourceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
+    media_quality: MediaQuality = MediaQuality.AUTO
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_old_media_profile(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            yt_dlp = cast(Mapping[str, object], value).get("yt_dlp")
+            if isinstance(yt_dlp, Mapping) and "media_profile" in yt_dlp:
+                raise ValueError("source.yt_dlp.media_profile: use source.media_quality")
+        return value
 
 
 class AutoUse(BaseModel):
@@ -193,7 +218,7 @@ InstanceCachePolicy = Literal["persistent", "disabled"]
 
 
 class PrepareRequest(BaseModel):
-    input: str
+    inputs: list[str] = Field(min_length=1)
     out_dir: Path
     overwrite: bool = False
     chunk_max_chars: int | None = None
@@ -210,18 +235,24 @@ class PrepareRequest(BaseModel):
     subtitle_languages: list[str] = Field(default_factory=list)
     output_language: str | None = None
     retain_media: bool | None = None
+    media_quality: MediaQuality | None = None
 
 
 class RuntimeConfig(BaseModel):
-    cache_dir: Path
     keep_temp: bool
     offline: bool
     workflow: WorkflowProfile
     env_files: list[Path] = Field(default_factory=list)
 
 
+class CacheConfig(BaseModel):
+    source_dir: Path
+    model_dir: Path
+
+
 class SourceConfig(BaseModel):
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
+    media_quality: MediaQuality
 
 
 class CapabilityPolicy(BaseModel):
@@ -323,6 +354,7 @@ class ConfigInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime: RuntimeInput = Field(default_factory=RuntimeInput)
+    cache: CacheInput = Field(default_factory=CacheInput)
     source: SourceInput = Field(default_factory=SourceInput)
     transforms: TransformInput = Field(default_factory=TransformInput)
     output: OutputInput = Field(default_factory=OutputInput)
@@ -343,6 +375,7 @@ class ConfigPathContext(BaseModel):
 
 class ResolvedConfig(BaseModel):
     runtime: RuntimeConfig
+    cache: CacheConfig
     source: SourceConfig
     transforms: TransformConfig
     output: OutputConfig
@@ -504,7 +537,7 @@ def _request_policy(raw: CapabilityInput, use: TransformUse | str | None) -> Cap
     )
 
 
-def resolve_config(request: PrepareRequest) -> ResolvedConfig:
+def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
     """Resolve user request/config omissions into concrete default/auto policy."""
 
     config = _read_config(request.config_path)
@@ -522,14 +555,16 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
     keep_temp = _coalesce(request.keep_temp, config.runtime.keep_temp, default=False)
     asr, visual_context, knowledge_flow = _workflow_capabilities(workflow)
 
-    cache_dir = _coalesce(
-        request.cache_dir,
-        (
-            path_context.resolve_config_path(config.runtime.cache_dir)
-            if config.runtime.cache_dir is not None
-            else None
-        ),
-        default=_default_cache_dir(),
+    cache_root = request.cache_dir or _default_cache_dir()
+    source_dir = (
+        cache_root / "source"
+        if request.cache_dir is not None or config.cache.source_dir is None
+        else path_context.resolve_config_path(config.cache.source_dir)
+    )
+    model_dir = (
+        cache_root / "models"
+        if request.cache_dir is not None or config.cache.model_dir is None
+        else path_context.resolve_config_path(config.cache.model_dir)
     )
 
     formats = _coalesce(request.formats, config.output.formats, default=DEFAULT_FORMATS)
@@ -562,13 +597,16 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
 
     return ResolvedConfig(
         runtime=RuntimeConfig(
-            cache_dir=cache_dir,
             keep_temp=keep_temp,
             offline=offline,
             workflow=workflow,
             env_files=path_context.resolve_config_paths(config.runtime.env_files),
         ),
-        source=SourceConfig(yt_dlp=ytdlp_source),
+        cache=CacheConfig(source_dir=source_dir, model_dir=model_dir),
+        source=SourceConfig(
+            yt_dlp=ytdlp_source,
+            media_quality=request.media_quality or config.source.media_quality,
+        ),
         transforms=transforms,
         output=OutputConfig(
             formats=formats,
@@ -591,3 +629,10 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
         ),
         instances=instances,
     )
+
+
+def resolve_config(request: PrepareRequest) -> ResolvedConfig:
+    try:
+        return _resolve_config(request)
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"invalid configuration: {exc}") from exc

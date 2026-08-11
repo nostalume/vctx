@@ -43,3 +43,4 @@ def test_doctor_reports_selected_product_policy_as_json(tmp_path) -> None:
     assert report["capabilities"]["asr"]["selector"] == "auto"
     assert report["capabilities"]["ocr"]["selector"] == "auto"
     assert report["capabilities"]["vision"]["selector"] == "auto"
+    assert not (tmp_path / "source").exists()

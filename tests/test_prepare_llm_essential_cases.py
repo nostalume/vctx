@@ -67,7 +67,9 @@ def test_prepare_visual_uses_llm_essential_cases_as_sampling_anchors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import vctx.app.prepare as prepare_module
+    import vctx.transforms.ai_routes as ai_routes_module
     import vctx.transforms.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     from vctx.models.visual import FrameAsset
@@ -147,6 +149,7 @@ cache = "persistent"
     monkeypatch.setattr(asr_module.FasterWhisperAsrAdapter, "transcribe", fake_transcribe)
     monkeypatch.setattr(visual_frames_module, "extract_frames", fake_extract_frames)
     monkeypatch.setattr(prepare_module, "OpenAiCompatibleTextAdapter", FakeTextAdapter)
+    monkeypatch.setattr(ai_routes_module, "load_openrouter_models", lambda *_args, **_kwargs: [])
     out_dir = tmp_path / "out"
 
     result = runner.invoke(
@@ -174,15 +177,16 @@ cache = "persistent"
         "seg_000003",
     ]
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
     assert _step_status(manifest, "visual_cases.llm_extract") == "ok"
     assert any(
         evidence["capability"] == "essential_cases"
-        for evidence in manifest["transform_evidence"]
+        for evidence in source_entry["transform_evidence"]
     )
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)

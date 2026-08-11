@@ -9,8 +9,8 @@ import pytest
 from typer.testing import CliRunner
 
 from vctx.cli import app
-from vctx.models.media import MediaAsset
-from vctx.sources.ytdlp_source import YtDlpInfo, YtDlpParams
+from vctx.source.session import MediaAsset
+from vctx.source.ytdlp import YtDlpInfo, YtDlpParams
 from vctx.transcript import TranscriptPayload, TranscriptProvenance
 
 runner = CliRunner()
@@ -43,9 +43,8 @@ class FakeYoutubeDLMedia:
         assert value == "https://video.example/watch?v=no-captions"
         self.calls.append((download, self.params))
         if download:
-            paths = self.params["paths"]
-            assert isinstance(paths, dict)
-            type(self).downloaded_path = Path(paths["home"]) / "example__no-captions.m4a"
+            paths = cast(dict[str, object], self.params["paths"])
+            type(self).downloaded_path = Path(str(paths["home"])) / "example__no-captions.m4a"
             type(self).downloaded_path.parent.mkdir(parents=True, exist_ok=True)
             type(self).downloaded_path.write_bytes(b"fake downloaded audio")
             return {
@@ -54,12 +53,21 @@ class FakeYoutubeDLMedia:
             }
         return self.info
 
+    def process_ie_result(self, info: YtDlpInfo, download: bool = False) -> YtDlpInfo:
+        assert download is True
+        self.calls.append((download, self.params))
+        paths = cast(dict[str, object], self.params["paths"])
+        type(self).downloaded_path = Path(str(paths["home"])) / "example__no-captions.m4a"
+        type(self).downloaded_path.parent.mkdir(parents=True, exist_ok=True)
+        type(self).downloaded_path.write_bytes(b"fake downloaded audio")
+        return {**info, "requested_downloads": [{"filepath": str(self.downloaded_path)}]}
+
 
 @pytest.mark.parametrize("retain_media", [True, False])
 def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, retain_media: bool
 ) -> None:
-    import vctx.sources.ytdlp_source as ytdlp_module
+    import vctx.source.ytdlp as ytdlp_module
     import vctx.transforms.asr as asr_module
 
     FakeYoutubeDLMedia.calls = []
@@ -81,7 +89,8 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
             del kwargs
 
         def transcribe(self, media_asset: MediaAsset) -> TranscriptPayload:
-            assert media_asset.local_path == FakeYoutubeDLMedia.downloaded_path
+            assert media_asset.local_path.read_bytes() == b"fake downloaded audio"
+            assert media_asset.local_path.parent == tmp_path / "cache" / "source" / "blobs"
             return TranscriptPayload(
                 text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nURL ASR text.\n",
                 format="vtt",
@@ -121,18 +130,21 @@ model = "tiny"
 
     assert result.exit_code == 0, result.output
     manifest = cast(JsonObject, json.loads((out_dir / "manifest.json").read_text(encoding="utf-8")))
+    source_entry = cast(JsonObject, cast(list[JsonObject], manifest["sources"])[0])
+    lane = out_dir / cast(str, source_entry["path"])
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "source.media") == "ok"
     assert _step_status(manifest, "transform.asr") == "ok"
-    receipt = cast(list[JsonObject], manifest["source_media"])[0]
+    receipt = cast(list[JsonObject], source_entry["assets"])[0]
+    assert receipt["kind"] == "audio"
     assert receipt["retained"] is retain_media
     if retain_media:
         assert receipt["path"] in {
-            item["path"] for item in cast(list[JsonObject], manifest["artifacts"])
+            item["path"] for item in cast(list[JsonObject], source_entry["assets"])
         }
     else:
-        assert not (out_dir / "media").exists()
-    assert manifest["transform_evidence"] == [
+        assert not (lane / "audio.webm").exists()
+    assert source_entry["transform_evidence"] == [
         {
             "capability": "asr",
             "selected_route": "local",
@@ -150,18 +162,21 @@ model = "tiny"
     ]
     clean = cast(
         JsonObject,
-        json.loads((out_dir / "transcript.clean.json").read_text(encoding="utf-8")),
+        json.loads((lane / "transcript.clean.json").read_text(encoding="utf-8")),
     )
     segments = cast(list[JsonObject], clean["segments"])
     assert segments[0]["text"] == "URL ASR text."
     assert any(download for download, _params in FakeYoutubeDLMedia.calls)
     download_params = [params for download, params in FakeYoutubeDLMedia.calls if download][0]
     assert download_params["skip_download"] is False
+    assert download_params["format"] == "bestaudio/best"
     assert download_params["paths"] == {
-        "home": str(out_dir / "media"),
-        "temp": str(tmp_path / "cache" / "tmp" / "yt-dlp"),
+        "home": str(tmp_path / "cache" / "source" / "tmp" / "yt-dlp"),
+        "temp": str(tmp_path / "cache" / "source" / "tmp" / "yt-dlp"),
     }
-    assert FakeYoutubeDLMedia.downloaded_path.parent == out_dir / "media"
+    assert FakeYoutubeDLMedia.downloaded_path.parent == (
+        tmp_path / "cache" / "source" / "tmp" / "yt-dlp"
+    )
 
 
 def _step_status(manifest: JsonObject, name: str) -> str:
@@ -172,7 +187,8 @@ def _step_status(manifest: JsonObject, name: str) -> str:
 
 
 def _step(manifest: JsonObject, name: str) -> JsonObject:
-    steps = cast(list[JsonObject], manifest["steps"])
+    source = cast(JsonObject, cast(list[JsonObject], manifest["sources"])[0])
+    steps = cast(list[JsonObject], source["steps"])
     for raw_step in steps:
         assert isinstance(raw_step, dict)
         if raw_step["name"] == name:

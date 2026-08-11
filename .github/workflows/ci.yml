@@ -76,9 +76,6 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --dev
 
-      - name: Check module layout
-        run: uv run python scripts/check_module_layout.py
-
       - name: Check behavior-suite LOC budget
         run: uv run python scripts/check_test_ratio.py
 

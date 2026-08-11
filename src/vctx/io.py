@@ -1,52 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
-from platformdirs import user_cache_path
 from pydantic import BaseModel
 
-from vctx.errors import OutputExistsError
-from vctx.models.artifacts import Artifact, ArtifactBundle
-from vctx.models.manifest import ArtifactRef, Manifest
-
-
-class Cache(BaseModel):
-    root: Path
-
-    def path_for(self, key: str) -> Path:
-        return self.root / key
-
-
-def build_cache(cache_dir: Path | None) -> Cache:
-    root = cache_dir or user_cache_path("vctx", appauthor=False)
-    root.mkdir(parents=True, exist_ok=True)
-    return Cache(root=root)
+from vctx.artifact.content import Artifact, ArtifactBundle
+from vctx.artifact.manifest import ArtifactRef, Manifest
 
 
 def model_to_json(model: BaseModel) -> str:
     return model.model_dump_json(indent=2) + "\n"
 
-
-def validate_output_policy(out_dir: Path, *, overwrite: bool) -> None:
-    if out_dir.exists() and any(out_dir.iterdir()) and not overwrite:
-        raise OutputExistsError(f"output directory already exists: {out_dir}")
-
-
 def write_artifact_bundle(out_dir: Path, bundle: ArtifactBundle) -> list[ArtifactRef]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    refs: list[ArtifactRef] = []
-    for artifact in bundle.artifacts:
-        refs.append(write_artifact(out_dir, artifact))
-    return refs
-
+    return [write_artifact(out_dir, artifact) for artifact in bundle.artifacts]
 
 def write_artifact(out_dir: Path, artifact: Artifact) -> ArtifactRef:
     final_path = out_dir / artifact.name
     temp_path = out_dir / f".{artifact.name}.tmp"
-    temp_path.write_text(artifact.content, encoding="utf-8")
+    body = artifact.content.encode("utf-8")
+    temp_path.write_bytes(body)
     temp_path.replace(final_path)
-    return ArtifactRef(kind=artifact.kind, path=artifact.name, media_type=artifact.media_type)
-
+    return ArtifactRef(
+        kind=artifact.kind,
+        path=artifact.name,
+        media_type=artifact.media_type,
+        bytes=len(body),
+        sha256=hashlib.sha256(body).hexdigest(),
+    )
 
 def write_manifest(out_dir: Path, manifest: Manifest) -> ArtifactRef:
     return write_artifact(

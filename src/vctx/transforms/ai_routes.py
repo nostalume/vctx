@@ -6,9 +6,10 @@ from typing import Literal, Self, assert_never
 
 from pydantic import BaseModel, Field
 
+from vctx.artifact.manifest import CapabilityName, TransformEvidence
 from vctx.config import CapabilityPolicy
-from vctx.models.manifest import CapabilityName, TransformEvidence
 from vctx.transforms.model_resolution import (
+    OPENROUTER_API_KEY_ENV,
     ModelCapability,
     ModelCost,
     ModelProvider,
@@ -181,6 +182,8 @@ def resolve_openrouter_ai_route(
         return None
     model_ref = policy.model_ref()
     if model_ref is None and not policy.auto():
+        return None
+    if model_ref is None and OPENROUTER_API_KEY_ENV not in env:
         return None
     models = openrouter_models
     if model_ref is None and models is None:

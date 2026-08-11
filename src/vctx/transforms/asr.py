@@ -5,14 +5,14 @@ import mimetypes
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from vctx.app.models import ModelLifecycleError, require_prepared_model
 from vctx.config import AsrInstanceConfig
-from vctx.models.media import MediaAsset
 from vctx.net import NetRequest, NetResponse, NetRuntime, UrllibNetRuntime
+from vctx.source.session import MediaAsset
 from vctx.transcript import TranscriptPayload, TranscriptProvenance, UnknownLanguage
 from vctx.transforms.planning import RoutePlan
 
@@ -55,6 +55,7 @@ class FasterWhisperAsrAdapter:
         self.model_id = model_id or instance.model or instance.model_policy
         self.cache_root = cache_root
         self.offline = offline
+        self._model: Any | None = None
 
     def transcribe(self, media_asset: MediaAsset) -> TranscriptPayload:
         model_id = self._model_id()
@@ -73,8 +74,9 @@ class FasterWhisperAsrAdapter:
         model_kwargs = self._model_kwargs(model_id)
         module = self._load_faster_whisper()
         try:
-            whisper_model = module.WhisperModel(model_id, **model_kwargs)
-            segments, _info = whisper_model.transcribe(str(media_asset.local_path), language=None)
+            if self._model is None:
+                self._model = module.WhisperModel(model_id, **model_kwargs)
+            segments, _info = self._model.transcribe(str(media_asset.local_path), language=None)
         except Exception as exc:
             raise AsrExecutionError(
                 "faster-whisper ASR failed. If offline, pre-populate the model cache "
@@ -118,7 +120,7 @@ class FasterWhisperAsrAdapter:
         except OSError as exc:
             raise AsrExecutionError(
                 "ASR model cache is not writable. Free disk space, choose another "
-                "runtime.cache_dir, or set model to path:<local-path>. "
+                "cache.model_dir, or set model to path:<local-path>. "
                 f"Cache path: {model_cache}. Original error: {exc}"
             ) from exc
         kwargs["download_root"] = str(model_cache)
@@ -204,16 +206,22 @@ def run_asr(
     cache_root: Path,
     offline: bool = False,
     api_key: str | None = None,
+    runtime_cache: dict[str, object] | None = None,
 ) -> TranscriptPayload:
     if plan.selected == "local":
         if instance.type != "local-faster-whisper":
             raise AsrExecutionError(f"unsupported local ASR instance type: {instance.type}")
-        adapter = FasterWhisperAsrAdapter(
-            instance=instance,
-            model_id=_asr_model_id(plan),
-            cache_root=cache_root,
-            offline=offline,
-        )
+        cache = runtime_cache if runtime_cache is not None else {}
+        key = f"asr:{instance.model_dump_json()}:{cache_root.resolve()}:{offline}"
+        adapter = cast(FasterWhisperAsrAdapter | None, cache.get(key))
+        if adapter is None:
+            adapter = FasterWhisperAsrAdapter(
+                instance=instance,
+                model_id=_asr_model_id(plan),
+                cache_root=cache_root,
+                offline=offline,
+            )
+            cache[key] = adapter
         return adapter.transcribe(media_asset)
     if plan.selected == "configured-online":
         if instance.type != "openai-compatible-audio":

@@ -4,9 +4,9 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from vctx.artifact.content import ArtifactKind
+from vctx.artifact.manifest import ArtifactRef, Manifest, TransformEvidence
 from vctx.config import PrepareRequest, ResolvedConfig
-from vctx.models.artifacts import ArtifactKind
-from vctx.models.manifest import ArtifactRef, Manifest, TransformEvidence
 
 
 class PrepareRouteSummary(BaseModel):
@@ -33,7 +33,7 @@ class PrepareRouteSummary(BaseModel):
 
 
 class PrepareSummary(BaseModel):
-    input: str
+    inputs: list[str]
     status: str
     workflow: str
     out_dir: Path
@@ -53,15 +53,23 @@ class PrepareSummary(BaseModel):
         artifacts: list[ArtifactRef],
     ) -> PrepareSummary:
         return cls(
-            input=request.input,
+            inputs=request.inputs,
             status=manifest.status,
             workflow=resolved.runtime.workflow,
             out_dir=request.out_dir,
-            cache_dir=resolved.runtime.cache_dir,
+            cache_dir=resolved.cache.source_dir,
             config_path=request.config_path,
-            artifacts=[artifact.path for artifact in artifacts],
-            warnings=manifest.warnings,
-            routes=[_route_summary(evidence) for evidence in manifest.transform_evidence],
+            artifacts=[
+                f"{source.path}/{artifact.path}"
+                for source in manifest.sources
+                for artifact in source.artifacts
+            ],
+            warnings=[warning for source in manifest.sources for warning in source.warnings],
+            routes=[
+                _route_summary(evidence)
+                for source in manifest.sources
+                for evidence in source.transform_evidence
+            ],
         )
 
     def render_cli_lines(self) -> list[str]:
@@ -94,9 +102,10 @@ class PrepareResult(BaseModel):
     summary: PrepareSummary
 
     def artifact_path(self, kind: ArtifactKind) -> Path | None:
-        for artifact in self.artifacts:
-            if artifact.kind == kind:
-                return self.out_dir / artifact.path
+        for source in self.manifest.sources:
+            for artifact in source.artifacts:
+                if artifact.kind == kind:
+                    return self.out_dir / source.path / artifact.path
         return None
 
 

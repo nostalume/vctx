@@ -1,12 +1,40 @@
 from __future__ import annotations
 
-from vctx.models.metadata import VideoMetadata
-from vctx.sources.detect import detect_source_adapter
+from pathlib import Path
+
+from vctx.config import PrepareRequest, WorkflowProfile, resolve_config
+from vctx.source.admission import admit_source
+from vctx.source.session import ObservePermit, VideoMetadata
+from vctx.source.store import SourceStore
 
 
-def inspect_metadata(value: str) -> VideoMetadata:
-    adapter = detect_source_adapter(value)
-    return adapter.extract_metadata(value)
+def inspect_metadata(
+    value: str,
+    *,
+    config_path: Path | None = None,
+    cache_dir: Path | None = None,
+    offline: bool | None = None,
+) -> VideoMetadata:
+    resolved = resolve_config(
+        PrepareRequest(
+            inputs=[value],
+            out_dir=Path("."),
+            workflow=WorkflowProfile.METADATA,
+            config_path=config_path,
+            cache_dir=cache_dir,
+            offline=offline,
+        )
+    )
+    session = admit_source(
+        value,
+        permit=ObservePermit(
+            operation="metadata",
+            network="denied" if resolved.runtime.offline else "allowed",
+        ),
+        options=resolved.source.yt_dlp,
+        store=SourceStore(resolved.cache.source_dir),
+    )
+    return session.record.metadata
 
 
 def render_metadata_text(metadata: VideoMetadata) -> str:

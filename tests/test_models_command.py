@@ -31,7 +31,7 @@ def test_models_pull_uses_adapter_boundary_and_verify_detects_corruption(
     import vctx.app.models as models_module
 
     def fake_pull(capability: str, model_id: str, cache_root: Path) -> Path:
-        model_dir = cache_root / "models" / capability / model_id
+        model_dir = cache_root / capability / model_id
         model_dir.mkdir(parents=True)
         (model_dir / "weights.bin").write_bytes(b"prepared")
         return model_dir

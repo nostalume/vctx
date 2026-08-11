@@ -2,99 +2,64 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from time import perf_counter
 
 from vctx.app.credentials import (
     CredentialError,
     env_with_credential_presence,
     resolve_env_credential,
 )
-from vctx.app.media_retention import materialize_source_media
-from vctx.app.result import PrepareResult, PrepareSummary
+from vctx.app.media_retention import materialize_source_assets
+from vctx.app.progress import phase
+from vctx.app.visual import Visuals, visual_products
+from vctx.artifact.content import Artifact
+from vctx.artifact.manifest import (
+    ArtifactRef,
+    ManifestBuilder,
+    ManifestSource,
+    source_key,
+)
 from vctx.chunking import ChunkOptions, ChunkSet, chunk_transcript
 from vctx.config import (
     AsrInstanceConfig,
     PrepareRequest,
     ResolvedConfig,
     WorkflowProfile,
-    resolve_config,
 )
-from vctx.errors import NoTranscriptError, OfflineSourceError
+from vctx.errors import CacheError, NoTranscriptError, ProviderError, VctxError
 from vctx.io import (
-    Cache,
-    build_cache,
     model_to_json,
-    validate_output_policy,
     write_artifact,
     write_artifact_bundle,
-    write_manifest,
 )
-from vctx.models.acquisition import (
-    LocalMedia,
-    LocalTranscript,
-    SourceMedia,
-    SourceSubtitle,
-    media_acquisition_detail,
-    transcript_acquisition_detail,
-)
-from vctx.models.artifacts import Artifact
 from vctx.models.knowledge_flow import KnowledgeFlow
-from vctx.models.manifest import ArtifactRef, ManifestBuilder
-from vctx.models.media import AsrAudioFetchRequest, MediaAsset, VisualVideoFetchRequest
-from vctx.models.metadata import VideoMetadata
-from vctx.models.visual import (
-    EssentialVisualCase,
-    SourceAccess,
-    VisualRecordSet,
-    VisualScoreReport,
-)
 from vctx.render.bundle import render_artifact_bundle
-from vctx.sources.detect import SourceAdapter, detect_source_adapter
+from vctx.source.admission import admit_source
+from vctx.source.session import (
+    AsrAudioRequest,
+    MediaAsset,
+    MediaPermit,
+    ObservePermit,
+    SourceSession,
+    SubtitlePermit,
+    VideoMetadata,
+    VisualVideoRequest,
+)
+from vctx.source.store import SourceStore
 from vctx.subtitles import parse_transcript_payload
 from vctx.transcript import Transcript, TranscriptPayload, normalize_transcript
 from vctx.transforms.ai_routes import AiRoute, AiTaskKind, resolve_openrouter_ai_route
 from vctx.transforms.asr import AsrExecutionError, run_asr
-from vctx.transforms.knowledge_flow import (
-    extract_knowledge_flow,
-    merge_knowledge_flow_supplement,
-)
 from vctx.transforms.model_resolution import (
     OPENROUTER_API_KEY_ENV,
     ModelCapability,
 )
 from vctx.transforms.planning import RoutePlan, SourceState, TransformEnvironment, plan_asr
-from vctx.transforms.text_ai import OpenAiCompatibleTextAdapter, TextAiExecutionError
-from vctx.transforms.visual_cases import (
-    deterministic_essential_cases,
-    merge_essential_case_supplement,
-    uncertain_visual_segments,
-)
-from vctx.transforms.visual_evidence import score_visual_records
-from vctx.transforms.visual_execute import VisualExecutionError, run_visual_context
-from vctx.transforms.visual_planning import (
-    VisualAssessment,
-    VisualPlan,
-    plan_visual_motives,
-    visual_motives_from_cases,
-)
-from vctx.transforms.visual_routes import discover_visual_actions
-from vctx.util import vctx_version
+from vctx.transforms.text_ai import OpenAiCompatibleTextAdapter
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _phase(name: str) -> Iterator[None]:
-    start = perf_counter()
-    logger.debug("%s start", name)
-    try:
-        yield
-    finally:
-        logger.info("%s duration_ms=%s", name, int((perf_counter() - start) * 1000))
 
 
 @dataclass
@@ -102,10 +67,16 @@ class Run:
     request: PrepareRequest
     resolved: ResolvedConfig
     manifest: ManifestBuilder
-    cache: Cache
-    adapter: SourceAdapter
+    source_cache: SourceStore
+    model_root: Path
+    source: SourceSession
     metadata: VideoMetadata
+    subtitle_permit: SubtitlePermit
+    media_permit: MediaPermit
+    runtime_cache: dict[str, object]
     media: MediaAsset | None = None
+    subtitle: TranscriptPayload | None = None
+    artifacts: list[ArtifactRef] = field(default_factory=list)
 
     def openrouter_env(self) -> dict[str, str]:
         return env_with_credential_presence(
@@ -119,7 +90,7 @@ class Run:
             self.resolved.transforms.visual_context,
             task="vision_description",
             capability=ModelCapability.VISION_DESCRIPTION,
-            cache_root=self.cache.root,
+            cache_root=self.model_root,
             env=self.openrouter_env(),
             offline=self.resolved.runtime.offline,
         )
@@ -130,7 +101,7 @@ class Run:
             self.resolved.transforms.knowledge_flow,
             task=task,
             capability=ModelCapability.ESSENTIAL_CASES,
-            cache_root=self.cache.root,
+            cache_root=self.model_root,
             env=self.openrouter_env(),
             offline=self.resolved.runtime.offline,
         )
@@ -144,19 +115,19 @@ class Run:
             ),
         )
 
+    def visual_media_request(self) -> VisualVideoRequest:
+        return VisualVideoRequest(
+            temp_dir=self.source_cache.root / "tmp" / "yt-dlp",
+            profile=self.resolved.source.media_quality.value,
+            refresh=self.request.overwrite,
+        )
+
 
 @dataclass(frozen=True)
 class Prepared:
     raw: Transcript
     clean: Transcript
     chunks: ChunkSet
-
-
-@dataclass(frozen=True)
-class Visuals:
-    records: VisualRecordSet | None
-    frames: list[ArtifactRef]
-    scores: VisualScoreReport | None = None
 
 
 @dataclass(frozen=True)
@@ -167,37 +138,77 @@ class AsrReady:
     api_key: str | None
 
 
-def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
-    with _phase("prepare.total"):
-        logger.info("prepare.start input=%s out=%s", request.input, request.out_dir)
-        run = _start(request)
+@dataclass(frozen=True)
+class SourcePrepared:
+    source: ManifestSource
+    artifacts: list[ArtifactRef]
+    request: PrepareRequest
+    resolved: ResolvedConfig
+    error: VctxError | None = None
+
+
+def prepare_source(
+    request: PrepareRequest,
+    resolved: ResolvedConfig,
+    occupied: dict[str, str],
+    completed: set[str],
+    runtime_cache: dict[str, object],
+    previous: dict[str, ManifestSource] | None = None,
+    reset_lane: Callable[[str], None] | None = None,
+    rollback_lane: Callable[[str], None] | None = None,
+) -> SourcePrepared | None:
+    logger.info("prepare.start input=%s out=%s", request.inputs[0], request.out_dir)
+    run = _start(request, resolved, occupied, runtime_cache)
+    if run.source.record.source_id in completed:
+        return None
+    completed.add(run.source.record.source_id)
+    prior = (previous or {}).get(run.source.record.source_id)
+    if prior is not None and prior.revision == run.source.record.revision and not request.overwrite:
+        return SourcePrepared(prior, prior.artifacts, run.request, resolved)
+    if reset_lane is not None:
+        reset_lane(run.manifest.key)
+    try:
         if run.resolved.runtime.workflow == WorkflowProfile.METADATA:
             run.manifest.add_step("transcript.extract", "skipped", "metadata workflow selected")
             run.manifest.warn("metadata workflow selected; transcript pipeline skipped")
             return _partial(run)
-
         transcript = _transcript(run)
-        if isinstance(transcript, PrepareResult):
+        if isinstance(transcript, SourcePrepared):
             return transcript
-
         prepared = _prepared(run, transcript)
-        visuals = _visuals(run, prepared)
-        flow = _flow(run, prepared, visuals)
+        visuals, flow = visual_products(run, prepared)
         return _finish(run, prepared, visuals, flow)
+    except (CacheError, ProviderError) as exc:
+        return _error_result(run, exc)
+    except VctxError:
+        if rollback_lane is not None:
+            rollback_lane(run.manifest.key)
+        raise
 
 
-def _start(request: PrepareRequest) -> Run:
-    resolved = resolve_config(request)
-    adapter = detect_source_adapter(request.input)
-    if resolved.runtime.offline and adapter.name == "yt-dlp":
-        raise OfflineSourceError(
-            "offline URL cache miss: no verified source cache is available"
+def _start(
+    request: PrepareRequest,
+    resolved: ResolvedConfig,
+    occupied: dict[str, str],
+    runtime_cache: dict[str, object],
+) -> Run:
+    network = "denied" if resolved.runtime.offline else "allowed"
+    permit = ObservePermit(operation="prepare", network=network)
+    cache = SourceStore(resolved.cache.source_dir)
+    source = admit_source(
+        request.inputs[0],
+        permit=permit,
+        options=resolved.source.yt_dlp,
+        store=cache,
+    )
+    if source.record.lifecycle != "finite":
+        raise NoTranscriptError(
+            f"source is {source.record.lifecycle}; prepare requires finite or archived media"
         )
-
-    manifest = ManifestBuilder.start(input=request.input, tool_version=vctx_version())
-
-    validate_output_policy(request.out_dir, overwrite=request.overwrite)
-    cache = build_cache(resolved.runtime.cache_dir)
+    key = source_key(source.record.source_id, occupied)
+    occupied[key.casefold()] = source.record.source_id
+    lane_request = request.model_copy(update={"out_dir": request.out_dir / key})
+    manifest = ManifestBuilder.start(source.record, key, offline=resolved.runtime.offline)
     logger.info(
         "prepare.config workflow=%s cache=%s config=%s offline=%s",
         resolved.runtime.workflow,
@@ -207,10 +218,10 @@ def _start(request: PrepareRequest) -> Run:
     )
     logger.debug("prepare.output formats=%s", ",".join(resolved.output.formats))
 
-    manifest.add_step("source.detect", "ok", adapter.name)
-    logger.info("source.detect adapter=%s", adapter.name)
+    manifest.add_step("source.detect", "ok", source.name)
+    logger.info("source.detect adapter=%s", source.name)
 
-    metadata = adapter.extract_metadata(request.input)
+    metadata = source.record.metadata
     manifest.add_step("metadata.extract", "ok")
     logger.info(
         "metadata.extract status=ok id=%s source_type=%s",
@@ -219,29 +230,30 @@ def _start(request: PrepareRequest) -> Run:
     )
 
     return Run(
-        request=request,
+        request=lane_request,
         resolved=resolved,
         manifest=manifest,
-        cache=cache,
-        adapter=adapter,
+        source_cache=cache,
+        model_root=resolved.cache.model_dir,
+        source=source,
         metadata=metadata,
+        subtitle_permit=SubtitlePermit(network=permit.network),
+        media_permit=MediaPermit(network=permit.network),
+        runtime_cache=runtime_cache,
     )
 
 
-def _transcript(run: Run) -> TranscriptPayload | PrepareResult:
-    with _phase("transcript.extract"):
+def _transcript(run: Run) -> TranscriptPayload | SourcePrepared:
+    with phase(logger, "transcript.extract"):
         logger.info("transcript.extract start")
         try:
-            payload = run.adapter.extract_transcript(
-                run.request.input,
-                cache=run.cache,
-                source_options=run.resolved.source.yt_dlp,
-            )
+            payload = run.source.transcript(permit=run.subtitle_permit)
         except NoTranscriptError as exc:
             logger.info("transcript.extract status=missing reason=%s", exc)
             return _asr_transcript(run, exc)
 
     run.manifest.add_step("transcript.extract", "ok", _transcript_detail(payload))
+    run.subtitle = payload
     logger.info("transcript.extract status=ok provenance=%s", payload.provenance_label())
     asr_plan = plan_asr(
         run.resolved.transforms.asr,
@@ -261,18 +273,18 @@ def _transcript(run: Run) -> TranscriptPayload | PrepareResult:
 def _asr_transcript(
     run: Run,
     transcript_error: NoTranscriptError,
-) -> TranscriptPayload | PrepareResult:
+) -> TranscriptPayload | SourcePrepared:
     run.manifest.add_step("transcript.extract", "warning", str(transcript_error))
     source = _asr_source(run, transcript_error)
-    if isinstance(source, PrepareResult):
+    if isinstance(source, SourcePrepared):
         return source
 
     ready = _asr_ready(run, source)
-    if isinstance(ready, PrepareResult):
+    if isinstance(ready, SourcePrepared):
         return ready
 
     try:
-        with _phase("asr.execute"):
+        with phase(logger, "asr.execute"):
             logger.info(
                 "asr.execute start route=%s provider=%s model=%s",
                 ready.plan.selected,
@@ -283,9 +295,10 @@ def _asr_transcript(
                 ready.plan,
                 ready.media,
                 instance=ready.instance,
-                cache_root=run.cache.root,
+                cache_root=run.model_root,
                 offline=run.resolved.runtime.offline,
                 api_key=ready.api_key,
+                runtime_cache=run.runtime_cache,
             )
     except AsrExecutionError as asr_exc:
         run.manifest.add_step("transform.asr", "warning", str(asr_exc))
@@ -298,7 +311,7 @@ def _asr_transcript(
     return payload
 
 
-def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | PrepareResult:
+def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | SourcePrepared:
     pre_media_asr_plan = plan_asr(
         run.resolved.transforms.asr,
         _asr_environment(run.resolved),
@@ -315,15 +328,11 @@ def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | Pr
 
     try:
         logger.info("source.media start purpose=asr")
-        run.media = run.adapter.extract_media(
-            run.request.input,
-            request=AsrAudioFetchRequest(
-                source_url=run.request.input,
-                output_dir=run.request.out_dir / "media",
-                temp_dir=run.cache.root / "tmp" / "yt-dlp",
-                source_options=run.resolved.source.yt_dlp,
-                reuse=not run.request.overwrite,
-            ),
+        run.media = run.source.media(
+            request=AsrAudioRequest(
+                temp_dir=run.source_cache.root / "tmp" / "yt-dlp",
+                refresh=run.request.overwrite,
+            ), permit=run.media_permit,
         )
     except NoTranscriptError as media_exc:
         asr_plan = plan_asr(
@@ -357,7 +366,7 @@ def _asr_source(run: Run, transcript_error: NoTranscriptError) -> RoutePlan | Pr
     return asr_plan
 
 
-def _asr_ready(run: Run, asr_plan: RoutePlan) -> AsrReady | PrepareResult:
+def _asr_ready(run: Run, asr_plan: RoutePlan) -> AsrReady | SourcePrepared:
     instance_name = run.resolved.transforms.asr.instance_name()
     instance = run.resolved.instances.asr.get(instance_name) if instance_name else None
     if instance is None:
@@ -417,214 +426,8 @@ def _prepared(run: Run, payload: TranscriptPayload) -> Prepared:
     return Prepared(raw=raw, clean=clean, chunks=chunks)
 
 
-def _visuals(run: Run, prepared: Prepared) -> Visuals:
-    if not _visual_enabled(run.resolved):
-        logger.info("visual.status skipped reason=disabled")
-        return Visuals(records=None, frames=[])
-
-    cases = _visual_cases(run, prepared)
-    plan = _visual_plan(run, prepared, cases)
-    if plan.kind == "skipped":
-        return Visuals(records=None, frames=[])
-
-    if not _video_media(run):
-        run.manifest.add_step("transform.visual_plan", "skipped", "no video media asset")
-        logger.info("visual.status skipped reason=no-video-media")
-        return Visuals(records=None, frames=[])
-
-    return _visual_capture(run, prepared, plan.assessment)
-
-
-def _video_media(run: Run) -> bool:
-    if run.media is not None:
-        return run.media.media_type == "video"
-    try:
-        logger.info("source.media start purpose=visual")
-        run.media = run.adapter.extract_media(
-            run.request.input,
-            request=VisualVideoFetchRequest(
-                source_url=run.request.input,
-                output_dir=run.request.out_dir / "media",
-                temp_dir=run.cache.root / "tmp" / "yt-dlp",
-                profile=run.resolved.source.yt_dlp.media_profile,
-                source_options=run.resolved.source.yt_dlp,
-                reuse=not run.request.overwrite,
-            ),
-        )
-    except NoTranscriptError as media_exc:
-        run.manifest.add_step("source.media", "skipped", str(media_exc))
-        logger.info("source.media status=skipped purpose=visual reason=%s", media_exc)
-        return False
-    run.manifest.add_step("source.media", "ok", _media_detail(run.media))
-    logger.info("source.media status=ok purpose=visual path=%s", run.media.local_path)
-    return run.media.media_type == "video"
-
-
-def _visual_cases(run: Run, prepared: Prepared) -> list[EssentialVisualCase]:
-    cases = deterministic_essential_cases(prepared.clean)
-    logger.info("visual.cases deterministic=%s", len(cases))
-    route = run.text_product_ai_route("essential_case_extraction")
-    if route is None:
-        return cases
-    uncertain = uncertain_visual_segments(prepared.clean, cases)
-    if not uncertain.segments:
-        run.manifest.add_step(
-            "visual_cases.llm_extract",
-            "skipped",
-            "no uncertain visual transcript segments",
-        )
-        return cases
-    try:
-        supplement = run.text_ai_adapter(route).essential_case_supplement(
-            uncertain
-        )
-    except (CredentialError, TextAiExecutionError) as text_ai_exc:
-        run.manifest.add_step("visual_cases.llm_extract", "warning", str(text_ai_exc))
-        run.manifest.warn(str(text_ai_exc))
-        logger.warning("visual.cases.llm status=warning reason=%s", text_ai_exc)
-        return cases
-
-    run.manifest.add_transform_evidence(route.transform_evidence("essential_cases"))
-    run.manifest.add_step(
-        "visual_cases.llm_extract",
-        "ok",
-        route.detail(),
-    )
-    merged = merge_essential_case_supplement(cases, supplement, prepared.clean)
-    logger.info("visual.cases.llm status=ok cases=%s route=%s", len(merged), route.provider_id)
-    return merged
-
-
-def _visual_plan(
-    run: Run,
-    prepared: Prepared,
-    cases: list[EssentialVisualCase],
-) -> VisualPlan:
-    plan = plan_visual_motives(
-        source=_source_access(run, prepared),
-        duration_seconds=run.metadata.duration_seconds,
-        motives=visual_motives_from_cases(cases),
-        available_actions=discover_visual_actions(
-            run.resolved.transforms.visual_context,
-            ocr_policy=run.resolved.transforms.ocr,
-            vision_instance_configs=run.resolved.instances.vision,
-            ai_routes=run.visual_ai_routes(),
-            offline=run.resolved.runtime.offline,
-        ),
-    )
-
-    if plan.kind == "skipped":
-        run.manifest.add_step(
-            "transform.visual_plan",
-            "skipped",
-            f"{plan.reason}: {plan.rationale}",
-        )
-        logger.info("visual.plan status=skipped reason=%s", plan.reason)
-        return plan
-    run.manifest.add_step("transform.visual_plan", "ok", _visual_plan_detail(plan.assessment))
-    logger.info(
-        "visual.plan status=ok actions=%s rationale=%s",
-        ",".join(action.name for action in plan.assessment.recipe) or "none",
-        plan.assessment.rationale,
-    )
-    return plan
-
-def _source_access(run: Run, prepared: Prepared) -> SourceAccess:
-    media_type = run.media.media_type if run.media is not None else None
-    return SourceAccess.from_flags(
-        transcript=bool(prepared.clean.segments),
-        audio=media_type in {"audio", "video"},
-        video=media_type == "video" or run.metadata.source.kind == "url",
-    )
-
-
-
-def _visual_capture(run: Run, prepared: Prepared, assessment: VisualAssessment) -> Visuals:
-    assert run.media is not None
-    try:
-        with _phase("visual.capture"):
-            records = run_visual_context(
-                assessment,
-                run.media,
-                run.request.out_dir,
-                cache_root=run.cache.root,
-                env_files=run.resolved.runtime.env_files,
-            )
-    except VisualExecutionError as visual_exc:
-        run.manifest.add_step("transform.visual_capture", "warning", str(visual_exc))
-        logger.warning("visual.capture status=warning reason=%s", visual_exc)
-        return Visuals(records=None, frames=[])
-
-    scored = score_visual_records(
-        records.records,
-        prepared.clean,
-        motives=assessment.motives,
-    )
-    visual_records = VisualRecordSet(records=scored.records)
-    visual_scores = VisualScoreReport(satisfaction=scored.satisfaction)
-    _add_visual_satisfaction_step(run, visual_scores)
-    run.manifest.add_step(
-        "transform.visual_capture",
-        "ok",
-        _visual_capture_detail(visual_records),
-    )
-    logger.info("visual.capture status=ok records=%s", len(visual_records.records))
-    return Visuals(
-        records=visual_records,
-        frames=_visual_frame_refs(visual_records),
-        scores=visual_scores,
-    )
-
-
-def _flow(run: Run, prepared: Prepared, visuals: Visuals) -> KnowledgeFlow:
-    with _phase("knowledge_flow.extract"):
-        knowledge_flow = extract_knowledge_flow(prepared.clean, visuals.records)
-    logger.info(
-        "knowledge_flow.extract deterministic nodes=%s edges=%s",
-        len(knowledge_flow.nodes),
-        len(knowledge_flow.edges),
-    )
-    knowledge_flow_route = run.text_product_ai_route("knowledge_flow_extraction")
-    if knowledge_flow_route is not None:
-        try:
-            supplement = run.text_ai_adapter(
-                knowledge_flow_route
-            ).knowledge_flow_supplement(prepared.clean)
-        except (CredentialError, TextAiExecutionError) as text_ai_exc:
-            run.manifest.add_step("knowledge_flow.llm_extract", "warning", str(text_ai_exc))
-            run.manifest.warn(str(text_ai_exc))
-            logger.warning("knowledge_flow.llm status=warning reason=%s", text_ai_exc)
-        else:
-            knowledge_flow = merge_knowledge_flow_supplement(
-                knowledge_flow,
-                supplement,
-                prepared.clean,
-            )
-            run.manifest.add_transform_evidence(
-                knowledge_flow_route.transform_evidence("knowledge_flow")
-            )
-            run.manifest.add_step(
-                "knowledge_flow.llm_extract",
-                "ok",
-                knowledge_flow_route.detail(),
-            )
-            logger.info(
-                "knowledge_flow.llm status=ok nodes=%s edges=%s route=%s",
-                len(knowledge_flow.nodes),
-                len(knowledge_flow.edges),
-                knowledge_flow_route.provider_id,
-            )
-    if knowledge_flow.nodes:
-        run.manifest.add_step(
-            "knowledge_flow.extract",
-            "ok",
-            f"{len(knowledge_flow.nodes)} nodes, {len(knowledge_flow.edges)} edges",
-        )
-    return knowledge_flow
-
-
-def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow) -> PrepareResult:
-    with _phase("prepare.finish"):
+def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow) -> SourcePrepared:
+    with phase(logger, "prepare.finish"):
         bundle = render_artifact_bundle(
             metadata=run.metadata,
             raw_transcript=prepared.raw,
@@ -638,25 +441,21 @@ def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow)
         )
         artifact_refs = write_artifact_bundle(run.request.out_dir, bundle)
         artifact_refs.extend(visuals.frames)
-        artifact_refs.extend(_retain_media(run))
-        final_manifest = run.manifest.finish(status="ok", artifacts=artifact_refs)
-        write_manifest(run.request.out_dir, final_manifest)
+        run.artifacts = artifact_refs
+        _retain_or_error(run, artifact_refs)
+        final_manifest = run.manifest.finish(
+            status="ok", artifacts=artifact_refs, receipts=run.source.receipts
+        )
     logger.info("prepare.finish status=ok artifacts=%s", len(artifact_refs))
-
-    return PrepareResult(
-        out_dir=run.request.out_dir,
-        manifest=final_manifest,
+    return SourcePrepared(
+        source=final_manifest,
         artifacts=artifact_refs,
-        summary=PrepareSummary.from_run(
-            request=run.request,
-            resolved=run.resolved,
-            manifest=final_manifest,
-            artifacts=artifact_refs,
-        ),
+        request=run.request,
+        resolved=run.resolved,
     )
 
 
-def _partial(run: Run) -> PrepareResult:
+def _partial(run: Run) -> SourcePrepared:
     run.request.out_dir.mkdir(parents=True, exist_ok=True)
     artifact_ref = write_artifact(
         run.request.out_dir,
@@ -667,61 +466,92 @@ def _partial(run: Run) -> PrepareResult:
             content=model_to_json(run.metadata),
         ),
     )
-    artifact_refs = [artifact_ref, *_retain_media(run)]
-    final_manifest = run.manifest.finish(status="partial", artifacts=artifact_refs)
-    write_manifest(run.request.out_dir, final_manifest)
+    artifact_refs = [artifact_ref]
+    run.artifacts = artifact_refs
+    _retain_or_error(run, artifact_refs)
+    final_manifest = run.manifest.finish(
+        status="partial", artifacts=artifact_refs, receipts=run.source.receipts
+    )
     logger.info("prepare.finish status=partial artifacts=%s", len(artifact_refs))
-    return PrepareResult(
-        out_dir=run.request.out_dir,
-        manifest=final_manifest,
+    return SourcePrepared(
+        source=final_manifest,
         artifacts=artifact_refs,
-        summary=PrepareSummary.from_run(
-            request=run.request,
-            resolved=run.resolved,
-            manifest=final_manifest,
-            artifacts=artifact_refs,
-        ),
+        request=run.request,
+        resolved=run.resolved,
     )
 
 
-def _retain_media(run: Run) -> list[ArtifactRef]:
+def _retain_assets(run: Run) -> None:
     media = run.media
-    if media is None and Path(run.request.input).is_file():
+    if media is None and Path(run.request.inputs[0]).is_file():
         try:
-            media = run.adapter.extract_media(
-                run.request.input,
-                request=AsrAudioFetchRequest(
-                    source_url=run.request.input,
-                    output_dir=run.request.out_dir / "media",
-                    temp_dir=run.cache.path_for("tmp/retention"),
-                    source_options=run.resolved.source.yt_dlp,
-                ),
+            media = run.source.media(
+                request=AsrAudioRequest(
+                    temp_dir=run.source_cache.path_for("tmp/retention"),
+                ), permit=run.media_permit,
             )
         except NoTranscriptError:
             media = None
-    refs, receipts = materialize_source_media(
+    assets = materialize_source_assets(
         media,
+        run.subtitle,
         run.request.out_dir,
         retain=run.resolved.output.retain_media,
     )
-    for receipt in receipts:
-        run.manifest.add_source_media(receipt)
-    if not receipts:
-        return refs
-    receipt = receipts[0]
-    if receipt.retained:
+    for asset in assets:
+        run.manifest.add_source_asset(asset)
+    if not assets:
+        return
+    retained = [asset for asset in assets if asset.retained]
+    if retained:
         run.manifest.add_step(
-            "source.media_retention",
+            "source.asset_retention",
             "ok",
-            f"{receipt.path}; {receipt.bytes} bytes; sha256={receipt.sha256}",
+            ", ".join(asset.path or "" for asset in retained),
         )
     else:
         run.manifest.add_step(
-            "source.media_retention",
+            "source.asset_retention",
             "skipped",
-            receipt.omission_reason,
+            assets[0].omission_reason,
         )
-    return refs
+
+
+def _retain_or_error(run: Run, artifact_refs: list[ArtifactRef]) -> None:
+    try:
+        _retain_assets(run)
+    except CacheError:
+        run.manifest.add_step("source.asset_retention", "error", "integrity or copy failure")
+        raise
+
+
+def _error_result(run: Run, exc: CacheError | ProviderError) -> SourcePrepared:
+    run.request.out_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = run.artifacts
+    if not artifacts:
+        artifacts = [
+            write_artifact(
+                run.request.out_dir,
+                Artifact(
+                    name="metadata.json",
+                    kind="metadata",
+                    media_type="application/json",
+                    content=model_to_json(run.metadata),
+                ),
+            )
+        ]
+    detail = "provider failure" if isinstance(exc, ProviderError) else "storage failure"
+    run.manifest.add_step("source.failure", "error", detail)
+    failed = run.manifest.finish(
+        status="error", artifacts=artifacts, receipts=run.source.receipts
+    )
+    return SourcePrepared(
+        source=failed,
+        artifacts=artifacts,
+        request=run.request,
+        resolved=run.resolved,
+        error=exc,
+    )
 
 
 def _asr_environment(resolved: ResolvedConfig) -> TransformEnvironment:
@@ -747,106 +577,22 @@ def _asr_environment(resolved: ResolvedConfig) -> TransformEnvironment:
     return TransformEnvironment(offline=resolved.runtime.offline)
 
 
-def _visual_enabled(resolved: ResolvedConfig) -> bool:
-    return resolved.transforms.visual_context.enabled
-
-
 def _transcript_detail(payload: TranscriptPayload) -> str:
     provenance = payload.provenance
     if provenance.method == "local_file":
-        return transcript_acquisition_detail(LocalTranscript(format=payload.format))
+        return f"local transcript: {payload.format}"
     if provenance.method == "official_subtitles" or provenance.method == "automatic_subtitles":
-        subtitle_kind = provenance.method
-        return transcript_acquisition_detail(
-            SourceSubtitle(
-                subtitle_kind=subtitle_kind,
-                language=provenance.language_evidence,
-                format=payload.format,
-                provider=provenance.provider or "source",
-            )
+        language = provenance.language or provenance.language_evidence.kind
+        return (
+            f"{provenance.provider or 'source'}:{provenance.method}:"
+            f"{language}:{payload.format}"
         )
     return payload.provenance_label()
 
 
 def _media_detail(media: MediaAsset) -> str:
-    if media.source.kind == "file":
-        return media_acquisition_detail(
-            LocalMedia(path=media.local_path, media_type=media.media_type)
-        )
-    return media_acquisition_detail(
-        SourceMedia(
-            cache_path=media.local_path,
-            media_type=media.media_type,
-            provider=media.provider,
-        )
-    )
-
-
-def _visual_capture_detail(visual_records: VisualRecordSet) -> str:
-    kept = sum(
-        1 for record in visual_records.records if record.score is None or record.score.keep
-    )
-    dropped = len(visual_records.records) - kept
-    if dropped:
-        return f"{len(visual_records.records)} records ({kept} kept, {dropped} low-novelty)"
-    return f"{len(visual_records.records)} records"
-
-
-def _add_visual_satisfaction_step(run: Run, scores: VisualScoreReport) -> None:
-    if not scores.satisfaction:
-        return
-    missed = [check for check in scores.satisfaction if check.status == "missed"]
-    if missed:
-        detail = f"{len(missed)} visual satisfaction missed, {len(scores.satisfaction)} checked"
-        run.manifest.add_step("transform.visual_satisfaction", "warning", detail)
-        run.manifest.warn(detail)
-        return
-    run.manifest.add_step(
-        "transform.visual_satisfaction",
-        "ok",
-        f"{len(scores.satisfaction)} checked",
-    )
-
-
-def _visual_frame_refs(visual_records: VisualRecordSet) -> list[ArtifactRef]:
-    refs: list[ArtifactRef] = []
-    seen: set[str] = set()
-    for record in visual_records.records:
-        if record.kind != "capture" or record.artifact_path is None:
-            continue
-        if record.artifact_path in seen:
-            continue
-        seen.add(record.artifact_path)
-        refs.append(
-            ArtifactRef(
-                kind="visual_frame",
-                path=record.artifact_path,
-                media_type=_visual_frame_media_type(record.artifact_path),
-            )
-        )
-    return refs
-
-
-def _visual_frame_media_type(path: str) -> str:
-    if path.lower().endswith(".png"):
-        return "image/png"
-    if path.lower().endswith((".jpg", ".jpeg")):
-        return "image/jpeg"
-    return "application/octet-stream"
-
-
-def _visual_plan_detail(assessment: VisualAssessment) -> str:
-    route_details = []
-    for action in assessment.recipe:
-        provider_id = action.provider_id
-        if action.name == "ocr" and provider_id is not None:
-            route_details.append(f"local OCR: {provider_id}")
-        if action.name == "describe" and provider_id is not None:
-            label = "free VLM" if action.route == "free-online" else "configured VLM"
-            route_details.append(f"{label}: {provider_id}")
-    if route_details:
-        return "; ".join(route_details)
-    return assessment.rationale
+    origin = "local" if media.source.kind == "file" else "source"
+    return f"{origin} media: {media.media_type}"
 
 
 def _capitalize_warning(message: str) -> str:

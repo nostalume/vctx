@@ -4,17 +4,17 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from vctx.artifact.content import Artifact, ArtifactBundle, ArtifactKind
 from vctx.chunking import ChunkSet
 from vctx.io import model_to_json
-from vctx.models.artifacts import Artifact, ArtifactBundle, ArtifactKind
 from vctx.models.knowledge_flow import KnowledgeFlow
-from vctx.models.metadata import VideoMetadata
 from vctx.models.visual import VisualRecordSet, VisualScoreReport
 from vctx.render.markdown import (
     render_context_markdown,
     render_readable_markdown,
     render_transcript_markdown,
 )
+from vctx.source.session import VideoMetadata
 from vctx.transcript import Transcript
 
 OutputFormat = Literal["json", "context", "readable", "transcript"]

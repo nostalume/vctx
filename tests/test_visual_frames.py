@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from vctx.models import SourceRef
-from vctx.models.media import LocalMediaAsset
 from vctx.models.visual import EssentialVisualCase
+from vctx.source.local import LocalMediaAsset
+from vctx.source.session import SourceRef
 from vctx.transforms.visual_frames import extract_frames
 from vctx.transforms.visual_planning import VisualAction, VisualActionParams
 

@@ -59,25 +59,25 @@ cache = "persistent"
     assert "Wrote context pack" in result.output
     assert "Wrote partial context pack" not in result.output
     assert (out_dir / "manifest.json").exists()
-    assert (out_dir / "metadata.json").exists()
-    assert (out_dir / "transcript.raw.json").exists()
-    assert (out_dir / "transcript.clean.json").exists()
-    assert (out_dir / "chunks.json").exists()
-    assert (out_dir / "context.md").exists()
 
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_entry = manifest["sources"][0]
+    lane = out_dir / source_entry["path"]
+    assert {path.name for path in lane.iterdir()} >= {
+        "metadata.json", "transcript.raw.json", "transcript.clean.json", "chunks.json", "context.md"
+    }
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "transcript.extract") == "warning"
     assert _step_status(manifest, "source.media") == "ok"
     assert _step_status(manifest, "transform.asr") == "ok"
     assert _step_detail(manifest, "transform.asr") == "faster-whisper:asr:en:vtt"
 
-    raw = json.loads((out_dir / "transcript.raw.json").read_text(encoding="utf-8"))
+    raw = json.loads((lane / "transcript.raw.json").read_text(encoding="utf-8"))
     assert raw["provenance"]["method"] == "asr"
     assert raw["provenance"]["provider"] == "faster-whisper"
     assert raw["segments"][0]["text"] == "Hello from fake ASR."
 
-    context = (out_dir / "context.md").read_text(encoding="utf-8")
+    context = (lane / "context.md").read_text(encoding="utf-8")
     assert "Hello from fake ASR." in context
 
 
@@ -96,7 +96,7 @@ def _step_detail(manifest: dict[str, Any], name: str) -> str:
 
 
 def _step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    steps = manifest["steps"]
+    steps = manifest["sources"][0]["steps"]
     assert isinstance(steps, list)
     for raw_step in steps:
         assert isinstance(raw_step, dict)
