@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 import srt
 import webvtt
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vctx.errors import EmptyChunksError, InvalidTranscriptError
 
@@ -60,6 +60,24 @@ class TranscriptSegment(BaseModel):
     source_id: str | None = None
 
 
+class AsrProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: str
+    revision: str | None = None
+    device: str
+    compute_type: str
+    batch_size: int | None = None
+    vad: bool
+    confirmation: bool = False
+    source_duration: float | None = None
+    speech_duration: float | None = None
+    language: str | None = None
+    language_confidence: float | None = None
+    timestamp_method: Literal["segment-milliseconds"] = "segment-milliseconds"
+
+
 class TranscriptProvenance(BaseModel):
     method: Literal["official_subtitles", "automatic_subtitles", "local_file", "asr"]
     language: str | None = None
@@ -68,7 +86,7 @@ class TranscriptProvenance(BaseModel):
     )
     format: Literal["vtt", "srt", "json", "plain", "unknown"] = "unknown"
     provider: str | None = None
-    asr: dict[str, str | float | int | bool | None] | None = None
+    asr: AsrProvenance | None = None
 
     @model_validator(mode="after")
     def mirror_legacy_language_into_tagged_evidence(self) -> TranscriptProvenance:

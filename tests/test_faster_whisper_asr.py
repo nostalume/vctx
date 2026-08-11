@@ -34,7 +34,7 @@ def test_asr_uses_explicit_local_model_without_network(
 
         def transcribe(self, path: str, **kwargs: object) -> tuple[list[object], object]:
             del path, kwargs
-            return [], object()
+            return [], _info()
 
     monkeypatch.setattr(
         "importlib.import_module",
@@ -68,6 +68,19 @@ def test_asr_rejects_unprepared_named_model_before_loading_adapter(
     outcome = adapter.transcribe(_media(tmp_path / "audio.wav"))
     assert outcome.kind == "unavailable"
     assert outcome.receipt.failure == "missing_model"
+
+
+def test_asr_rejects_vendor_model_without_transcribe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class WhisperModel:
+        def __init__(self, _model_id: str, **_kwargs: object) -> None:
+            pass
+
+    outcome = _adapter(monkeypatch, tmp_path, WhisperModel).transcribe(
+        _media(tmp_path / "audio.wav")
+    )
+    assert outcome.kind == "unavailable" and outcome.receipt.failure == "invalid_response"
 
 
 def test_asr_verifies_no_speech_with_vad_and_confirmation(
@@ -123,9 +136,7 @@ def test_asr_failed_confirmation_is_unavailable(
     assert outcome.receipt.failure == "confirmation_failed"
 
 
-def test_asr_rejects_invalid_timestamps(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_asr_rejects_invalid_timestamps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     class WhisperModel:
         def __init__(self, _model_id: str, **_kwargs: object) -> None:
             pass
@@ -138,6 +149,26 @@ def test_asr_rejects_invalid_timestamps(
     )
     assert outcome.kind == "unavailable"
     assert outcome.receipt.failure == "invalid_timestamps"
+
+
+@pytest.mark.parametrize("fault", ["segment", "info"])
+def test_asr_rejects_malformed_vendor_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    class WhisperModel:
+        def __init__(self, _model_id: str, **_kwargs: object) -> None:
+            pass
+
+        def transcribe(self, _path: str, **_kwargs: object) -> tuple[list[object], object]:
+            if fault == "segment":
+                return [types.SimpleNamespace(start=0.0, end=1.0)], _info()
+            segment = types.SimpleNamespace(start=0.0, end=1.0, text="speech")
+            return [segment], types.SimpleNamespace(language_probability="certain")
+
+    outcome = _adapter(monkeypatch, tmp_path, WhisperModel).transcribe(
+        _media(tmp_path / "audio.wav")
+    )
+    assert outcome.kind == "unavailable" and outcome.receipt.failure == "invalid_response"
 
 
 def test_asr_auto_device_falls_back_once_to_cpu(
@@ -178,9 +209,7 @@ def test_asr_explicit_cuda_never_falls_back(
     )
     model = _model(tmp_path)
     outcome = FasterWhisperAsrAdapter(
-        instance=AsrInstanceConfig(
-            type="local-faster-whisper", model=str(model), device="cuda"
-        ),
+        instance=AsrInstanceConfig(type="local-faster-whisper", model=str(model), device="cuda"),
         model_id=str(model),
         cache_root=tmp_path / "cache",
     ).transcribe(_media(tmp_path / "audio.wav"))
@@ -196,6 +225,9 @@ def test_asr_cuda_retries_pre_output_oom_with_smaller_batch(
     class WhisperModel:
         def __init__(self, _model_id: str, **_kwargs: object) -> None:
             pass
+
+        def transcribe(self, _path: str, **_kwargs: object) -> tuple[list[object], object]:
+            raise AssertionError("CUDA execution must use the batched pipeline")
 
     class BatchedInferencePipeline:
         def __init__(self, *, model: object) -> None:
@@ -216,16 +248,14 @@ def test_asr_cuda_retries_pre_output_oom_with_smaller_batch(
     monkeypatch.setattr("importlib.import_module", lambda _name: module)
     model = _model(tmp_path)
     outcome = FasterWhisperAsrAdapter(
-        instance=AsrInstanceConfig(
-            type="local-faster-whisper", model=str(model), device="cuda"
-        ),
+        instance=AsrInstanceConfig(type="local-faster-whisper", model=str(model), device="cuda"),
         model_id=str(model),
         cache_root=tmp_path / "cache",
     ).transcribe(_media(tmp_path / "audio.wav"))
     assert outcome.kind == "ready"
     assert outcome.receipt.batch_size == 4
     assert outcome.transcript.provenance.asr is not None
-    assert outcome.transcript.provenance.asr["batch_size"] == 4
+    assert outcome.transcript.provenance.asr.batch_size == 4
     assert outcome.transcript.segments[0].end == 1.234
     assert batches == [8, 4]
 

@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from tests.support import asr_ready
+from vctx.artifact.manifest import Manifest
 from vctx.cli import app
 from vctx.source.session import MediaAsset
 
@@ -56,21 +58,28 @@ cache = "persistent"
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert {path.name for path in lane.iterdir()} >= {
-        "metadata.json", "transcript.json", "chunks.json", "context.md"
+        "metadata.json",
+        "transcript.json",
+        "chunks.json",
+        "context.md",
     }
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "transcript.extract") == "warning"
     assert _step_status(manifest, "source.media") == "ok"
     assert _step_status(manifest, "transform.asr") == "ok"
     assert _step_detail(manifest, "transform.asr") == "faster-whisper:tiny"
+    asr_step = _step(manifest, "transform.asr")
+    assert asr_step["receipt"]["kind"] == "asr"
 
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["provenance"]["method"] == "asr"
     assert transcript["provenance"]["provider"] == "faster-whisper"
     assert transcript["segments"][0]["text"] == "Hello from fake ASR."
-
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "Hello from fake ASR." in context
+    asr_step["receipt"]["unexpected"] = True
+    with pytest.raises(ValidationError):
+        Manifest.model_validate(manifest)
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:

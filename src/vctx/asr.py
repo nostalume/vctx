@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import importlib
 import math
-import mimetypes
 import threading
-import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Literal, Protocol, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vctx.app.models import ModelLifecycleError, require_prepared_model
-from vctx.config import AsrInstanceConfig
-from vctx.net import NetRequest, NetRuntime, UrllibNetRuntime
+from vctx.artifact.manifest import TransformEvidence
+from vctx.config import AsrInstanceConfig, CapabilityPolicy
 from vctx.source.session import MediaAsset
 from vctx.transcript import (
+    AsrProvenance,
     DetectedLanguage,
     Transcript,
     TranscriptNoSpeech,
@@ -25,7 +25,71 @@ from vctx.transcript import (
     TranscriptUnavailable,
     UnknownLanguage,
 )
-from vctx.transforms.planning import RoutePlan
+
+
+class AsrPlan(BaseModel):
+    selected: Literal["local", "skipped", "unavailable"]
+    reason: str
+    provider_id: str | None = None
+    model_id: str | None = None
+    requirements: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    deterministic: bool = False
+
+    @property
+    def evidence_seed(self) -> TransformEvidence:
+        return TransformEvidence(
+            capability="asr",
+            selected_route=self.selected,
+            provider_id=self.provider_id,
+            model_id=self.model_id,
+            requires_user_config=False,
+            uploaded=False,
+            cost_may_apply=False,
+            deterministic=self.deterministic,
+            reason=self.reason,
+            warnings=self.warnings,
+        )
+
+
+class AsrEnvironment(BaseModel):
+    installed: bool = False
+    offline: bool = False
+    model_id: str | None = None
+
+
+def plan_asr(
+    policy: CapabilityPolicy,
+    environment: AsrEnvironment,
+    *,
+    has_transcript: bool,
+    has_media: bool,
+) -> AsrPlan:
+    if has_transcript:
+        return AsrPlan(
+            selected="skipped", reason="transcript already available", deterministic=True
+        )
+    if policy.disabled():
+        return AsrPlan(selected="skipped", reason="ASR disabled by policy")
+    if not has_media:
+        return AsrPlan(
+            selected="unavailable",
+            reason=("No transcript found and no media asset is available for ASR."),
+            requirements=["media asset"],
+        )
+    if environment.installed:
+        return AsrPlan(
+            selected="local",
+            provider_id="faster-whisper",
+            model_id=policy.model_ref() or environment.model_id or "small",
+            reason="default local ASR route available",
+        )
+    return AsrPlan(
+        selected="unavailable",
+        reason="No transcript found and the prepared local ASR route is unavailable.",
+        requirements=["install ASR extra", "prepare ASR model", "provide transcript file"],
+    )
+
 
 AsrFailureCode = Literal[
     "missing_package",
@@ -40,21 +104,11 @@ AsrFailureCode = Literal[
 ]
 
 
-class AsrReceipt(BaseModel):
-    provider: str
-    model: str
-    revision: str | None = None
-    device: str
-    compute_type: str
-    batch_size: int | None = None
-    vad: bool
-    confirmation: bool = False
-    source_duration: float | None = None
-    speech_duration: float | None = None
-    language: str | None = None
-    language_confidence: float | None = None
-    timestamp_method: Literal["segment-milliseconds"] = "segment-milliseconds"
+class AsrReceipt(AsrProvenance):
     failure: AsrFailureCode | None = None
+
+    def provenance(self) -> AsrProvenance:
+        return AsrProvenance.model_validate(self, from_attributes=True)
 
 
 class AsrReady(TranscriptReady):
@@ -72,20 +126,97 @@ class AsrUnavailable(TranscriptUnavailable):
 type AsrOutcome = AsrReady | AsrNoSpeech | AsrUnavailable
 
 
-class WhisperSegment(Protocol):
+class TimedText(Protocol):
     start: float
     end: float
     text: str
 
 
-class OpenAiAsrSegment(BaseModel):
-    start: float
-    end: float
+class _WhisperModel(Protocol):
+    def transcribe(
+        self,
+        path: str,
+        *,
+        language: None,
+        task: Literal["transcribe"],
+        word_timestamps: Literal[False],
+        vad_filter: bool,
+        vad_parameters: dict[str, float | int] | None,
+    ) -> object: ...
+
+
+class _WhisperPipeline(Protocol):
+    def transcribe(
+        self,
+        path: str,
+        *,
+        batch_size: int,
+        language: None,
+        task: Literal["transcribe"],
+        word_timestamps: Literal[False],
+        vad_filter: bool,
+        vad_parameters: dict[str, float | int] | None,
+    ) -> object: ...
+
+
+class _WhisperModelFactory(Protocol):
+    def __call__(
+        self,
+        model_id: str,
+        *,
+        device: str,
+        compute_type: str,
+        local_files_only: Literal[True],
+    ) -> object: ...
+
+
+class _WhisperPipelineFactory(Protocol):
+    def __call__(self, *, model: _WhisperModel) -> object: ...
+
+
+@dataclass(frozen=True)
+class _WhisperApi:
+    model: _WhisperModelFactory
+    pipeline: _WhisperPipelineFactory | None
+
+
+class _WhisperInfo(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    language: str | None
+    language_probability: float | None = Field(strict=True, ge=0, le=1)
+    duration: float = Field(strict=True, ge=0)
+    duration_after_vad: float = Field(strict=True, ge=0)
+
+
+class _WhisperSegment(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    start: float = Field(strict=True)
+    end: float = Field(strict=True)
     text: str
 
 
-class OpenAiAsrResponse(BaseModel):
-    segments: list[OpenAiAsrSegment] = Field(default_factory=list)
+@dataclass(frozen=True)
+class _WhisperPass:
+    segments: list[TranscriptSegment]
+    info: _WhisperInfo
+    batch_size: int | None = None
+
+
+class _InvalidVendorResponse(ValueError):
+    pass
+
+
+class _InvalidVendorTimestamps(ValueError):
+    pass
+
+
+class _InferenceStreamError(RuntimeError):
+    def __init__(self, cause: Exception, *, emitted: bool) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.emitted = emitted
 
 
 class FasterWhisperAsrAdapter:
@@ -95,8 +226,8 @@ class FasterWhisperAsrAdapter:
         self.instance = instance
         self.model_id = model_id or instance.model or "small"
         self.cache_root = cache_root
-        self._model: Any | None = None
-        self._module: Any | None = None
+        self._model: _WhisperModel | None = None
+        self._api: _WhisperApi | None = None
         self._device = instance.device
         self._compute = instance.compute
         self._lock = threading.Lock()
@@ -111,7 +242,7 @@ class FasterWhisperAsrAdapter:
             return loaded
         with self._lock:
             first = self._pass(media, vad=True)
-            if isinstance(first, AsrUnavailable) or first[0]:
+            if isinstance(first, AsrUnavailable) or first.segments:
                 return self._finish(media, first, confirmation=False)
             second = self._pass(media, vad=False)
             if isinstance(second, AsrUnavailable):
@@ -123,10 +254,10 @@ class FasterWhisperAsrAdapter:
                         ),
                     }
                 )
-            if not second[0]:
+            if not second.segments:
                 return AsrNoSpeech(
                     reason="two successful ASR passes found no speech",
-                    receipt=self._receipt(second[1], vad=False, confirmation=True),
+                    receipt=self._receipt(second.info, vad=False, confirmation=True),
                 )
             return self._finish(media, second, confirmation=True)
 
@@ -148,15 +279,17 @@ class FasterWhisperAsrAdapter:
         self._revision = prepared.integrity
         return str(self.cache_root / prepared.cache_path), None
 
-    def _load(self, model_id: str) -> Any | AsrUnavailable:
+    def _load(self, model_id: str) -> _WhisperModel | AsrUnavailable:
         if self._model is not None:
             return self._model
         try:
-            self._module = importlib.import_module("faster_whisper")
+            self._api = _admit_whisper_api(importlib.import_module("faster_whisper"))
         except ModuleNotFoundError:
             return self._unavailable("missing_package", "install vctx[asr]")
+        except _InvalidVendorResponse as exc:
+            return self._unavailable("invalid_response", str(exc))
         try:
-            self._model = self._module.WhisperModel(
+            raw_model = self._api.model(
                 model_id,
                 device=self.instance.device,
                 compute_type=self.instance.compute,
@@ -166,89 +299,115 @@ class FasterWhisperAsrAdapter:
             if self.instance.device != "auto":
                 return self._unavailable("unsupported_hardware", str(exc))
             try:
-                self._model = self._module.WhisperModel(
+                raw_model = self._api.model(
                     model_id, device="cpu", compute_type="auto", local_files_only=True
                 )
                 self._device = "cpu"
             except Exception as fallback:
                 return self._unavailable("unsupported_hardware", str(fallback))
-        self._device = str(getattr(getattr(self._model, "model", None), "device", self._device))
-        self._compute = str(
-            getattr(getattr(self._model, "model", None), "compute_type", self._compute)
-        )
+        try:
+            self._model, self._device, self._compute = _admit_whisper_model(
+                raw_model, default_device=self._device, default_compute=self._compute
+            )
+        except _InvalidVendorResponse as exc:
+            return self._unavailable("invalid_response", str(exc))
         return self._model
 
-    def _pass(
-        self, media: MediaAsset, *, vad: bool
-    ) -> tuple[list[WhisperSegment], object, int | None] | AsrUnavailable:
+    def _pass(self, media: MediaAsset, *, vad: bool) -> _WhisperPass | AsrUnavailable:
         assert self._model is not None
-        kwargs: dict[str, object] = {
-            "language": None,
-            "task": "transcribe",
-            "word_timestamps": False,
-            "vad_filter": vad,
-        }
-        if vad:
-            kwargs["vad_parameters"] = {
+        vad_parameters = (
+            {
                 "threshold": 0.5,
                 "min_silence_duration_ms": 2000,
                 "speech_pad_ms": 400,
             }
-        if self._cuda():
-            return self._batched_pass(media, kwargs)
+            if vad
+            else None
+        )
+        if self._device == "cuda":
+            return self._batched_pass(media, vad=vad, vad_parameters=vad_parameters)
         try:
-            segments, info = self._model.transcribe(str(media.local_path), **kwargs)
-            return list(segments), info, None
+            raw = self._model.transcribe(
+                str(media.local_path),
+                language=None,
+                task="transcribe",
+                word_timestamps=False,
+                vad_filter=vad,
+                vad_parameters=vad_parameters,
+            )
+            return _admit_whisper_pass(raw)
+        except _InvalidVendorTimestamps as exc:
+            return self._unavailable("invalid_timestamps", str(exc), vad=vad)
+        except _InvalidVendorResponse as exc:
+            return self._unavailable("invalid_response", str(exc), vad=vad)
+        except _InferenceStreamError as exc:
+            return self._unavailable("inference_failed", str(exc.cause), vad=vad)
         except Exception as exc:
             return self._unavailable("inference_failed", str(exc), vad=vad)
 
     def _batched_pass(
-        self, media: MediaAsset, kwargs: dict[str, object]
-    ) -> tuple[list[WhisperSegment], object, int | None] | AsrUnavailable:
-        assert self._module is not None
-        pipeline = self._module.BatchedInferencePipeline(model=self._model)
+        self,
+        media: MediaAsset,
+        *,
+        vad: bool,
+        vad_parameters: dict[str, float | int] | None,
+    ) -> _WhisperPass | AsrUnavailable:
+        assert self._api is not None and self._model is not None
+        if self._api.pipeline is None:
+            return self._unavailable(
+                "invalid_response", "faster-whisper lacks BatchedInferencePipeline", vad=vad
+            )
+        try:
+            pipeline = _admit_whisper_pipeline(self._api.pipeline(model=self._model))
+        except _InvalidVendorResponse as exc:
+            return self._unavailable("invalid_response", str(exc), vad=vad)
+        except Exception as exc:
+            return self._unavailable("inference_failed", str(exc), vad=vad)
         for batch_size in (8, 4, 2, 1):
-            emitted: list[WhisperSegment] = []
             try:
-                segments, info = pipeline.transcribe(
-                    str(media.local_path), batch_size=batch_size, **kwargs
+                raw = pipeline.transcribe(
+                    str(media.local_path),
+                    batch_size=batch_size,
+                    language=None,
+                    task="transcribe",
+                    word_timestamps=False,
+                    vad_filter=vad,
+                    vad_parameters=vad_parameters,
                 )
-                for segment in segments:
-                    emitted.append(segment)
-                return emitted, info, batch_size
+                admitted = _admit_whisper_pass(raw)
+                return _WhisperPass(admitted.segments, admitted.info, batch_size)
+            except _InvalidVendorTimestamps as exc:
+                return self._unavailable("invalid_timestamps", str(exc), vad=vad)
+            except _InvalidVendorResponse as exc:
+                return self._unavailable("invalid_response", str(exc), vad=vad)
+            except _InferenceStreamError as exc:
+                if exc.emitted or not _is_oom(exc.cause) or batch_size == 1:
+                    return self._unavailable("inference_failed", str(exc.cause), vad=vad)
             except Exception as exc:
-                if emitted or not _is_oom(exc) or batch_size == 1:
-                    return self._unavailable(
-                        "inference_failed", str(exc), vad=bool(kwargs["vad_filter"])
-                    )
+                if not _is_oom(exc) or batch_size == 1:
+                    return self._unavailable("inference_failed", str(exc), vad=vad)
         raise AssertionError("unreachable batch retry state")
 
     def _finish(
         self,
         media: MediaAsset,
-        result: tuple[list[WhisperSegment], object, int | None] | AsrUnavailable,
+        result: _WhisperPass | AsrUnavailable,
         *,
         confirmation: bool,
     ) -> AsrOutcome:
         if isinstance(result, AsrUnavailable):
             return result
-        raw, info, batch = result
-        try:
-            segments = _admit_segments(raw)
-        except ValueError as exc:
-            return self._unavailable("invalid_timestamps", str(exc), vad=not confirmation)
+        segments, info, batch = result.segments, result.info, result.batch_size
         if not segments:
             return self._unavailable("invalid_timestamps", "ASR emitted no usable timed text")
-        language = getattr(info, "language", None)
-        confidence = getattr(info, "language_probability", None)
+        language = info.language
+        confidence = info.language_probability
         evidence = (
             DetectedLanguage(code=language, source="asr", confidence=confidence)
             if language
             else UnknownLanguage(reason="ASR language not reported")
         )
-        receipt = self._receipt(
-            info, vad=not confirmation, confirmation=confirmation, batch=batch
-        )
+        receipt = self._receipt(info, vad=not confirmation, confirmation=confirmation, batch=batch)
         return AsrReady(
             transcript=Transcript(
                 video_id=media.id,
@@ -258,7 +417,7 @@ class FasterWhisperAsrAdapter:
                     language_evidence=evidence,
                     format="json",
                     provider="faster-whisper",
-                    asr=receipt.model_dump(exclude_none=True),
+                    asr=receipt.provenance(),
                 ),
                 segments=segments,
             ),
@@ -266,7 +425,12 @@ class FasterWhisperAsrAdapter:
         )
 
     def _receipt(
-        self, info: object, *, vad: bool, confirmation: bool = False, batch: int | None = None
+        self,
+        info: _WhisperInfo,
+        *,
+        vad: bool,
+        confirmation: bool = False,
+        batch: int | None = None,
     ) -> AsrReceipt:
         return AsrReceipt(
             provider="faster-whisper",
@@ -277,10 +441,10 @@ class FasterWhisperAsrAdapter:
             batch_size=batch,
             vad=vad,
             confirmation=confirmation,
-            source_duration=getattr(info, "duration", None),
-            speech_duration=getattr(info, "duration_after_vad", None),
-            language=getattr(info, "language", None),
-            language_confidence=getattr(info, "language_probability", None),
+            source_duration=info.duration,
+            speech_duration=info.duration_after_vad,
+            language=info.language,
+            language_confidence=info.language_probability,
         )
 
     def _unavailable(
@@ -299,105 +463,100 @@ class FasterWhisperAsrAdapter:
             ),
         )
 
-    def _cuda(self) -> bool:
-        if self._device == "cuda":
-            return True
-        device = getattr(getattr(self._model, "model", None), "device", None)
-        return str(device).lower() == "cuda"
 
+@dataclass
+class AsrRuntimePool:
+    local: dict[str, FasterWhisperAsrAdapter] = field(default_factory=dict)
 
-class OpenAiCompatibleAsrAdapter:
-    def __init__(
-        self, *, instance: AsrInstanceConfig, api_key: str, provider_id: str,
-        net: NetRuntime | None = None
-    ) -> None:
-        self.instance = instance
-        self.api_key = api_key
-        self.provider_id = provider_id
-        self.net = net or UrllibNetRuntime()
-
-    def transcribe(self, media: MediaAsset) -> AsrOutcome:
-        try:
-            response = self.net.request(self._request(media))
-        except Exception as exc:
-            return self._unavailable("inference_failed", type(exc).__name__)
-        if not 200 <= response.status_code < 300:
-            return self._unavailable("inference_failed", f"HTTP {response.status_code}")
-        try:
-            payload = OpenAiAsrResponse.model_validate_json(response.body)
-            segments = _admit_segments(payload.segments)
-        except ValueError as exc:
-            return self._unavailable("invalid_response", str(exc))
-        if not segments:
-            return self._unavailable("invalid_response", "online ASR returned no timed segments")
-        return AsrReady(
-            transcript=Transcript(
-                video_id=media.id,
-                provenance=TranscriptProvenance(
-                    method="asr", format="json", provider=self.provider_id
-                ),
-                segments=segments,
-            ),
-            receipt=AsrReceipt(
-                provider=self.provider_id, model=self.instance.model or "whisper-1",
-                device="remote", compute_type="remote", vad=False
-            ),
-        )
-
-    def _request(self, media: MediaAsset) -> NetRequest:
-        if not self.instance.base_url:
-            raise ValueError("openai-compatible ASR instance is missing base_url")
-        body, content_type = _multipart_audio_payload(
-            media.local_path, model=self.instance.model or "whisper-1"
-        )
-        return NetRequest(
-            method="POST", url=self.instance.base_url,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": content_type},
-            body=body, timeout_s=120, purpose="asr_transcription", provider_id=self.provider_id
-        )
-
-    def _unavailable(self, code: AsrFailureCode, reason: str) -> AsrUnavailable:
-        return AsrUnavailable(
-            reason=reason,
-            receipt=AsrReceipt(
-                provider=self.provider_id, model=self.instance.model or "whisper-1",
-                device="remote", compute_type="remote", vad=False, failure=code
-            ),
-        )
+    def faster_whisper(
+        self, *, instance: AsrInstanceConfig, model_id: str | None, cache_root: Path
+    ) -> FasterWhisperAsrAdapter:
+        key = f"{instance.model_dump_json()}:{model_id}:{cache_root.resolve()}"
+        adapter = self.local.get(key)
+        if adapter is None:
+            adapter = FasterWhisperAsrAdapter(
+                instance=instance, model_id=model_id, cache_root=cache_root
+            )
+            self.local[key] = adapter
+        return adapter
 
 
 def run_asr(
-    plan: RoutePlan, media: MediaAsset, *, instance: AsrInstanceConfig,
-    cache_root: Path, api_key: str | None = None,
-    runtime_cache: dict[str, object] | None = None
+    plan: AsrPlan,
+    media: MediaAsset,
+    *,
+    instance: AsrInstanceConfig,
+    cache_root: Path,
+    runtimes: AsrRuntimePool | None = None,
 ) -> AsrOutcome:
     if plan.selected == "local" and instance.type == "local-faster-whisper":
-        cache = runtime_cache if runtime_cache is not None else {}
-        key = f"asr:{instance.model_dump_json()}:{cache_root.resolve()}"
-        adapter = cast(FasterWhisperAsrAdapter | None, cache.get(key))
-        if adapter is None:
-            adapter = FasterWhisperAsrAdapter(
-                instance=instance, model_id=plan.model_id, cache_root=cache_root
-            )
-            cache[key] = adapter
-        return adapter.transcribe(media)
-    if plan.selected == "configured-online" and instance.type == "openai-compatible-audio":
-        if not api_key:
-            return AsrUnavailable(
-                reason="online ASR credential is missing",
-                receipt=AsrReceipt(
-                    provider=plan.provider_id or "configured-asr",
-                    model=instance.model or "whisper-1", device="remote",
-                    compute_type="remote", vad=False, failure="inference_failed"
-                ),
-            )
-        return OpenAiCompatibleAsrAdapter(
-            instance=instance, api_key=api_key, provider_id=plan.provider_id or "configured-asr"
+        pool = runtimes or AsrRuntimePool()
+        return pool.faster_whisper(
+            instance=instance, model_id=plan.model_id, cache_root=cache_root
         ).transcribe(media)
     raise ValueError(f"ASR plan is not executable: {plan.selected}")
 
 
-def _admit_segments(segments: Iterable[WhisperSegment]) -> list[TranscriptSegment]:
+def _admit_whisper_api(module: object) -> _WhisperApi:
+    model = getattr(module, "WhisperModel", None)
+    if not callable(model):
+        raise _InvalidVendorResponse("faster-whisper lacks callable WhisperModel")
+    pipeline = getattr(module, "BatchedInferencePipeline", None)
+    if pipeline is not None and not callable(pipeline):
+        raise _InvalidVendorResponse("faster-whisper BatchedInferencePipeline is not callable")
+    return _WhisperApi(
+        model=cast(_WhisperModelFactory, model),
+        pipeline=cast(_WhisperPipelineFactory, pipeline) if pipeline is not None else None,
+    )
+
+
+def _admit_whisper_model(
+    raw: object, *, default_device: str, default_compute: str
+) -> tuple[_WhisperModel, str, str]:
+    if not callable(getattr(raw, "transcribe", None)):
+        raise _InvalidVendorResponse("faster-whisper model lacks callable transcribe")
+    engine = getattr(raw, "model", None)
+    device = str(getattr(engine, "device", default_device))
+    compute = str(getattr(engine, "compute_type", default_compute))
+    return cast(_WhisperModel, raw), device, compute
+
+
+def _admit_whisper_pipeline(raw: object) -> _WhisperPipeline:
+    if not callable(getattr(raw, "transcribe", None)):
+        raise _InvalidVendorResponse("faster-whisper pipeline lacks callable transcribe")
+    return cast(_WhisperPipeline, raw)
+
+
+def _admit_whisper_pass(raw: object) -> _WhisperPass:
+    if not isinstance(raw, tuple) or len(raw) != 2:
+        raise _InvalidVendorResponse("faster-whisper transcribe must return segments and info")
+    raw_segments, raw_info = raw
+    if not isinstance(raw_segments, Iterable):
+        raise _InvalidVendorResponse("faster-whisper segments are not iterable")
+    try:
+        info = _WhisperInfo.model_validate(raw_info)
+    except ValidationError as exc:
+        raise _InvalidVendorResponse(str(exc)) from exc
+    vendor_segments: list[_WhisperSegment] = []
+    iterator = iter(raw_segments)
+    while True:
+        try:
+            raw_segment = next(iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            raise _InferenceStreamError(exc, emitted=bool(vendor_segments)) from exc
+        try:
+            vendor_segments.append(_WhisperSegment.model_validate(raw_segment))
+        except ValidationError as exc:
+            raise _InvalidVendorResponse(str(exc)) from exc
+    try:
+        return _WhisperPass(_admit_segments(vendor_segments), info)
+    except ValueError as exc:
+        raise _InvalidVendorTimestamps(str(exc)) from exc
+
+
+def _admit_segments(segments: Iterable[TimedText]) -> list[TranscriptSegment]:
     admitted: list[TranscriptSegment] = []
     previous = -1.0
     for segment in segments:
@@ -411,9 +570,7 @@ def _admit_segments(segments: Iterable[WhisperSegment]) -> list[TranscriptSegmen
             raise ValueError("ASR timestamps must have ordered bounds")
         start, end = round(start, 3), round(end, 3)
         admitted.append(
-            TranscriptSegment(
-                id=f"seg_{len(admitted) + 1:06d}", start=start, end=end, text=text
-            )
+            TranscriptSegment(id=f"seg_{len(admitted) + 1:06d}", start=start, end=end, text=text)
         )
         previous = start
     return admitted
@@ -422,20 +579,3 @@ def _admit_segments(segments: Iterable[WhisperSegment]) -> list[TranscriptSegmen
 def _is_oom(exc: Exception) -> bool:
     message = str(exc).casefold()
     return "out of memory" in message or "cuda" in message and "memory" in message
-
-
-def _multipart_audio_payload(path: Path, *, model: str) -> tuple[bytes, str]:
-    boundary = f"----vctx-{uuid.uuid4().hex}"
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    body = bytearray()
-    for name, value in (("model", model),):
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
-    body.extend(f"--{boundary}\r\n".encode())
-    body.extend(
-        f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
-        f"Content-Type: {media_type}\r\n\r\n".encode()
-    )
-    body.extend(path.read_bytes())
-    body.extend(f"\r\n--{boundary}--\r\n".encode())
-    return bytes(body), f"multipart/form-data; boundary={boundary}"

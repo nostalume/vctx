@@ -11,13 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from vctx.artifact.content import ArtifactKind
 from vctx.source.session import EffectReceipt, Revision, SourceRecord
+from vctx.transcript import AsrProvenance
 
 StepStatus = Literal["ok", "skipped", "warning", "error"]
 RunStatus = Literal["ok", "partial", "error"]
 SelectedRoute = Literal[
     "skipped", "deterministic", "local", "free-online", "configured-online", "unavailable"
 ]
-CapabilityName = Literal["asr", "visual_context", "knowledge_flow", "essential_cases"]
+CapabilityName = Literal["asr", "visual_context", "evidence_plan"]
 Freshness = Literal["immutable", "observed-online", "unverified-offline"]
 _RESERVED = {
     "con",
@@ -33,11 +34,65 @@ class ClosedModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AsrStepReceipt(AsrProvenance):
+    kind: Literal["asr"] = "asr"
+    failure: (
+        Literal[
+            "missing_package",
+            "missing_model",
+            "corrupt_model",
+            "unwritable_cache",
+            "unsupported_hardware",
+            "inference_failed",
+            "confirmation_failed",
+            "invalid_timestamps",
+            "invalid_response",
+        ]
+        | None
+    ) = None
+
+
+class FrameCaptureReceipt(ClosedModel):
+    id: str
+    path: str
+    requested_seconds: float = Field(ge=0)
+    actual_seconds: float = Field(ge=0)
+    original_width: int = Field(gt=0)
+    original_height: int = Field(gt=0)
+    orientation: Literal[0, 90, 180, 270]
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    sha256: str = Field(min_length=64, max_length=64)
+    request_ids: list[str]
+    segment_ids: list[str]
+    claim_ids: list[str]
+    processors: list[Literal["ocr", "describe"]]
+
+
+class FrameMissReceipt(ClosedModel):
+    id: str
+    requested_seconds: float = Field(ge=0)
+    reason: Literal["target_out_of_range"]
+    request_ids: list[str]
+    segment_ids: list[str]
+    claim_ids: list[str]
+
+
+class FrameStepReceipt(ClosedModel):
+    kind: Literal["frames"] = "frames"
+    recipe: Literal["pyav-display-v1"] = "pyav-display-v1"
+    captures: list[FrameCaptureReceipt]
+    misses: list[FrameMissReceipt]
+
+
+type StepReceipt = Annotated[AsrStepReceipt | FrameStepReceipt, Field(discriminator="kind")]
+
+
 class ManifestStep(ClosedModel):
     name: str
     status: StepStatus
     detail: str | None = None
-    receipt: dict[str, object] | None = None
+    receipt: StepReceipt | None = None
 
 
 class ArtifactRef(ClosedModel):
@@ -47,13 +102,19 @@ class ArtifactRef(ClosedModel):
     bytes: int = Field(ge=0)
     sha256: str = Field(min_length=64, max_length=64)
 
-    @field_validator("path")
-    @classmethod
-    def direct_lane_child(cls, value: str) -> str:
-        path = PurePosixPath(value)
-        if path.is_absolute() or len(path.parts) != 1 or path.name in {"", ".", ".."}:
-            raise ValueError("artifact path must be one direct source-lane child")
-        return value
+    @model_validator(mode="after")
+    def contained_lane_path(self) -> ArtifactRef:
+        path = PurePosixPath(self.path)
+        valid_frame = (
+            self.kind == "visual_frame"
+            and len(path.parts) == 2
+            and path.parts[0] == "frames"
+            and path.suffix == ".png"
+        )
+        valid_direct = self.kind != "visual_frame" and len(path.parts) == 1
+        if path.is_absolute() or path.name in {"", ".", ".."} or not (valid_frame or valid_direct):
+            raise ValueError("artifact path is outside its canonical source-lane location")
+        return self
 
 
 class SourceEffect(ClosedModel):
@@ -205,7 +266,9 @@ class ManifestBuilder:
         self.freshness: Freshness = (
             "immutable"
             if source.revision.kind == "immutable"
-            else "unverified-offline" if offline else "observed-online"
+            else "unverified-offline"
+            if offline
+            else "observed-online"
         )
         self.steps: list[ManifestStep] = []
         self.warnings: list[str] = []
@@ -217,8 +280,11 @@ class ManifestBuilder:
         return cls(source, key, offline=offline)
 
     def add_step(
-        self, name: str, status: StepStatus, detail: str | None = None,
-        receipt: dict[str, object] | None = None
+        self,
+        name: str,
+        status: StepStatus,
+        detail: str | None = None,
+        receipt: StepReceipt | None = None,
     ) -> None:
         self.steps.append(ManifestStep(name=name, status=status, detail=detail, receipt=receipt))
 

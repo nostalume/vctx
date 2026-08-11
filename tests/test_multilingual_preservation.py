@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from vctx.models.visual import VisualRecord, VisualRecordSet
 from vctx.render.markdown import render_context_markdown, render_readable_markdown
 from vctx.source.session import SourceRef, VideoMetadata
 from vctx.transcript import (
@@ -12,6 +11,7 @@ from vctx.transcript import (
     chunk_transcript,
     normalize_transcript,
 )
+from vctx.visual.evidence import CaptureEvidence, Evidence, Observation
 
 
 def test_native_non_english_transcript_text_survives_normalize_chunk_and_render() -> None:
@@ -70,19 +70,20 @@ def test_native_visual_text_is_rendered_as_source_evidence_without_translation()
     )
     chunks = chunk_transcript(transcript, ChunkOptions(max_chars=200))
     visual_text = "精度 速度 メモリ使用量"
-    visual_records = VisualRecordSet(
-        records=[
-            VisualRecord(
-                id="ocr-0001",
-                timestamp_seconds=1.0,
-                frame_id="frame-0001",
-                kind="ocr",
-                text=visual_text,
+    evidence = Evidence(
+        video_id="video-ja",
+        captures=[
+            CaptureEvidence(
+                id="frame-0001",
+                requested_seconds=1.0,
+                actual_seconds=1.0,
+                artifact_path="frames/frame-0001.png",
+                ocr=Observation(status="ok", text=visual_text, provider="rapidocr"),
             )
-        ]
+        ],
     )
 
-    context = render_context_markdown(_metadata(), transcript, chunks, visual_records)
+    context = render_context_markdown(_metadata(), transcript, chunks, evidence)
 
     assert visual_text in context
     assert "accuracy speed memory" not in context.lower()
