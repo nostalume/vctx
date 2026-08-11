@@ -8,43 +8,109 @@ from typing import Annotated, Literal
 import typer
 from platformdirs import user_config_path
 
-from vctx.app.cache import manage_cache, render_cache
+from vctx.app.auth import AuthError, OpenRouterAuth, desktop_login, system_keyring
+from vctx.app.cache import cache_status, prune_cache, render_cache
 from vctx.app.chunk import write_chunk_file
 from vctx.app.doctor import doctor_report
 from vctx.app.metadata import inspect_metadata, render_metadata_text
 from vctx.app.models import (
-    ModelLifecycleError,
-    manage_models,
+    model_status,
+    pull_models,
     render_model_receipts,
-    resolve_asr_model_id,
-    resolve_model_dir,
+    select_asr_model_id,
+    verify_models,
 )
 from vctx.app.pack import prepare_context_pack
 from vctx.app.render import RenderFormat, write_render_file
-from vctx.config import MediaQuality, PrepareRequest, WorkflowProfile
+from vctx.config import MediaQuality, PrepareRequest, WorkflowProfile, load_resolved_config
 from vctx.errors import VctxError
 from vctx.io import model_to_json
+from vctx.net import HttpxNetRuntime, NetRuntime
 
 app = typer.Typer(no_args_is_help=True)
 models_app = typer.Typer(no_args_is_help=True)
 cache_app = typer.Typer(no_args_is_help=True)
+auth_app = typer.Typer(no_args_is_help=True)
+openrouter_auth_app = typer.Typer(no_args_is_help=True)
 app.add_typer(models_app, name="models")
 app.add_typer(cache_app, name="cache")
+app.add_typer(auth_app, name="auth")
+auth_app.add_typer(openrouter_auth_app, name="openrouter")
+
+
+def _openrouter_auth(net: NetRuntime | None = None) -> OpenRouterAuth:
+    try:
+        return OpenRouterAuth(keyring=system_keyring(), net=net)
+    except AuthError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
+@openrouter_auth_app.command("login")
+def openrouter_login_command(
+    headless: Annotated[bool, typer.Option("--headless")] = False,
+) -> None:
+    with HttpxNetRuntime() as net:
+        auth = _openrouter_auth(net)
+        try:
+            if headless:
+                session = auth.begin("http://localhost")
+                typer.echo(f"Open this URL:\n{session.authorization_url}")
+                auth.finish(session, code=typer.prompt("Paste authorization code").strip())
+            else:
+                desktop_login(auth)
+        except AuthError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+    typer.echo("OpenRouter authentication stored in the system keyring.")
+
+
+@openrouter_auth_app.command("status")
+def openrouter_status_command() -> None:
+    status = _openrouter_auth().status()
+    typer.echo("authenticated" if status.authenticated else "not authenticated")
+
+
+@openrouter_auth_app.command("logout")
+def openrouter_logout_command() -> None:
+    _openrouter_auth().logout()
+    typer.echo("OpenRouter authentication removed from the system keyring.")
+
 
 def _cache_command(
-    action: Literal["status", "prune"], cache_dir: Path | None, config: Path | None,
-    json_output: bool, *, age: str | None = None, all_records: bool = False,
-    dry_run: bool = False
+    action: Literal["status", "prune"],
+    cache_dir: Path | None,
+    config: Path | None,
+    json_output: bool,
+    *,
+    age: str | None = None,
+    all_records: bool = False,
+    dry_run: bool = False,
 ) -> None:
     try:
-        report = manage_cache(
-            action, config_path=_select_config_path(config), cache_dir=cache_dir,
-            age=age, all_records=all_records, dry_run=dry_run
+        resolved = load_resolved_config(
+            PrepareRequest(
+                inputs=["cache-operation"],
+                out_dir=Path("."),
+                config_path=_select_config_path(config),
+                cache_dir=cache_dir,
+            )
+        )
+        report = (
+            cache_status(resolved.cache.source_dir)
+            if action == "status"
+            else prune_cache(
+                resolved.cache.source_dir,
+                age=age,
+                all_records=all_records,
+                dry_run=dry_run,
+            )
         )
     except VctxError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(exc.exit_code) from exc
     typer.echo(render_cache(report, json_output=json_output), nl=False)
+
 
 @cache_app.command("status")
 def cache_status_command(
@@ -53,6 +119,7 @@ def cache_status_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     _cache_command("status", cache_dir, config, json_output)
+
 
 @cache_app.command("prune")
 def cache_prune_command(
@@ -66,8 +133,7 @@ def cache_prune_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     _cache_command(
-        "prune", cache_dir, config, json_output,
-        age=age, all_records=all_records, dry_run=dry_run
+        "prune", cache_dir, config, json_output, age=age, all_records=all_records, dry_run=dry_run
     )
 
 
@@ -80,16 +146,28 @@ def _models_command(
     asr: str | None,
 ) -> None:
     try:
-        asr_model_id = resolve_asr_model_id(
-            config_path=_select_config_path(config), cache_dir=cache_dir, selector=asr
+        resolved = load_resolved_config(
+            PrepareRequest(
+                inputs=["model-lifecycle"],
+                out_dir=Path("."),
+                workflow=WorkflowProfile.TRANSCRIPT,
+                config_path=_select_config_path(config),
+                cache_dir=cache_dir,
+                asr_use=asr,
+            )
         )
-        model_dir = resolve_model_dir(
-            config_path=_select_config_path(config), cache_dir=cache_dir
+        asr_model_id = select_asr_model_id(resolved)
+        operation = {
+            "pull": pull_models,
+            "status": model_status,
+            "verify": verify_models,
+        }[action]
+        receipts = operation(
+            capabilities,
+            cache_dir=resolved.cache.model_dir,
+            asr_model_id=asr_model_id,
         )
-        receipts = manage_models(
-            action, capabilities, cache_dir=model_dir, asr_model_id=asr_model_id
-        )
-    except ModelLifecycleError as exc:
+    except VctxError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(exc.exit_code) from exc
     typer.echo(render_model_receipts(receipts, json_output=json_output), nl=False)
@@ -169,7 +247,7 @@ def prepare_command(
         str | None,
         typer.Option(
             "--vision",
-            help="Vision selector: auto, none, instance:<name>, or openrouter:<model>.",
+            help="Vision selector: auto, none, or instance:<name>.",
         ),
     ] = None,
     no_retain_media: Annotated[

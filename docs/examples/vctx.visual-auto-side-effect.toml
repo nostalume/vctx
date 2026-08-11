@@ -18,9 +18,10 @@ media_quality = "balanced"
 # Source acquisition preference only; not OCR translation.
 subtitle_languages = ["en", "ja", "zh-Hans", "zh-Hant"]
 
-[transforms.visual_context]
-enabled = true
+[evidence]
+planner = "auto"
+ocr = "auto"
 # OCR remains local RapidOCR auto/default when rapidocr is installed.
 # VLM is separate and optional; auto only resolves when policy, network, upload, and key allow it.
-use = "auto"
-# use = "openrouter:<vision-model-id>"
+vision = "auto"
+# vision = "instance:my-vlm"  # configure under [instances.ai.my-vlm]

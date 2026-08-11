@@ -17,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+from vctx.ai import AiInstanceConfig
 from vctx.errors import ConfigError
 from vctx.render.bundle import DEFAULT_FORMATS, OutputFormat
 
@@ -59,9 +60,7 @@ def _source_session(value: object) -> object:
         return BrowserSourceSession(browser=value.removeprefix("browser:"))
     if value.startswith("cookies-file:"):
         return CookieFileSourceSession(path=Path(value.removeprefix("cookies-file:")))
-    raise ValueError(
-        "source.yt_dlp.session must be none, browser:<name>, or cookies-file:<path>"
-    )
+    raise ValueError("source.yt_dlp.session must be none, browser:<name>, or cookies-file:<path>")
 
 
 SourceSession = Annotated[
@@ -199,11 +198,11 @@ def _transform_use(value: object) -> object:
     if value.startswith("instance:"):
         return InstanceUse(name=value.removeprefix("instance:"))
     prefix, separator, _rest = value.partition(":")
-    if separator and prefix in {"openrouter", "path", "local", "hf"}:
+    if separator and prefix in {"path", "local", "hf"}:
         return ModelRefUse(ref=value)
     raise ValueError(
-        "transform use must be auto, none, instance:<name>, openrouter:<model>, "
-        "path:<local-path>, local:<path-or-id>, or hf:<repo-id>"
+        "transform use must be auto, none, instance:<name>, path:<local-path>, "
+        "local:<path-or-id>, or hf:<repo-id>"
     )
 
 
@@ -213,7 +212,7 @@ TransformUse = Annotated[
     BeforeValidator(_transform_use),
 ]
 
-AsrInstanceType = Literal["local-faster-whisper", "openai-compatible-audio"]
+AsrInstanceType = Literal["local-faster-whisper"]
 InstanceCachePolicy = Literal["persistent", "disabled"]
 
 
@@ -289,20 +288,35 @@ class CapabilityInput(BaseModel):
     use: TransformUse = Field(default_factory=AutoUse)
 
 
+def _capability_input(value: object) -> object:
+    return {"use": value} if isinstance(value, str) else value
+
+
+CapabilitySelection = Annotated[CapabilityInput, BeforeValidator(_capability_input)]
+
+
 class TransformInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     asr: CapabilityInput = Field(default_factory=CapabilityInput)
-    ocr: CapabilityInput = Field(default_factory=CapabilityInput)
-    visual_context: CapabilityInput = Field(default_factory=CapabilityInput)
-    knowledge_flow: CapabilityInput = Field(default_factory=CapabilityInput)
 
 
 class TransformConfig(BaseModel):
     asr: CapabilityPolicy
+
+
+class EvidenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    planner: CapabilitySelection = Field(default_factory=CapabilityInput)
+    vision: CapabilitySelection = Field(default_factory=CapabilityInput)
+    ocr: CapabilitySelection = Field(default_factory=CapabilityInput)
+
+
+class EvidenceConfig(BaseModel):
+    planner: CapabilityPolicy
+    vision: CapabilityPolicy
     ocr: CapabilityPolicy
-    visual_context: CapabilityPolicy
-    knowledge_flow: CapabilityPolicy
 
 
 class OutputConfig(BaseModel):
@@ -323,15 +337,6 @@ class OutputInput(BaseModel):
     retain_media: StrictBool | None = None
 
 
-class VisionInstanceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: str
-    base_url: str | None = None
-    api_key_env: str | None = None
-    model: str | None = None
-
-
 class AsrInstanceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -340,15 +345,13 @@ class AsrInstanceConfig(BaseModel):
     device: Literal["auto", "cpu", "cuda"] = "auto"
     compute: str = "auto"
     cache: InstanceCachePolicy = "persistent"
-    base_url: str | None = None
-    api_key_env: str | None = None
 
 
 class InstanceRegistry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     asr: dict[str, AsrInstanceConfig] = Field(default_factory=dict)
-    vision: dict[str, VisionInstanceConfig] = Field(default_factory=dict)
+    ai: dict[str, AiInstanceConfig] = Field(default_factory=dict)
 
 
 class ConfigInput(BaseModel):
@@ -358,6 +361,7 @@ class ConfigInput(BaseModel):
     cache: CacheInput = Field(default_factory=CacheInput)
     source: SourceInput = Field(default_factory=SourceInput)
     transforms: TransformInput = Field(default_factory=TransformInput)
+    evidence: EvidenceInput = Field(default_factory=EvidenceInput)
     output: OutputInput = Field(default_factory=OutputInput)
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
 
@@ -379,6 +383,7 @@ class ResolvedConfig(BaseModel):
     cache: CacheConfig
     source: SourceConfig
     transforms: TransformConfig
+    evidence: EvidenceConfig
     output: OutputConfig
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
 
@@ -391,18 +396,21 @@ def _workflow_capabilities(
     if workflow == WorkflowProfile.TRANSCRIPT:
         return (True, False, False)
     if workflow == WorkflowProfile.VISUAL:
-        return (True, True, False)
+        return (True, True, True)
     if workflow == WorkflowProfile.FULL:
         return (True, True, True)
     return (True, False, False)
 
 
-def _read_config(path: Path | None) -> ConfigInput:
+def load_config(path: Path | None) -> ConfigInput:
     if path is None:
         return ConfigInput()
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return ConfigInput.model_validate(data)
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        return ConfigInput.model_validate(data)
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"invalid configuration: {exc}") from exc
 
 
 def _resolve_ytdlp_source_paths(
@@ -427,10 +435,7 @@ def _resolve_instance_registry(
             name: _resolve_asr_instance_paths(instance, paths)
             for name, instance in instances.asr.items()
         },
-        vision={
-            name: _resolve_vision_instance_paths(instance, paths)
-            for name, instance in instances.vision.items()
-        },
+        ai=instances.ai,
     )
 
 
@@ -443,66 +448,37 @@ def _resolve_asr_instance_paths(
     return instance.model_copy(update={"model": str(resolved_model)})
 
 
-def _resolve_vision_instance_paths(
-    instance: VisionInstanceConfig, paths: ConfigPathContext
-) -> VisionInstanceConfig:
-    if instance.model is None or not instance.model.startswith("path:"):
-        return instance
-    resolved_model = paths.resolve_config_path(Path(instance.model.removeprefix("path:")))
-    return instance.model_copy(update={"model": str(resolved_model)})
-
-
 def _validate_instance_refs(config: ConfigInput) -> None:
     if (
         isinstance(config.transforms.asr.use, InstanceUse)
         and config.transforms.asr.use.name not in config.instances.asr
     ):
         raise ValueError(
-            "transforms.asr.use references unknown ASR instance: "
-            f"{config.transforms.asr.use.name}"
+            f"transforms.asr.use references unknown ASR instance: {config.transforms.asr.use.name}"
         )
     if (
-        isinstance(config.transforms.visual_context.use, InstanceUse)
-        and config.transforms.visual_context.use.name not in config.instances.vision
+        isinstance(config.evidence.vision.use, InstanceUse)
+        and config.evidence.vision.use.name not in config.instances.ai
     ):
         raise ValueError(
-            "transforms.visual_context.use references unknown vision instance: "
-            f"{config.transforms.visual_context.use.name}"
+            f"evidence.vision references unknown AI instance: {config.evidence.vision.use.name}"
         )
-
-
-def _validate_instance_compatibility(
-    transforms: TransformConfig, instances: InstanceRegistry
-) -> None:
-    if isinstance(transforms.asr.use, InstanceUse) and transforms.asr.enabled:
-        _validate_asr_instance_compatibility(
-            instances.asr[transforms.asr.use.name],
-        )
-    if isinstance(transforms.visual_context.use, InstanceUse) and transforms.visual_context.enabled:
-        _validate_vision_instance_compatibility(
-            instances.vision[transforms.visual_context.use.name],
-        )
-
-
-def _validate_asr_instance_compatibility(instance: AsrInstanceConfig) -> None:
-    if instance.type == "openai-compatible-audio" and (
-        instance.base_url is None or instance.api_key_env is None or instance.model is None
+    if (
+        isinstance(config.evidence.planner.use, InstanceUse)
+        and config.evidence.planner.use.name not in config.instances.ai
     ):
         raise ValueError(
-            "openai-compatible-audio ASR instance requires base_url, api_key_env, and model"
+            f"evidence.planner references unknown AI instance: {config.evidence.planner.use.name}"
         )
 
 
-def _validate_vision_instance_compatibility(instance: VisionInstanceConfig) -> None:
-    if instance.type != "openai-compatible-vision":
-        raise ValueError("vision instance requires type openai-compatible-vision")
-    if instance.base_url is None or instance.api_key_env is None or instance.model is None:
-        raise ValueError(
-            "openai-compatible-vision instance requires base_url, api_key_env, and model"
-        )
+def _validate_instance_compatibility(evidence: EvidenceConfig, instances: InstanceRegistry) -> None:
+    for policy in (evidence.vision, evidence.planner):
+        if isinstance(policy.use, InstanceUse) and policy.enabled:
+            instances.ai[policy.use.name].admit(policy.use.name)
 
 
-def _default_cache_dir() -> Path:
+def default_cache_dir() -> Path:
     return user_cache_path("vctx", appauthor=False)
 
 
@@ -511,7 +487,6 @@ def _coalesce[T](*values: T | None, default: T) -> T:
         if value is not None:
             return value
     return default
-
 
 
 def _resolve_policy(
@@ -538,11 +513,27 @@ def _request_policy(raw: CapabilityInput, use: TransformUse | str | None) -> Cap
     )
 
 
-def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
+def resolve_config(
+    request: PrepareRequest,
+    config: ConfigInput,
+    *,
+    default_cache_root: Path,
+) -> ResolvedConfig:
     """Resolve user request/config omissions into concrete default/auto policy."""
 
-    config = _read_config(request.config_path)
-    _validate_instance_refs(config)
+    try:
+        _validate_instance_refs(config)
+        return _resolve_config(request, config, default_cache_root=default_cache_root)
+    except ValueError as exc:
+        raise ConfigError(f"invalid configuration: {exc}") from exc
+
+
+def _resolve_config(
+    request: PrepareRequest,
+    config: ConfigInput,
+    *,
+    default_cache_root: Path,
+) -> ResolvedConfig:
     path_context = ConfigPathContext(
         base_dir=request.config_path.parent if request.config_path is not None else None
     )
@@ -554,9 +545,9 @@ def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
     )
     offline = _coalesce(request.offline, config.runtime.offline, default=False)
     keep_temp = _coalesce(request.keep_temp, config.runtime.keep_temp, default=False)
-    asr, visual_context, knowledge_flow = _workflow_capabilities(workflow)
+    asr, visual_enabled, planner_enabled = _workflow_capabilities(workflow)
 
-    cache_root = request.cache_dir or _default_cache_dir()
+    cache_root = request.cache_dir or default_cache_root
     source_dir = (
         cache_root / "source"
         if request.cache_dir is not None or config.cache.source_dir is None
@@ -583,18 +574,20 @@ def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
 
     transforms = TransformConfig(
         asr=_resolve_policy(_request_policy(config.transforms.asr, request.asr_use), asr),
+    )
+    evidence = EvidenceConfig(
         ocr=_resolve_policy(
-            _request_policy(config.transforms.ocr, request.ocr_use),
-            visual_context,
+            _request_policy(config.evidence.ocr, request.ocr_use),
+            visual_enabled,
         ),
-        visual_context=_resolve_policy(
-            _request_policy(config.transforms.visual_context, request.vision_use),
-            visual_context,
+        vision=_resolve_policy(
+            _request_policy(config.evidence.vision, request.vision_use),
+            visual_enabled,
         ),
-        knowledge_flow=_resolve_policy(config.transforms.knowledge_flow, knowledge_flow),
+        planner=_resolve_policy(config.evidence.planner, planner_enabled),
     )
     instances = _resolve_instance_registry(config.instances, path_context)
-    _validate_instance_compatibility(transforms, instances)
+    _validate_instance_compatibility(evidence, instances)
 
     return ResolvedConfig(
         runtime=RuntimeConfig(
@@ -609,6 +602,7 @@ def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
             media_quality=request.media_quality or config.source.media_quality,
         ),
         transforms=transforms,
+        evidence=evidence,
         output=OutputConfig(
             formats=formats,
             chunk_max_chars=_coalesce(
@@ -632,8 +626,9 @@ def _resolve_config(request: PrepareRequest) -> ResolvedConfig:
     )
 
 
-def resolve_config(request: PrepareRequest) -> ResolvedConfig:
-    try:
-        return _resolve_config(request)
-    except (OSError, ValueError) as exc:
-        raise ConfigError(f"invalid configuration: {exc}") from exc
+def load_resolved_config(request: PrepareRequest) -> ResolvedConfig:
+    return resolve_config(
+        request,
+        load_config(request.config_path),
+        default_cache_root=default_cache_dir(),
+    )
