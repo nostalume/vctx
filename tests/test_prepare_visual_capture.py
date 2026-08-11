@@ -7,8 +7,9 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 
+from tests.support import asr_ready
 from vctx.cli import app
-from vctx.transcript import TranscriptPayload, TranscriptProvenance
+from vctx.source.session import MediaAsset
 
 runner = CliRunner()
 
@@ -17,7 +18,7 @@ def test_prepare_visual_workflow_writes_capture_records_and_frame_refs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    import vctx.transforms.asr as asr_module
+    import vctx.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     import vctx.transforms.visual_ocr as visual_ocr_module
     import vctx.transforms.visual_routes as visual_routes_module
@@ -40,18 +41,9 @@ cache = "persistent"
     )
     out_dir = tmp_path / "out"
 
-    def fake_transcribe(self: object, media_asset: object) -> TranscriptPayload:
-        del self, media_asset
-        return TranscriptPayload(
-            text="WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nThis chart compares child mortality.\n",
-            format="vtt",
-            provenance=TranscriptProvenance(
-                method="asr",
-                language="en",
-                format="vtt",
-                provider="faster-whisper",
-            ),
-        )
+    def fake_transcribe(self: object, media_asset: MediaAsset) -> object:
+        del self
+        return asr_ready(media_asset.id, "This chart compares child mortality.")
 
     def fake_extract_frames(
         media_asset: object,

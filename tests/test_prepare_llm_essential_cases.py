@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 
+from tests.support import asr_ready_segments
 from vctx.cli import app
 from vctx.models.knowledge_flow import (
     KnowledgeFlow,
@@ -18,7 +19,8 @@ from vctx.models.visual import (
     EssentialCaseSupplementEvidence,
     EssentialVisualCase,
 )
-from vctx.transcript import Transcript, TranscriptPayload, TranscriptProvenance
+from vctx.source.session import MediaAsset
+from vctx.transcript import Transcript
 
 runner = CliRunner()
 
@@ -69,8 +71,8 @@ def test_prepare_visual_uses_llm_essential_cases_as_sampling_anchors(
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import vctx.app.prepare as prepare_module
+    import vctx.asr as asr_module
     import vctx.transforms.ai_routes as ai_routes_module
-    import vctx.transforms.asr as asr_module
     import vctx.transforms.visual_frames as visual_frames_module
     from vctx.models.visual import FrameAsset
     from vctx.transforms.visual_planning import Evidence, VisualAction
@@ -103,25 +105,15 @@ cache = "persistent"
     )
     seen_cases: list[dict[str, Any]] = []
 
-    def fake_transcribe(self: object, media_asset: object) -> TranscriptPayload:
-        del self, media_asset
-        return TranscriptPayload(
-            text=(
-                "WEBVTT\n\n"
-                "00:00:00.000 --> 00:00:02.000\n"
-                "Plain setup narration.\n\n"
-                "00:00:02.000 --> 00:00:04.000\n"
-                "Look at this for the workflow.\n\n"
-                "00:00:04.000 --> 00:00:06.000\n"
-                "Plain follow-up narration.\n"
-            ),
-            format="vtt",
-            provenance=TranscriptProvenance(
-                method="asr",
-                language="en",
-                format="vtt",
-                provider="faster-whisper",
-            ),
+    def fake_transcribe(self: object, media_asset: MediaAsset) -> object:
+        del self
+        return asr_ready_segments(
+            media_asset.id,
+            [
+                (0.0, 2.0, "Plain setup narration."),
+                (2.0, 4.0, "Look at this for the workflow."),
+                (4.0, 6.0, "Plain follow-up narration."),
+            ],
         )
 
     def fake_extract_frames(

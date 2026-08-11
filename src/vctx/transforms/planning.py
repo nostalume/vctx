@@ -114,7 +114,7 @@ def plan_asr(
             requirements=["media asset"],
         )
     if environment.installed_asr:
-        model_id = policy.model_ref() or environment.configured_asr_model_id or "base"
+        model_id = policy.model_ref() or environment.configured_asr_model_id or "small"
         return _plan(
             capability="asr",
             selected="local",

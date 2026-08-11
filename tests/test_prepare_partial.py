@@ -109,7 +109,7 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     assert _step_status(manifest, "transcript.extract") == "warning"
     assert _step_status(manifest, "transform.asr") == "warning"
     assert "No subtitles found" in "\n".join(source_entry["warnings"])
-    assert "Provide a transcript file" in "\n".join(source_entry["warnings"])
+    assert "vctx models pull asr" in "\n".join(source_entry["warnings"])
 
 
 def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(

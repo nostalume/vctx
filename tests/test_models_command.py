@@ -22,6 +22,7 @@ def test_models_status_is_network_free_and_machine_readable(tmp_path: Path) -> N
         ("asr", "missing"),
         ("ocr", "missing"),
     ]
+    assert records[0]["cache_path"] == "asr/small"
     assert all(not Path(item["cache_path"]).is_absolute() for item in records)
 
 
@@ -63,3 +64,33 @@ def test_models_pull_uses_adapter_boundary_and_verify_detects_corruption(
         ],
     )
     assert json.loads(corrupt.output)[0]["state"] == "corrupt"
+
+
+def test_asr_model_pull_preserves_previous_model_on_download_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import vctx.app.models as models_module
+
+    fail = False
+
+    def download_model(_model_id: str, *, output_dir: str) -> None:
+        target = Path(output_dir)
+        (target / "model.bin").write_bytes(b"replacement" if fail else b"original")
+        (target / "config.json").write_text("{}", encoding="utf-8")
+        if fail:
+            raise RuntimeError("interrupted download")
+
+    module = type("FakeWhisper", (), {"download_model": staticmethod(download_model)})
+    monkeypatch.setattr(models_module.importlib, "import_module", lambda _name: module)
+    args = ["models", "pull", "asr", "--cache-dir", str(tmp_path)]
+    first = runner.invoke(app, args)
+    assert first.exit_code == 0, first.output
+    target = tmp_path / "models" / "asr" / "small"
+    before = {path.name: path.read_bytes() for path in target.iterdir()}
+
+    fail = True
+    second = runner.invoke(app, args)
+
+    assert second.exit_code == 1
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == before
+    assert not any(path.name.endswith((".stage", ".backup")) for path in target.parent.iterdir())

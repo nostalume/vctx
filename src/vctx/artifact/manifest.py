@@ -37,6 +37,7 @@ class ManifestStep(ClosedModel):
     name: str
     status: StepStatus
     detail: str | None = None
+    receipt: dict[str, object] | None = None
 
 
 class ArtifactRef(ClosedModel):
@@ -215,8 +216,11 @@ class ManifestBuilder:
     def start(cls, source: SourceRecord, key: str, *, offline: bool) -> ManifestBuilder:
         return cls(source, key, offline=offline)
 
-    def add_step(self, name: str, status: StepStatus, detail: str | None = None) -> None:
-        self.steps.append(ManifestStep(name=name, status=status, detail=detail))
+    def add_step(
+        self, name: str, status: StepStatus, detail: str | None = None,
+        receipt: dict[str, object] | None = None
+    ) -> None:
+        self.steps.append(ManifestStep(name=name, status=status, detail=detail, receipt=receipt))
 
     def warn(self, message: str) -> None:
         self.warnings.append(message)

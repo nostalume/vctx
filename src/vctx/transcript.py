@@ -68,6 +68,7 @@ class TranscriptProvenance(BaseModel):
     )
     format: Literal["vtt", "srt", "json", "plain", "unknown"] = "unknown"
     provider: str | None = None
+    asr: dict[str, str | float | int | bool | None] | None = None
 
     @model_validator(mode="after")
     def mirror_legacy_language_into_tagged_evidence(self) -> TranscriptProvenance:

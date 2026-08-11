@@ -7,8 +7,9 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 
+from tests.support import asr_ready
 from vctx.cli import app
-from vctx.transcript import TranscriptPayload, TranscriptProvenance
+from vctx.source.session import MediaAsset
 
 runner = CliRunner()
 
@@ -16,7 +17,7 @@ runner = CliRunner()
 def test_prepare_local_media_runs_asr_and_writes_full_context_pack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.transforms.asr as asr_module
+    import vctx.asr as asr_module
 
     media = tmp_path / "lecture.wav"
     media.write_bytes(b"fake wav bytes")
@@ -35,18 +36,9 @@ cache = "persistent"
     )
     out_dir = tmp_path / "out"
 
-    def fake_transcribe(self: object, media_asset: object) -> TranscriptPayload:
-        del self, media_asset
-        return TranscriptPayload(
-            text="WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello from fake ASR.\n",
-            format="vtt",
-            provenance=TranscriptProvenance(
-                method="asr",
-                language="en",
-                format="vtt",
-                provider="faster-whisper",
-            ),
-        )
+    def fake_transcribe(self: object, media_asset: MediaAsset) -> object:
+        del self
+        return asr_ready(media_asset.id, "Hello from fake ASR.", model="tiny")
 
     monkeypatch.setattr(asr_module.FasterWhisperAsrAdapter, "transcribe", fake_transcribe)
 
@@ -70,7 +62,7 @@ cache = "persistent"
     assert _step_status(manifest, "transcript.extract") == "warning"
     assert _step_status(manifest, "source.media") == "ok"
     assert _step_status(manifest, "transform.asr") == "ok"
-    assert _step_detail(manifest, "transform.asr") == "faster-whisper:asr:en:vtt"
+    assert _step_detail(manifest, "transform.asr") == "faster-whisper:tiny"
 
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["provenance"]["method"] == "asr"

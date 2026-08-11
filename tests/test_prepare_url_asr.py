@@ -8,10 +8,10 @@ from typing import TypeAlias, cast
 import pytest
 from typer.testing import CliRunner
 
+from tests.support import asr_ready
 from vctx.cli import app
 from vctx.source.session import MediaAsset
 from vctx.source.ytdlp import YtDlpInfo, YtDlpParams
-from vctx.transcript import TranscriptPayload, TranscriptProvenance
 
 runner = CliRunner()
 
@@ -67,8 +67,8 @@ class FakeYoutubeDLMedia:
 def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, retain_media: bool
 ) -> None:
+    import vctx.asr as asr_module
     import vctx.source.ytdlp as ytdlp_module
-    import vctx.transforms.asr as asr_module
 
     FakeYoutubeDLMedia.calls = []
     FakeYoutubeDLMedia.downloaded_path = tmp_path / "downloaded" / "lecture.m4a"
@@ -88,16 +88,10 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
         def __init__(self, **kwargs: JsonValue) -> None:
             del kwargs
 
-        def transcribe(self, media_asset: MediaAsset) -> TranscriptPayload:
+        def transcribe(self, media_asset: MediaAsset) -> object:
             assert media_asset.local_path.read_bytes() == b"fake downloaded audio"
             assert media_asset.local_path.parent == tmp_path / "cache" / "source" / "blobs"
-            return TranscriptPayload(
-                text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nURL ASR text.\n",
-                format="vtt",
-                provenance=TranscriptProvenance(
-                    method="asr", language="en", format="vtt", provider="faster-whisper"
-                ),
-            )
+            return asr_ready(media_asset.id, "URL ASR text.", model="tiny")
 
     monkeypatch.setattr(asr_module, "FasterWhisperAsrAdapter", FakeAsrAdapter)
     config_path = tmp_path / "vctx.toml"

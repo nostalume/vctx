@@ -211,7 +211,9 @@ use = "instance:local-default"  # arbitrary name
 
 [instances.asr.local-default]
 type = "local-faster-whisper"
-model_policy = "auto"
+model = "small"
+device = "auto"
+compute = "auto"
 cache = "persistent"
 ```
 
@@ -234,8 +236,15 @@ Current ASR instance types:
 
 | Type | Behavior |
 | --- | --- |
-| `local-faster-whisper` | Runs local `faster_whisper`. `model_policy = "auto"` currently executes faster-whisper model id `base`. Managed model ids use `cache.model_dir`; `path:<local-path>` uses local files only. |
+| `local-faster-whisper` | Runs local multilingual faster-whisper `small` by default. Managed model ids use `cache.model_dir`; `path:<local-path>` uses local files only. Execution never downloads models. |
 | `openai-compatible-audio` | Sends multipart audio/media to `base_url` with `model` and credential from `api_key_env`; manifest records upload/cost evidence automatically. |
+
+Local ASR always transcribes in the detected language. It uses Silero VAD with
+threshold `0.5`, minimum silence `2000 ms`, and speech padding `400 ms`. An empty
+VAD pass is confirmed once without VAD; only two successful empty passes produce
+`no_speech`. Segment timestamps are admitted at millisecond precision; negative,
+non-finite, or unordered anchors are rejected. Runtime loads only prepared
+CTranslate2 directories and never pulls a model.
 
 ### Visual frames, OCR, and VLM descriptions
 
@@ -488,7 +497,9 @@ use = "instance:local-default"   # arbitrary example name selected below
 
 [instances.asr.local-default]
 type = "local-faster-whisper"
-model_policy = "auto"            # currently executes faster-whisper model id "base"
+model = "small"                  # built-in default
+device = "auto"                 # auto, cpu, or cuda
+compute = "auto"
 cache = "persistent"             # managed weights under cache.model_dir
 
 [instances.asr.local-model]
@@ -547,8 +558,9 @@ Field semantics:
 | `instances.vision.<name>` | Named OpenAI-compatible VLM endpoint selected by `transforms.visual_context.use = "instance:<name>"`. |
 | `transforms.knowledge_flow.use` | Current text-model supplement selector. Deterministic knowledge-flow extraction does not need a model. |
 | `instances.asr.<name>.type` | ASR implementation type: `local-faster-whisper` or `openai-compatible-audio`. The `<name>` is arbitrary. |
-| `instances.asr.<name>.model_policy` | Local faster-whisper managed model policy. Current `auto` executes model id `base`. |
-| `instances.asr.<name>.model` | Either a model id such as `tiny`/`base` for managed persistent cache, or `path:<local-path>` for local files only. Bare path-like strings are treated as model ids, not guessed as paths. |
+| `instances.asr.<name>.model` | Model id such as `small`, or `path:<local-path>` for an immutable local CTranslate2 model. Omission selects multilingual `small`. |
+| `instances.asr.<name>.device` | `auto`, `cpu`, or `cuda`; auto may fall back once to CPU during initialization. |
+| `instances.asr.<name>.compute` | Faster-whisper compute type; defaults to `auto`. |
 | `instances.asr.<name>.cache` | `persistent` stores managed faster-whisper weights under `cache.model_dir`; `disabled` requires `path:<local-path>`. |
 | `instances.asr.<name>.api_key_env` | Environment variable containing an ASR credential. The config stores only the variable name. |
 | `instances.vision.<name>.type` | Vision implementation type. Current implemented value: `openai-compatible-vision`, using chat-completions style image messages. |

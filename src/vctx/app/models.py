@@ -4,6 +4,9 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import os
+import shutil
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -54,14 +57,14 @@ def resolve_asr_model_id(
         raise ModelLifecycleError("models pull manages named local ASR models, not path/HF refs")
     instance_name = policy.instance_name()
     if instance_name is None:
-        return "base"
+        return "small"
     instance = resolved.instances.asr[instance_name]
     if instance.type != "local-faster-whisper":
         raise ModelLifecycleError("selected ASR instance is online and has no local model to pull")
-    model_id = instance.model or instance.model_policy
+    model_id = instance.model or "small"
     if Path(model_id).is_absolute():
         raise ModelLifecycleError("selected ASR model is an explicit local path and needs no pull")
-    return "base" if model_id == "auto" else model_id
+    return model_id
 
 
 def resolve_model_dir(*, config_path: Path | None, cache_dir: Path | None) -> Path:
@@ -76,7 +79,7 @@ def manage_models(
     capabilities: list[str] | None,
     *,
     cache_dir: Path,
-    asr_model_id: str = "base",
+    asr_model_id: str = "small",
 ) -> list[ModelReceipt]:
     cache_root = cache_dir
     if action == "pull":
@@ -100,7 +103,7 @@ def render_model_receipts(receipts: list[ModelReceipt], *, json_output: bool) ->
 
 
 def require_prepared_model(
-    capability: ModelCapability, cache_root: Path, *, asr_model_id: str = "base"
+    capability: ModelCapability, cache_root: Path, *, asr_model_id: str = "small"
 ) -> ModelReceipt:
     receipt = _inspect(capability, cache_root, verify=True, asr_model_id=asr_model_id)
     if receipt.state != "ready":
@@ -128,7 +131,7 @@ def _capabilities(values: list[str] | None) -> list[ModelCapability]:
     return selected
 
 
-def _identity(capability: ModelCapability, asr_model_id: str = "base") -> tuple[str, str, str]:
+def _identity(capability: ModelCapability, asr_model_id: str = "small") -> tuple[str, str, str]:
     if capability == "asr":
         return ("faster-whisper", asr_model_id, "faster-whisper")
     return ("rapidocr", "rapidocr", "rapidocr")
@@ -160,8 +163,7 @@ def _pull(capability: ModelCapability, cache_root: Path, *, asr_model_id: str) -
         integrity=digest,
     )
     path = _receipt_path(capability, cache_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(model_to_json(receipt), encoding="utf-8")
+    _write_atomic(path, model_to_json(receipt))
     return receipt
 
 
@@ -180,7 +182,11 @@ def _inspect(
         bytes=0,
         package_version=_package_version(package),
     )
-    if not path.is_file() or not model_dir.is_dir():
+    try:
+        prepared = path.is_file() and model_dir.is_dir()
+    except OSError:
+        prepared = False
+    if not prepared:
         return base.model_copy(update={"message": "model is not prepared"})
     try:
         recorded = ModelReceipt.model_validate_json(path.read_text(encoding="utf-8"))
@@ -203,23 +209,64 @@ def _inspect(
 
 def _pull_model(capability: str, model_id: str, cache_root: Path) -> Path:
     target = cache_root / capability / model_id
+    if capability == "asr":
+        return _pull_asr_model(model_id, target)
     target.mkdir(parents=True, exist_ok=True)
     try:
-        if capability == "asr":
-            module = importlib.import_module("faster_whisper")
-            module.download_model(model_id, output_dir=str(target))
-        else:
-            module = importlib.import_module("rapidocr")
-            template = Path(module.__file__).with_name("config.yaml")
-            config = template.read_text(encoding="utf-8").replace(
-                "model_root_dir: null", f'model_root_dir: "{target.as_posix()}"'
-            )
-            config_path = rapidocr_config_path(cache_root)
-            config_path.write_text(config, encoding="utf-8")
-            module.download_models(config_path)
+        module = importlib.import_module("rapidocr")
+        template = Path(module.__file__).with_name("config.yaml")
+        config = template.read_text(encoding="utf-8").replace(
+            "model_root_dir: null", f'model_root_dir: "{target.as_posix()}"'
+        )
+        config_path = rapidocr_config_path(cache_root)
+        config_path.write_text(config, encoding="utf-8")
+        module.download_models(config_path)
     except (ImportError, OSError, RuntimeError) as exc:
         raise ModelLifecycleError(f"failed to pull {capability} model: {exc}") from exc
     return target
+
+
+def _pull_asr_model(model_id: str, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    stage = target.parent / f".{target.name}.{token}.stage"
+    backup = target.parent / f".{target.name}.{token}.backup"
+    try:
+        stage.mkdir()
+        module = importlib.import_module("faster_whisper")
+        module.download_model(model_id, output_dir=str(stage))
+        _validate_ctranslate2(stage)
+        if target.exists():
+            os.replace(target, backup)
+        os.replace(stage, target)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        if backup.exists() and not target.exists():
+            os.replace(backup, target)
+        raise ModelLifecycleError(f"failed to pull asr model: {exc}") from exc
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        if target.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+    return target
+
+
+def _validate_ctranslate2(root: Path) -> None:
+    missing = [name for name in ("model.bin", "config.json") if not (root / name).is_file()]
+    if missing:
+        raise ValueError(f"download is not a CTranslate2 model: missing {', '.join(missing)}")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _tree_integrity(root: Path) -> tuple[str, int]:

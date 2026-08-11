@@ -188,7 +188,9 @@ use = "instance:local-default"
 
 [instances.asr.local-default]
 type = "local-faster-whisper"
-model_policy = "auto"
+model = "small"
+device = "auto"
+compute = "auto"
 
 [transforms.visual_context]
 use = "auto"  # or "instance:my-vlm" / "openrouter:<model-id>"

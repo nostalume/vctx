@@ -337,7 +337,8 @@ class AsrInstanceConfig(BaseModel):
 
     type: AsrInstanceType
     model: str | None = None
-    model_policy: Literal["auto", "tiny", "base", "small", "medium", "large"] = "auto"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    compute: str = "auto"
     cache: InstanceCachePolicy = "persistent"
     base_url: str | None = None
     api_key_env: str | None = None
