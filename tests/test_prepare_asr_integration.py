@@ -64,7 +64,7 @@ cache = "persistent"
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert {path.name for path in lane.iterdir()} >= {
-        "metadata.json", "transcript.raw.json", "transcript.clean.json", "chunks.json", "context.md"
+        "metadata.json", "transcript.json", "chunks.json", "context.md"
     }
     assert manifest["status"] == "ok"
     assert _step_status(manifest, "transcript.extract") == "warning"
@@ -72,10 +72,10 @@ cache = "persistent"
     assert _step_status(manifest, "transform.asr") == "ok"
     assert _step_detail(manifest, "transform.asr") == "faster-whisper:asr:en:vtt"
 
-    raw = json.loads((lane / "transcript.raw.json").read_text(encoding="utf-8"))
-    assert raw["provenance"]["method"] == "asr"
-    assert raw["provenance"]["provider"] == "faster-whisper"
-    assert raw["segments"][0]["text"] == "Hello from fake ASR."
+    transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
+    assert transcript["provenance"]["method"] == "asr"
+    assert transcript["provenance"]["provider"] == "faster-whisper"
+    assert transcript["segments"][0]["text"] == "Hello from fake ASR."
 
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "Hello from fake ASR." in context

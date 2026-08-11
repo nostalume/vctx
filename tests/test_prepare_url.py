@@ -98,12 +98,12 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert {path.name for path in lane.iterdir()} >= {
-        "metadata.json", "transcript.raw.json", "transcript.clean.json", "chunks.json",
-        "context.md", "readable.md", "transcript.md", "knowledge_flow.json",
+        "metadata.json", "transcript.json", "chunks.json",
+        "context.md", "read.md", "knowledge_flow.json",
     }
     assert "manifest-secret" not in json.dumps(manifest)
     assert manifest["status"] == "ok"
-    assert manifest["schema_version"] == "0.3"
+    assert manifest["schema_version"] == "2"
     subtitle_asset = source_entry["assets"][0]
     assert subtitle_asset["kind"] == "subtitle"
     assert subtitle_asset["path"] == "subtitle.en.vtt"
@@ -124,7 +124,7 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     assert metadata["title"] == "URL Lecture"
     assert metadata["source_type"] == "url"
 
-    clean = json.loads((lane / "transcript.clean.json").read_text(encoding="utf-8"))
+    clean = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert clean["segments"][0]["text"] == (
         "The workflow takes a video URL and produces a knowledge-flow pack."
     )
@@ -134,7 +134,7 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     assert "The workflow takes a video URL" in context
     assert "## Knowledge-flow summary" in context
 
-    readable = (lane / "readable.md").read_text(encoding="utf-8")
+    readable = (lane / "read.md").read_text(encoding="utf-8")
     assert "## Knowledge-flow summary" in readable
 
     knowledge_flow = json.loads(
@@ -202,7 +202,7 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
     manifest = json.loads((offline_out / "manifest.json").read_text(encoding="utf-8"))
     source_entry = manifest["sources"][0]
     lane = offline_out / source_entry["path"]
-    clean = json.loads((lane / "transcript.clean.json").read_text(encoding="utf-8"))
+    clean = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert clean["segments"][0]["text"] == "Cached transcript survives offline."
     assert source_entry["freshness"] == "unverified-offline"
     assert [(item["operation"], item["status"]) for item in source_entry["effects"]] == [
@@ -248,7 +248,7 @@ def test_online_prepare_degrades_when_source_cache_cannot_be_written(
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
-    assert (tmp_path / "out" / manifest["sources"][0]["path"] / "transcript.clean.json").is_file()
+    assert (tmp_path / "out" / manifest["sources"][0]["path"] / "transcript.json").is_file()
 
 
 def _step_status(manifest: dict[str, Any], name: str) -> str:

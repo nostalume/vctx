@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from vctx.chunking import ChunkSet, TranscriptChunk
 from vctx.models.visual import VisualEvidenceScore, VisualRecord, VisualRecordSet
 from vctx.render.markdown import render_context_markdown
 from vctx.source.session import SourceRef, VideoMetadata
-from vctx.transcript import Transcript, TranscriptProvenance, TranscriptSegment
+from vctx.transcript import (
+    ChunkSet,
+    Transcript,
+    TranscriptChunk,
+    TranscriptProvenance,
+    TranscriptSegment,
+)
 
 
 def test_render_context_omits_low_novelty_visual_records() -> None:

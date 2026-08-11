@@ -116,7 +116,7 @@ Start with:
 
 ```text
 DIR/manifest.json
-DIR/<source-key>/readable.md
+DIR/<source-key>/read.md
 DIR/<source-key>/context.md
 ```
 
@@ -145,10 +145,10 @@ Core artifacts:
 
 ```text
 metadata.json
-transcript.raw.json
-transcript.clean.json
+transcript.json
 chunks.json
-transcript.md
+context.md
+read.md
 ```
 
 Optional visual artifacts:

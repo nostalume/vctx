@@ -178,7 +178,7 @@ class ManifestSource(ClosedModel):
 
 
 class Manifest(ClosedModel):
-    schema_version: Literal["0.3"] = "0.3"
+    schema_version: Literal["2"] = "2"
     tool: Literal["vctx"] = "vctx"
     tool_version: str
     pack_id: UUID

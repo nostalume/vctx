@@ -54,7 +54,11 @@ def _subtitle_asset(
             language=language,
             omission_reason="disabled by --no-retain-media/output.retain_media",
         )
-    body = payload.text.encode("utf-8")
+    body = (
+        payload.original_bytes
+        if payload.original_bytes is not None
+        else payload.text.encode("utf-8")
+    )
     final = _publish_bytes(body, out_dir, relative)
     published.append(final)
     return SubtitleSourceAsset(

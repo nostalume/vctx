@@ -23,7 +23,7 @@ def test_prepare_retains_local_media_as_manifest_artifact(tmp_path: Path) -> Non
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "0.3"
+    assert manifest["schema_version"] == "2"
     UUID(manifest["pack_id"])
     UUID(manifest["updated_run_id"])
     source_entry = manifest["sources"][0]

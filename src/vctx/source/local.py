@@ -59,8 +59,10 @@ class LocalFileSession:
                 EffectReceipt(operation="subtitle", status="failed", purpose="transcript")
             )
             raise NoTranscriptError("no transcript found for media input")
+        original = self.path.read_bytes()
         payload = TranscriptPayload(
-            text=self.path.read_text(encoding="utf-8"),
+            text=original.decode("utf-8"),
+            original_bytes=original,
             format=fmt,
             provenance=TranscriptProvenance(
                 method="local_file",

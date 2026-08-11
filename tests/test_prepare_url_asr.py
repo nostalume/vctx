@@ -162,7 +162,7 @@ model = "tiny"
     ]
     clean = cast(
         JsonObject,
-        json.loads((lane / "transcript.clean.json").read_text(encoding="utf-8")),
+        json.loads((lane / "transcript.json").read_text(encoding="utf-8")),
     )
     segments = cast(list[JsonObject], clean["segments"])
     assert segments[0]["text"] == "URL ASR text."

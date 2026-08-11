@@ -6,9 +6,7 @@ from pydantic import BaseModel
 
 ArtifactKind = Literal[
     "metadata",
-    "transcript_raw",
-    "transcript_clean",
-    "transcript_md",
+    "transcript",
     "chunks",
     "context",
     "readable",

@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from html import escape
 
-from vctx.chunking import ChunkSet
 from vctx.models.knowledge_flow import KnowledgeFlow, KnowledgeFlowEdge
 from vctx.models.visual import VisualRecord, VisualRecordSet
 from vctx.source.session import VideoMetadata
-from vctx.transcript import Transcript
+from vctx.transcript import ChunkSet, Transcript
 from vctx.util import format_timestamp
 
 

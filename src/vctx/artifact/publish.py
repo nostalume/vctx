@@ -152,7 +152,7 @@ def verify_pack(root: Path) -> Manifest:
         return manifest
     except (OSError, ValueError, ValidationError) as exc:
         raise OutputExistsError(
-            f"output is not a verified vctx 0.3 pack: {root} ({exc})"
+            f"output is not a verified vctx schema-2 pack: {root} ({exc})"
         ) from exc
 
 

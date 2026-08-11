@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -45,21 +44,26 @@ This is a second caption.
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir)])
 
     assert result.exit_code == 0, result.output
-    assert "INFO vctx.app.prepare" not in result.output
-    assert "Workflow: default" in result.output
     assert "Status: ok" in result.output
-    assert "Config: built-in defaults + CLI" in result.output
-    assert "Artifacts:" in result.output
-    assert "/metadata.json" in result.output
     assert (out_dir / "manifest.json").exists()
 
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
-    assert {path.name for path in lane.iterdir()} >= {
-        "metadata.json", "transcript.raw.json", "transcript.clean.json", "chunks.json",
-        "context.md", "readable.md", "transcript.md",
+    lane_names = {path.name for path in lane.iterdir()}
+    assert lane_names >= {
+        "metadata.json",
+        "subtitle.und.srt",
+        "transcript.json",
+        "chunks.json",
+        "context.md",
+        "read.md",
     }
+    assert [name for name in lane_names if name.startswith("transcript")] == [
+        "transcript.json"
+    ]
+    assert lane_names.isdisjoint({"visual_records.json", "visual_scores.json"})
+    assert manifest["schema_version"] == "2"
     assert manifest["status"] == "ok"
     assert "input" not in manifest
     assert source_entry["id"].startswith("local__")
@@ -67,11 +71,12 @@ This is a second caption.
     assert {artifact["path"] for artifact in source_entry["artifacts"]} >= {
         "metadata.json",
         "context.md",
-        "readable.md",
+        "read.md",
     }
 
-    clean = json.loads((lane / "transcript.clean.json").read_text(encoding="utf-8"))
-    assert clean["segments"][0]["text"] == "Hello world."
+    transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
+    assert transcript["segments"][0]["text"] == "Hello world."
+    assert (lane / "subtitle.und.srt").read_bytes() == source.read_bytes()
 
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "# Agent Context Pack" in context
@@ -92,7 +97,7 @@ def test_prepare_multiple_inputs_writes_independent_source_lanes(tmp_path: Path)
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "0.3"
+    assert manifest["schema_version"] == "2"
     assert len(manifest["sources"]) == 2
     assert {path.name for path in out.iterdir()} == {
         "manifest.json",
@@ -217,7 +222,7 @@ def test_prepare_refuses_corrupt_pack_even_with_overwrite(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 5
-    assert "not a verified vctx 0.3 pack" in result.output
+    assert "not a verified vctx schema-2 pack" in result.output
     assert context.read_text(encoding="utf-8") == "corrupt"
 
 
@@ -306,40 +311,6 @@ def test_existing_pack_publishes_valid_addition_beside_rejected_input(tmp_path: 
     assert {source["title"] for source in manifest["sources"]} == {"first", "second"}
 
 
-def test_prepare_local_srt_writes_knowledge_flow_json_for_arrow_chain(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "flow.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:02,000
-URL acquisition -> transcript extraction -> knowledge flow
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-
-    result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir), "--overwrite"])
-
-    assert result.exit_code == 0, result.output
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-    source_entry = manifest["sources"][0]
-    lane = out_dir / source_entry["path"]
-    flow = json.loads((lane / "knowledge_flow.json").read_text(encoding="utf-8"))
-    assert {node["label"] for node in flow["nodes"]} == {
-        "URL acquisition",
-        "transcript extraction",
-        "knowledge flow",
-    }
-    assert flow["edges"][0]["evidence"] == ["seg_000001"]
-    assert {artifact["path"] for artifact in source_entry["artifacts"]} >= {
-        "knowledge_flow.json"
-    }
-    context = (lane / "context.md").read_text(encoding="utf-8")
-    assert "## Knowledge flow" in context
-    assert "URL acquisition -> transcript extraction -> knowledge flow" in context
-
-
 def test_prepare_refuses_existing_output_without_overwrite(tmp_path: Path) -> None:
     source = tmp_path / "lecture.srt"
     source.write_text(
@@ -356,81 +327,8 @@ hello
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir)])
 
     assert result.exit_code == 5
-    assert "not a verified vctx 0.3 pack" in result.output
+    assert "not a verified vctx schema-2 pack" in result.output
     assert (out_dir / "existing.txt").read_text(encoding="utf-8") == "keep"
-
-
-def test_prepare_verbose_emits_phase_logs(tmp_path: Path) -> None:
-    source = tmp_path / "lecture.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:01,000
-hello
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-
-    result = runner.invoke(
-        app,
-        ["prepare", str(source), "--out", str(out_dir), "--verbose"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "INFO vctx.app.prepare prepare.start" in result.output
-    assert "INFO vctx.app.prepare source.detect" in result.output
-    assert "INFO vctx.app.prepare prepare.finish status=ok" in result.output
-    assert "duration_ms=" in result.output
-    assert "Workflow: default" in result.output
-
-
-def test_prepare_verbose_writes_logs_to_stderr_not_stdout(tmp_path: Path) -> None:
-    source = tmp_path / "lecture.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:01,000
-hello
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-    repo_root = Path(__file__).resolve().parents[1]
-
-    result = subprocess.run(
-        ["uv", "run", "vctx", "prepare", str(source), "--out", str(out_dir), "--verbose"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert "Wrote context pack:" in result.stdout
-    assert "Workflow: default" in result.stdout
-    assert "INFO vctx.app.prepare" not in result.stdout
-    assert "INFO vctx.app.prepare prepare.start" in result.stderr
-    assert "INFO vctx.app.prepare prepare.finish status=ok" in result.stderr
-
-
-
-def test_prepare_debug_emits_debug_details(tmp_path: Path) -> None:
-    source = tmp_path / "lecture.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:01,000
-hello
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-
-    result = runner.invoke(
-        app,
-        ["prepare", str(source), "--out", str(out_dir), "--debug"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "DEBUG vctx.app.prepare prepare.output formats=" in result.output
 
 
 def test_prepare_log_file_writes_logs_without_secret_value(

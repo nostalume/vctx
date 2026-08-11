@@ -89,12 +89,12 @@ def _video_media(run: Run) -> bool:
 
 
 def _visual_cases(run: Run, prepared: Prepared) -> list[EssentialVisualCase]:
-    cases = deterministic_essential_cases(prepared.clean)
+    cases = deterministic_essential_cases(prepared.transcript)
     logger.info("visual.cases deterministic=%s", len(cases))
     route = run.text_product_ai_route("essential_case_extraction")
     if route is None:
         return cases
-    uncertain = uncertain_visual_segments(prepared.clean, cases)
+    uncertain = uncertain_visual_segments(prepared.transcript, cases)
     if not uncertain.segments:
         run.manifest.add_step(
             "visual_cases.llm_extract", "skipped", "no uncertain visual transcript segments"
@@ -109,7 +109,7 @@ def _visual_cases(run: Run, prepared: Prepared) -> list[EssentialVisualCase]:
         return cases
     run.manifest.add_transform_evidence(route.transform_evidence("essential_cases"))
     run.manifest.add_step("visual_cases.llm_extract", "ok", route.detail())
-    merged = merge_essential_case_supplement(cases, supplement, prepared.clean)
+    merged = merge_essential_case_supplement(cases, supplement, prepared.transcript)
     logger.info("visual.cases.llm status=ok cases=%s route=%s", len(merged), route.provider_id)
     return merged
 
@@ -147,7 +147,7 @@ def _visual_plan(
 def _source_access(run: Run, prepared: Prepared) -> SourceAccess:
     media_type = run.media.media_type if run.media is not None else None
     return SourceAccess.from_flags(
-        transcript=bool(prepared.clean.segments),
+        transcript=bool(prepared.transcript.segments),
         audio=media_type in {"audio", "video"},
         video=media_type == "video" or run.metadata.source.kind == "url",
     )
@@ -169,7 +169,7 @@ def _visual_capture(run: Run, prepared: Prepared, assessment: VisualAssessment) 
         run.manifest.add_step("transform.visual_capture", "warning", str(exc))
         logger.warning("visual.capture status=warning reason=%s", exc)
         return Visuals(records=None, frames=[])
-    scored = score_visual_records(records.records, prepared.clean, motives=assessment.motives)
+    scored = score_visual_records(records.records, prepared.transcript, motives=assessment.motives)
     visual_records = VisualRecordSet(records=scored.records)
     visual_scores = VisualScoreReport(satisfaction=scored.satisfaction)
     _add_visual_satisfaction_step(run, visual_scores)
@@ -186,17 +186,17 @@ def _visual_capture(run: Run, prepared: Prepared, assessment: VisualAssessment) 
 
 def _flow(run: Run, prepared: Prepared, visuals: Visuals) -> KnowledgeFlow:
     with phase(logger, "knowledge_flow.extract"):
-        flow = extract_knowledge_flow(prepared.clean, visuals.records)
+        flow = extract_knowledge_flow(prepared.transcript, visuals.records)
     route = run.text_product_ai_route("knowledge_flow_extraction")
     if route is not None:
         try:
-            supplement = run.text_ai_adapter(route).knowledge_flow_supplement(prepared.clean)
+            supplement = run.text_ai_adapter(route).knowledge_flow_supplement(prepared.transcript)
         except (CredentialError, TextAiExecutionError) as exc:
             run.manifest.add_step("knowledge_flow.llm_extract", "warning", str(exc))
             run.manifest.warn(str(exc))
             logger.warning("knowledge_flow.llm status=warning reason=%s", exc)
         else:
-            flow = merge_knowledge_flow_supplement(flow, supplement, prepared.clean)
+            flow = merge_knowledge_flow_supplement(flow, supplement, prepared.transcript)
             run.manifest.add_transform_evidence(route.transform_evidence("knowledge_flow"))
             run.manifest.add_step("knowledge_flow.llm_extract", "ok", route.detail())
     if flow.nodes:

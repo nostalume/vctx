@@ -64,7 +64,7 @@ def _write_chunks(path: Path) -> None:
 
 def test_render_command_writes_context_markdown(tmp_path: Path) -> None:
     metadata = tmp_path / "metadata.json"
-    transcript = tmp_path / "transcript.clean.json"
+    transcript = tmp_path / "transcript.json"
     chunks = tmp_path / "chunks.json"
     out = tmp_path / "context.md"
     _write_metadata(metadata)
@@ -97,7 +97,7 @@ def test_render_command_writes_context_markdown(tmp_path: Path) -> None:
 
 def test_render_command_writes_transcript_markdown_without_chunks(tmp_path: Path) -> None:
     metadata = tmp_path / "metadata.json"
-    transcript = tmp_path / "transcript.clean.json"
+    transcript = tmp_path / "transcript.json"
     out = tmp_path / "transcript.md"
     _write_metadata(metadata)
     _write_transcript(transcript)

@@ -59,7 +59,7 @@ hello
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert (lane / "metadata.json").exists()
-    assert not (lane / "transcript.clean.json").exists()
+    assert not (lane / "transcript.json").exists()
     assert not (lane / "chunks.json").exists()
     assert not (lane / "context.md").exists()
     assert manifest["status"] == "partial"
@@ -101,7 +101,7 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
     assert (lane / "metadata.json").exists()
-    assert not (lane / "transcript.clean.json").exists()
+    assert not (lane / "transcript.json").exists()
     assert not (lane / "chunks.json").exists()
     metadata = json.loads((lane / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["id"] == "example__abc"
@@ -158,7 +158,7 @@ def test_prepare_offline_accepts_local_input(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert (out_dir / "manifest.json").exists()
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert (out_dir / manifest["sources"][0]["path"] / "transcript.clean.json").exists()
+    assert (out_dir / manifest["sources"][0]["path"] / "transcript.json").exists()
 
 
 @pytest.mark.parametrize("cache_inside_output", [False, True])

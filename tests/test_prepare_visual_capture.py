@@ -124,7 +124,7 @@ cache = "persistent"
         'path="frame-0001.png">'
     ) in context
 
-    readable = (lane / "readable.md").read_text(encoding="utf-8")
+    readable = (lane / "read.md").read_text(encoding="utf-8")
     assert "## Visual references" in readable
     assert "### 00:00:01 — frame-0001" in readable
     assert "![Frame frame-0001 at 00:00:01](frame-0001.png)" in readable

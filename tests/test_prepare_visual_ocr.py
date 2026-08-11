@@ -131,7 +131,7 @@ cache = "persistent"
     assert "<ocr" in context
     assert "CAP theorem slide</ocr>" in context
 
-    readable = (lane / "readable.md").read_text(encoding="utf-8")
+    readable = (lane / "read.md").read_text(encoding="utf-8")
     assert "![Frame frame-0001 at 00:00:01](frame-0001.png)" in readable
     assert "- OCR: CAP theorem slide" in readable
 

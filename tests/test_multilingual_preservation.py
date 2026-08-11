@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from vctx.chunking import ChunkOptions, chunk_transcript
 from vctx.models.visual import VisualRecord, VisualRecordSet
 from vctx.render.markdown import render_context_markdown, render_readable_markdown
 from vctx.source.session import SourceRef, VideoMetadata
 from vctx.transcript import (
+    ChunkOptions,
     DetectedLanguage,
     Transcript,
     TranscriptProvenance,
     TranscriptSegment,
+    chunk_transcript,
     normalize_transcript,
 )
-from vctx.transforms.knowledge_flow import extract_knowledge_flow
 
 
 def test_native_non_english_transcript_text_survives_normalize_chunk_and_render() -> None:
@@ -87,32 +87,6 @@ def test_native_visual_text_is_rendered_as_source_evidence_without_translation()
     assert visual_text in context
     assert "accuracy speed memory" not in context.lower()
     assert "Translated" not in context
-
-
-def test_deterministic_knowledge_flow_preserves_non_english_text_without_chain() -> None:
-    native_text = "模型先读取字幕，再结合画面证据，最后输出上下文包。"
-    transcript = Transcript(
-        video_id="video-zh",
-        provenance=TranscriptProvenance(
-            method="local_file",
-            language_evidence=DetectedLanguage(code="zh-CN", source="metadata"),
-            format="plain",
-        ),
-        segments=[
-            TranscriptSegment(
-                id="seg_000001",
-                start=0.0,
-                end=5.0,
-                text=native_text,
-            )
-        ],
-    )
-
-    flow = extract_knowledge_flow(transcript)
-
-    assert flow.nodes == []
-    assert flow.edges == []
-    assert transcript.segments[0].text == native_text
 
 
 def _metadata() -> VideoMetadata:

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 
-from vctx.chunking import ChunkSet, TranscriptChunk
 from vctx.models.visual import VisualEvidenceScore, VisualRecord, VisualRecordSet
 from vctx.render.bundle import render_artifact_bundle
 from vctx.source.session import SourceRef, VideoMetadata
-from vctx.transcript import Transcript, TranscriptProvenance, TranscriptSegment
+from vctx.transcript import (
+    ChunkSet,
+    Transcript,
+    TranscriptChunk,
+    TranscriptProvenance,
+    TranscriptSegment,
+)
 from vctx.transforms.knowledge_flow import extract_knowledge_flow
 
 
@@ -33,8 +38,7 @@ def test_render_bundle_writes_knowledge_flow_json_with_visual_evidence() -> None
 
     bundle = render_artifact_bundle(
         metadata=_metadata(),
-        raw_transcript=transcript,
-        clean_transcript=transcript,
+        transcript=transcript,
         chunks=_chunks(),
         formats={"json"},
         visual_records=visual_records,
@@ -80,8 +84,7 @@ def test_render_bundle_keeps_native_text_when_output_language_is_requested() -> 
 
     bundle = render_artifact_bundle(
         metadata=_metadata(),
-        raw_transcript=transcript,
-        clean_transcript=transcript,
+        transcript=transcript,
         chunks=chunks,
         formats={"readable"},
         output_language="en",

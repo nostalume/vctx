@@ -11,7 +11,7 @@ runner = CliRunner()
 
 
 def test_chunk_command_writes_chunkset_from_transcript_json(tmp_path: Path) -> None:
-    transcript = tmp_path / "transcript.clean.json"
+    transcript = tmp_path / "transcript.json"
     transcript.write_text(
         json.dumps(
             {

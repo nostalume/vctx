@@ -4,10 +4,9 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from vctx.chunking import ChunkOptions, chunk_transcript
 from vctx.errors import InvalidTranscriptError, VctxError
 from vctx.io import model_to_json
-from vctx.transcript import Transcript
+from vctx.transcript import ChunkOptions, Transcript, chunk_transcript
 
 
 class ChunkWriteError(VctxError):

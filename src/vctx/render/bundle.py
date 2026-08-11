@@ -5,20 +5,15 @@ from typing import Literal
 from pydantic import BaseModel
 
 from vctx.artifact.content import Artifact, ArtifactBundle, ArtifactKind
-from vctx.chunking import ChunkSet
 from vctx.io import model_to_json
 from vctx.models.knowledge_flow import KnowledgeFlow
 from vctx.models.visual import VisualRecordSet, VisualScoreReport
-from vctx.render.markdown import (
-    render_context_markdown,
-    render_readable_markdown,
-    render_transcript_markdown,
-)
+from vctx.render.markdown import render_context_markdown, render_readable_markdown
 from vctx.source.session import VideoMetadata
-from vctx.transcript import Transcript
+from vctx.transcript import ChunkSet, Transcript
 
-OutputFormat = Literal["json", "context", "readable", "transcript"]
-DEFAULT_FORMATS: set[OutputFormat] = {"json", "context", "readable", "transcript"}
+OutputFormat = Literal["json", "context", "readable"]
+DEFAULT_FORMATS: set[OutputFormat] = {"json", "context", "readable"}
 
 
 def json_artifact(name: str, kind: ArtifactKind, model: BaseModel) -> Artifact:
@@ -42,8 +37,7 @@ def markdown_artifact(name: str, kind: ArtifactKind, content: str) -> Artifact:
 def render_artifact_bundle(
     *,
     metadata: VideoMetadata,
-    raw_transcript: Transcript,
-    clean_transcript: Transcript,
+    transcript: Transcript,
     chunks: ChunkSet,
     formats: set[OutputFormat],
     visual_records: VisualRecordSet | None = None,
@@ -57,8 +51,7 @@ def render_artifact_bundle(
         artifacts.extend(
             [
                 json_artifact("metadata.json", "metadata", metadata),
-                json_artifact("transcript.raw.json", "transcript_raw", raw_transcript),
-                json_artifact("transcript.clean.json", "transcript_clean", clean_transcript),
+                json_artifact("transcript.json", "transcript", transcript),
                 json_artifact("chunks.json", "chunks", chunks),
             ]
         )
@@ -75,7 +68,7 @@ def render_artifact_bundle(
                 "context",
                 render_context_markdown(
                     metadata,
-                    clean_transcript,
+                    transcript,
                     chunks,
                     visual_records,
                     knowledge_flow,
@@ -85,23 +78,15 @@ def render_artifact_bundle(
     if "readable" in formats:
         artifacts.append(
             markdown_artifact(
-                "readable.md",
+                "read.md",
                 "readable",
                 render_readable_markdown(
                     metadata,
-                    clean_transcript,
+                    transcript,
                     chunks,
                     visual_records,
                     knowledge_flow,
                 ),
-            )
-        )
-    if "transcript" in formats:
-        artifacts.append(
-            markdown_artifact(
-                "transcript.md",
-                "transcript_md",
-                render_transcript_markdown(metadata, clean_transcript),
             )
         )
     return ArtifactBundle(artifacts=artifacts)

@@ -306,7 +306,7 @@ Options:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--out DIR` | required | Output directory for durable artifacts. |
-| `--overwrite` | unset | Force requested lanes to rebuild when upserting a verified schema-0.3 pack. |
+| `--overwrite` | unset | Force requested lanes to rebuild when upserting a verified schema-2 pack. |
 | `--chunk-max-chars INT` | `6000` | Maximum approximate characters per chunk before flushing. |
 | `--chunk-max-seconds INT` | unset | Optional maximum chunk duration. |
 | `--cache-dir DIR` | platform cache dir | Override the base containing `source/` and `models/`. |
@@ -328,7 +328,7 @@ network runtime, or creating an output pack. Source records live in
 are not persisted.
 
 An absent or empty output creates a pack. An existing output is accepted only
-when its schema-0.3 manifest, owned lane set, retained assets, artifact sizes,
+when its schema-2 manifest, owned lane set, retained assets, artifact sizes,
 and hashes verify. Prepare then upserts by stable source identity: a new source
 adds a lane, a matching revision reuses it, and a changed revision replaces only
 that lane. Unrequested lanes stay byte-identical. Publication uses sibling
@@ -342,12 +342,11 @@ DIR/
   manifest.json
   youtube-abc123/
     metadata.json
-    transcript.raw.json
-    transcript.clean.json
-    transcript.md
+    subtitle.en.vtt
+    transcript.json
     chunks.json
     context.md
-    readable.md
+    read.md
 ```
 
 Visual/full or supplement branches may additionally write:
@@ -365,19 +364,18 @@ Artifact orthogonality:
 ```text
 manifest.json          pack audit and source-lane index; inspect first
 metadata.json          source metadata
-transcript.raw.json    source/ASR transcript before normalization
-transcript.clean.json  normalized transcript used by transforms
+subtitle.<lang>.<ext>  original native subtitle bytes when retained
+transcript.json        canonical normalized transcript used by transforms
 chunks.json            context-window chunks
 knowledge_flow.json    canonical evidence-linked flow graph
 visual_records.json    canonical OCR/VLM/capture evidence records
 visual_scores.json     visual satisfaction diagnostics
 frame-*.png            frame artifacts referenced by visual records
 context.md             AI-agent context injection projection
-readable.md            human inspection projection
-transcript.md          human timestamped transcript projection
+read.md                human inspection projection
 ```
 
-`context.md` and `readable.md` intentionally overlap in source material but serve different consumers. JSON artifacts are canonical machine records; Markdown files are projections.
+`context.md` and `read.md` intentionally overlap in source material but serve different consumers. JSON artifacts are canonical machine records; Markdown files are projections.
 
 Current artifact contract:
 
@@ -385,12 +383,11 @@ Current artifact contract:
 | --- | --- | --- |
 | `manifest.json` | every successful or partial prepare | Route, warning, evidence, and artifact index. Start here for automation. |
 | `metadata.json` | every successful or partial prepare | Normalized input/source metadata. |
-| `transcript.raw.json` | transcript-bearing workflows | Source transcript/ASR payload before normalization. |
-| `transcript.clean.json` | transcript-bearing workflows | Normalized transcript segments. |
+| `subtitle.<language>.<ext>` | native subtitle retained | Original acquired subtitle bytes for inspection and reparsing. |
+| `transcript.json` | transcript-bearing workflows | Canonical parsed and deterministically normalized transcript segments. |
 | `chunks.json` | transcript-bearing workflows | Chunked transcript for downstream context windows. |
-| `transcript.md` | `transcript` format enabled | Human-readable transcript projection. |
 | `context.md` | `context` format enabled | Agent-oriented context injection artifact; includes visual records and knowledge-flow summary when available. |
-| `readable.md` | `readable` format enabled | Human-readable inspection artifact; includes knowledge-flow summary when available. |
+| `read.md` | `readable` format enabled | Human-readable inspection artifact; includes knowledge-flow summary when available. |
 | `visual_records.json` | visual/full workflow with captured visual evidence | Canonical OCR/VLM/capture evidence records only; no satisfaction diagnostics. |
 | `visual_scores.json` | visual/full workflow with checked visual motives | Satisfaction diagnostics for required visual operations; missed checks are also manifest warnings. |
 | frame image files | visual/full workflow with capture records | PNG frame artifacts referenced from visual records and manifest. |
@@ -417,7 +414,7 @@ Wrote context pack: DIR
 Manifest: DIR/manifest.json
 Artifacts:
   - SOURCE-KEY/context.md
-  - SOURCE-KEY/readable.md
+  - SOURCE-KEY/read.md
 ```
 
 Warnings stderr example:
@@ -630,7 +627,7 @@ Output:
 Chunk an existing transcript artifact.
 
 ```bash
-vctx chunk transcript.clean.json --out chunks.json [--chunk-max-chars 6000]
+vctx chunk transcript.json --out chunks.json [--chunk-max-chars 6000]
 ```
 
 Purpose:
@@ -641,7 +638,7 @@ Purpose:
 
 Input:
 
-- `transcript.clean.json` or compatible `Transcript` JSON
+- `transcript.json` or compatible `Transcript` JSON
 
 Output:
 
@@ -653,7 +650,7 @@ Render Markdown from existing artifacts.
 
 ```bash
 vctx render --metadata metadata.json --chunks chunks.json --out context.md --format context
-vctx render --metadata metadata.json --transcript transcript.clean.json --out readable.md --format readable
+vctx render --metadata metadata.json --transcript transcript.json --out read.md --format readable
 ```
 
 Purpose:
@@ -717,7 +714,7 @@ Shape:
 
 ```json
 {
-  "schema_version": "0.3",
+  "schema_version": "2",
   "tool": "vctx",
   "tool_version": "0.1.0",
   "pack_id": "3db85608-8840-4dc7-afc2-9af6e4300f76",
@@ -788,9 +785,9 @@ Shape:
 }
 ```
 
-### `transcript.raw.json`
+### `transcript.json`
 
-Transcript as parsed from source with minimal cleanup.
+Canonical transcript after deterministic parsing and normalization.
 
 Shape:
 
@@ -815,9 +812,7 @@ Shape:
 }
 ```
 
-### `transcript.clean.json`
-
-Same shape as `transcript.raw.json`, but after deterministic normalization:
+Normalization guarantees:
 
 - empty segments removed
 - whitespace normalized
@@ -886,7 +881,7 @@ Welcome to this video...
 </chunk>
 ```
 
-### `readable.md`
+### `read.md`
 
 Human-readable transcript pack.
 
@@ -933,7 +928,7 @@ Recommended agent flow:
 3. For each usable `sources[]` entry, enter its `path` and select artifacts:
    - use `<path>/context.md` for context injection
    - use `<path>/chunks.json` for programmatic chunk-by-chunk processing
-   - use `<path>/readable.md` for human-facing source review
+   - use `<path>/read.md` for human-facing source review
 4. The agent performs summarization, knowledge-flow extraction, Q&A, or memory updates outside `vctx`.
 
 Example agent prompt wrapper:
@@ -955,6 +950,6 @@ For early versions, treat these as semi-stable:
 - CLI command names
 - output file names
 - `manifest.json` discovery fields
-- `metadata.json`, `transcript.clean.json`, and `chunks.json` top-level fields
+- `metadata.json`, `transcript.json`, and `chunks.json` top-level fields
 
 Internal Python module paths are not stable until implementation matures.

@@ -21,7 +21,6 @@ from vctx.artifact.manifest import (
     ManifestSource,
     source_key,
 )
-from vctx.chunking import ChunkOptions, ChunkSet, chunk_transcript
 from vctx.config import (
     AsrInstanceConfig,
     PrepareRequest,
@@ -48,8 +47,15 @@ from vctx.source.session import (
     VisualVideoRequest,
 )
 from vctx.source.store import SourceStore
-from vctx.subtitles import parse_transcript_payload
-from vctx.transcript import Transcript, TranscriptPayload, normalize_transcript
+from vctx.transcript import (
+    ChunkOptions,
+    ChunkSet,
+    Transcript,
+    TranscriptPayload,
+    chunk_transcript,
+    normalize_transcript,
+    parse_transcript_payload,
+)
 from vctx.transforms.ai_routes import AiRoute, AiTaskKind, resolve_openrouter_ai_route
 from vctx.transforms.asr import AsrExecutionError, run_asr
 from vctx.transforms.model_resolution import (
@@ -125,8 +131,7 @@ class Run:
 
 @dataclass(frozen=True)
 class Prepared:
-    raw: Transcript
-    clean: Transcript
+    transcript: Transcript
     chunks: ChunkSet
 
 
@@ -423,15 +428,14 @@ def _prepared(run: Run, payload: TranscriptPayload) -> Prepared:
     )
     run.manifest.add_step("chunk", "ok", f"{len(chunks.chunks)} chunks")
     logger.info("chunk status=ok chunks=%s", len(chunks.chunks))
-    return Prepared(raw=raw, clean=clean, chunks=chunks)
+    return Prepared(transcript=clean, chunks=chunks)
 
 
 def _finish(run: Run, prepared: Prepared, visuals: Visuals, flow: KnowledgeFlow) -> SourcePrepared:
     with phase(logger, "prepare.finish"):
         bundle = render_artifact_bundle(
             metadata=run.metadata,
-            raw_transcript=prepared.raw,
-            clean_transcript=prepared.clean,
+            transcript=prepared.transcript,
             chunks=prepared.chunks,
             formats=run.resolved.output.formats,
             visual_records=visuals.records,
