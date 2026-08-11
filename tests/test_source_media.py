@@ -9,6 +9,7 @@ import pytest
 
 from vctx.config import YtDlpSourceOptions
 from vctx.errors import OperationCancelledError, ProviderError
+from vctx.net import NetRuntime
 from vctx.source.session import (
     MediaPermit,
     Revision,
@@ -17,7 +18,7 @@ from vctx.source.session import (
     VideoMetadata,
     VisualVideoRequest,
 )
-from vctx.source.ytdlp import SourceNetFactory, YtDlpInfo, YtDlpParams, YtDlpSession
+from vctx.source.ytdlp import YtDlpInfo, YtDlpParams, YtDlpSession
 
 
 def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_refuses(
@@ -71,8 +72,8 @@ def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_r
         "disk_usage",
         lambda _path: SimpleNamespace(total=20_000_000_000, free=500_000_000),
     )
-    net_factory = cast(SourceNetFactory, lambda: None)
-    session = YtDlpSession(info, YtDlpSourceOptions(), record, net_factory)
+    net = cast(NetRuntime, None)
+    session = YtDlpSession(info, YtDlpSourceOptions(), record, net)
     permit = MediaPermit(network="allowed")
 
     asset = session.media(

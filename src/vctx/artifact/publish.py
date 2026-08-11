@@ -55,9 +55,7 @@ class PackPublisher:
 
     def rollback_lane(self, key: str) -> None:
         self.reset_lane(key)
-        if self.previous is not None and any(
-            source.key == key for source in self.previous.sources
-        ):
+        if self.previous is not None and any(source.key == key for source in self.previous.sources):
             shutil.copytree(self.target / key, self.stage / key, copy_function=shutil.copy2)
 
     def commit(self, manifest: Manifest) -> None:
@@ -160,17 +158,30 @@ def _verify_lane(lane: Path, source: ManifestSource) -> None:
     refs = [(ref.path, ref.bytes, ref.sha256) for ref in source.artifacts]
     for asset in source.assets:
         if asset.retained:
-            assert (
-                asset.path is not None
-                and asset.bytes is not None
-                and asset.sha256 is not None
-            )
+            assert asset.path is not None and asset.bytes is not None and asset.sha256 is not None
             refs.append((asset.path, asset.bytes, asset.sha256))
     expected = {path for path, _, _ in refs}
     if _linked(lane) or not lane.is_dir():
         raise ValueError("source lane is missing or linked")
-    actual = {entry.name for entry in lane.iterdir()}
-    if len(expected) != len(refs) or actual != expected:
+    expected_dirs = {
+        parent.as_posix()
+        for name in expected
+        for parent in Path(name).parents
+        if parent != Path(".")
+    }
+    actual: set[str] = set()
+    actual_dirs: set[str] = set()
+    for entry in lane.rglob("*"):
+        if _linked(entry):
+            raise ValueError("source lane contains a linked entry")
+        relative = entry.relative_to(lane).as_posix()
+        if entry.is_file():
+            actual.add(relative)
+        elif entry.is_dir():
+            actual_dirs.add(relative)
+        else:
+            raise ValueError("source lane contains an unsupported entry")
+    if len(expected) != len(refs) or actual != expected or actual_dirs != expected_dirs:
         detail = f"expected {sorted(expected)}, found {sorted(actual)}"
         raise ValueError(f"source lane contents differ: {detail}")
     for name, size, digest in refs:

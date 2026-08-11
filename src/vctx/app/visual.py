@@ -1,269 +1,196 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from vctx.app.credentials import CredentialError
+from vctx.ai import AiRoute
 from vctx.app.progress import phase
-from vctx.artifact.manifest import ArtifactRef
+from vctx.artifact.manifest import (
+    ArtifactRef,
+    FrameCaptureReceipt,
+    FrameMissReceipt,
+    FrameStepReceipt,
+)
 from vctx.errors import NoTranscriptError
-from vctx.models.knowledge_flow import KnowledgeFlow
-from vctx.models.visual import (
-    EssentialVisualCase,
-    SourceAccess,
-    VisualRecordSet,
-    VisualScoreReport,
-)
-from vctx.transforms.knowledge_flow import (
-    extract_knowledge_flow,
-    merge_knowledge_flow_supplement,
-)
-from vctx.transforms.text_ai import TextAiExecutionError
-from vctx.transforms.visual_cases import (
-    deterministic_essential_cases,
-    merge_essential_case_supplement,
-    uncertain_visual_segments,
-)
-from vctx.transforms.visual_evidence import score_visual_records
-from vctx.transforms.visual_execute import VisualExecutionError, run_visual_context
-from vctx.transforms.visual_planning import (
-    VisualAssessment,
-    VisualPlan,
-    plan_visual_motives,
-    visual_motives_from_cases,
-)
-from vctx.transforms.visual_routes import discover_visual_actions
+from vctx.visual.evidence import Evidence, assemble
+from vctx.visual.frame import FrameBatch, FrameError, capture
+from vctx.visual.ocr import OcrOutcome, RapidOcr
+from vctx.visual.plan import EvidencePlan, execution_plan, plan_evidence
+from vctx.visual.vlm import VisionProcessor, VlmOutcome
 
 if TYPE_CHECKING:
-    from vctx.app.prepare import Prepared, Run
+    from vctx.app.prepare import Prepared
+    from vctx.app.run import Run
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class Visuals:
-    records: VisualRecordSet | None
+class VisualProducts:
+    evidence: Evidence | None
+    evidence_plan: EvidencePlan | None
     frames: list[ArtifactRef]
-    scores: VisualScoreReport | None = None
+    partial: bool = False
 
 
-def visual_products(run: Run, prepared: Prepared) -> tuple[Visuals, KnowledgeFlow]:
-    visuals = _visuals(run, prepared)
-    return visuals, _flow(run, prepared, visuals)
-
-
-def _visuals(run: Run, prepared: Prepared) -> Visuals:
-    if not run.resolved.transforms.visual_context.enabled:
-        logger.info("visual.status skipped reason=disabled")
-        return Visuals(records=None, frames=[])
-    cases = _visual_cases(run, prepared)
-    plan = _visual_plan(run, prepared, cases)
-    if plan.kind == "skipped":
-        return Visuals(records=None, frames=[])
+def visual_products(run: Run, prepared: Prepared) -> VisualProducts:
+    if not run.resolved.evidence.planner.enabled:
+        return VisualProducts(None, None, [])
+    planner = run.planner_ai_route()
+    if planner is None:
+        return _partial(run, "evidence planner unavailable; publishing transcript-only lane")
+    try:
+        with phase(logger, "evidence.plan"):
+            plan = plan_evidence(prepared.transcript, run.ai_client(planner))
+    except ValueError as exc:
+        return _partial(run, str(exc))
+    run.manifest.add_transform_evidence(planner.transform_evidence("evidence_plan"))
+    failed_plans = [item for item in plan.receipts if item.status in {"failed", "unavailable"}]
+    run.manifest.add_step(
+        "evidence.plan",
+        "warning" if failed_plans else "ok",
+        f"{len(plan.claims)} claims, {len(plan.frames)} frame targets",
+    )
+    if failed_plans:
+        run.manifest.warn(f"{len(failed_plans)} evidence planning windows failed")
+    if not plan.frames:
+        return VisualProducts(None, plan, [], partial=bool(failed_plans))
     if not _video_media(run):
-        run.manifest.add_step("transform.visual_plan", "skipped", "no video media asset")
-        logger.info("visual.status skipped reason=no-video-media")
-        return Visuals(records=None, frames=[])
-    return _visual_capture(run, prepared, plan.assessment)
+        return VisualProducts(None, plan, [], partial=True)
+
+    vision_routes = run.visual_ai_routes()
+    assessment = execution_plan(
+        plan,
+        ocr_available=isinstance(run.ocr_runtime, RapidOcr),
+        vision_route=vision_routes[0] if vision_routes else None,
+    )
+    if assessment.missing_processors:
+        detail = "unavailable visual processors: " + ", ".join(assessment.missing_processors)
+        run.manifest.add_step("transform.visual_plan", "warning", detail)
+        run.manifest.warn(detail)
+    else:
+        run.manifest.add_step("transform.visual_plan", "ok", assessment.rationale)
+    try:
+        assert run.media is not None
+        with phase(logger, "visual.capture"):
+            batch = capture(run.media, assessment.frames, run.request.out_dir)
+    except FrameError as exc:
+        run.manifest.add_step("transform.visual_capture", "warning", str(exc))
+        run.manifest.warn(str(exc))
+        return VisualProducts(None, plan, [], partial=True)
+
+    ocr = _observe_ocr(run, batch)
+    vision = _observe_vision(run, batch, vision_routes, ocr)
+    evidence = assemble(run.metadata.id, batch, run.request.out_dir, ocr=ocr, vision=vision)
+    partial = bool(
+        failed_plans or assessment.missing_processors or batch.misses or evidence.partial
+    )
+    if batch.misses:
+        run.manifest.warn(f"{len(batch.misses)} frame targets were unavailable")
+    run.manifest.add_step(
+        "transform.visual_capture",
+        "warning" if partial else "ok",
+        f"{len(batch.frames)} captures, {len(batch.misses)} misses",
+        _frame_receipt(batch, run.request.out_dir),
+    )
+    return VisualProducts(
+        evidence, plan, _visual_frame_refs(batch, run.request.out_dir), partial=partial
+    )
+
+
+def _observe_ocr(run: Run, batch: FrameBatch) -> dict[str, OcrOutcome]:
+    if not isinstance(run.ocr_runtime, RapidOcr):
+        return {}
+    return {
+        frame.id: run.ocr_runtime.observe(frame)
+        for frame in batch.frames
+        if "ocr" in frame.processors
+    }
+
+
+def _observe_vision(
+    run: Run,
+    batch: FrameBatch,
+    routes: list[AiRoute],
+    ocr: dict[str, OcrOutcome],
+) -> dict[str, VlmOutcome]:
+    if not routes:
+        return {}
+    processor = VisionProcessor(client=run.ai_client(routes[0]))
+    outcomes: dict[str, VlmOutcome] = {}
+    for frame in batch.frames:
+        if "describe" not in frame.processors:
+            continue
+        ocr_outcome = ocr.get(frame.id)
+        outcomes[frame.id] = processor.observe(
+            frame, ocr_text=ocr_outcome.text if ocr_outcome is not None else None
+        )
+    return outcomes
+
+
+def _partial(run: Run, detail: str) -> VisualProducts:
+    run.manifest.add_step("evidence.plan", "warning", detail)
+    run.manifest.warn(detail)
+    return VisualProducts(None, None, [], partial=True)
 
 
 def _video_media(run: Run) -> bool:
-    if run.media is not None:
-        return run.media.media_type == "video"
-    try:
-        logger.info("source.media start purpose=visual")
-        run.media = run.source.media(
-            request=run.visual_media_request(), permit=run.media_permit
-        )
-    except NoTranscriptError as exc:
-        run.manifest.add_step("source.media", "skipped", str(exc))
-        logger.info("source.media status=skipped purpose=visual reason=%s", exc)
-        return False
-    origin = "local" if run.media.source.kind == "file" else "source"
-    run.manifest.add_step("source.media", "ok", f"{origin} media: {run.media.media_type}")
-    logger.info("source.media status=ok purpose=visual path=%s", run.media.local_path)
+    if run.media is None:
+        try:
+            run.media = run.source.media(
+                request=run.visual_media_request(), permit=run.media_permit
+            )
+        except NoTranscriptError as exc:
+            run.manifest.add_step("source.media", "warning", str(exc))
+            return False
     return run.media.media_type == "video"
 
 
-def _visual_cases(run: Run, prepared: Prepared) -> list[EssentialVisualCase]:
-    cases = deterministic_essential_cases(prepared.transcript)
-    logger.info("visual.cases deterministic=%s", len(cases))
-    route = run.text_product_ai_route("essential_case_extraction")
-    if route is None:
-        return cases
-    uncertain = uncertain_visual_segments(prepared.transcript, cases)
-    if not uncertain.segments:
-        run.manifest.add_step(
-            "visual_cases.llm_extract", "skipped", "no uncertain visual transcript segments"
+def _visual_frame_refs(batch: FrameBatch, out_dir: Path) -> list[ArtifactRef]:
+    return [
+        ArtifactRef(
+            kind="visual_frame",
+            path=frame.path.relative_to(out_dir).as_posix(),
+            media_type="image/png",
+            bytes=frame.bytes,
+            sha256=frame.sha256,
         )
-        return cases
-    try:
-        supplement = run.text_ai_adapter(route).essential_case_supplement(uncertain)
-    except (CredentialError, TextAiExecutionError) as exc:
-        run.manifest.add_step("visual_cases.llm_extract", "warning", str(exc))
-        run.manifest.warn(str(exc))
-        logger.warning("visual.cases.llm status=warning reason=%s", exc)
-        return cases
-    run.manifest.add_transform_evidence(route.transform_evidence("essential_cases"))
-    run.manifest.add_step("visual_cases.llm_extract", "ok", route.detail())
-    merged = merge_essential_case_supplement(cases, supplement, prepared.transcript)
-    logger.info("visual.cases.llm status=ok cases=%s route=%s", len(merged), route.provider_id)
-    return merged
+        for frame in batch.frames
+    ]
 
 
-def _visual_plan(
-    run: Run, prepared: Prepared, cases: list[EssentialVisualCase]
-) -> VisualPlan:
-    plan = plan_visual_motives(
-        source=_source_access(run, prepared),
-        duration_seconds=run.metadata.duration_seconds,
-        motives=visual_motives_from_cases(cases),
-        available_actions=discover_visual_actions(
-            run.resolved.transforms.visual_context,
-            ocr_policy=run.resolved.transforms.ocr,
-            vision_instance_configs=run.resolved.instances.vision,
-            ai_routes=run.visual_ai_routes(),
-            offline=run.resolved.runtime.offline,
-        ),
-    )
-    if plan.kind == "skipped":
-        run.manifest.add_step(
-            "transform.visual_plan", "skipped", f"{plan.reason}: {plan.rationale}"
-        )
-        logger.info("visual.plan status=skipped reason=%s", plan.reason)
-        return plan
-    run.manifest.add_step("transform.visual_plan", "ok", _visual_plan_detail(plan.assessment))
-    logger.info(
-        "visual.plan status=ok actions=%s rationale=%s",
-        ",".join(action.name for action in plan.assessment.recipe) or "none",
-        plan.assessment.rationale,
-    )
-    return plan
-
-
-def _source_access(run: Run, prepared: Prepared) -> SourceAccess:
-    media_type = run.media.media_type if run.media is not None else None
-    return SourceAccess.from_flags(
-        transcript=bool(prepared.transcript.segments),
-        audio=media_type in {"audio", "video"},
-        video=media_type == "video" or run.metadata.source.kind == "url",
-    )
-
-
-def _visual_capture(run: Run, prepared: Prepared, assessment: VisualAssessment) -> Visuals:
-    assert run.media is not None
-    try:
-        with phase(logger, "visual.capture"):
-            records = run_visual_context(
-                assessment,
-                run.media,
-                run.request.out_dir,
-                cache_root=run.model_root,
-                env_files=run.resolved.runtime.env_files,
-                runtime_cache=run.runtime_cache,
+def _frame_receipt(batch: FrameBatch, out_dir: Path) -> FrameStepReceipt:
+    return FrameStepReceipt(
+        captures=[
+            FrameCaptureReceipt(
+                id=frame.id,
+                path=frame.path.relative_to(out_dir).as_posix(),
+                requested_seconds=frame.requested_seconds,
+                actual_seconds=frame.actual_seconds,
+                original_width=frame.original_size[0],
+                original_height=frame.original_size[1],
+                orientation=frame.orientation,
+                width=frame.size[0],
+                height=frame.size[1],
+                sha256=frame.sha256,
+                request_ids=list(frame.request_ids),
+                segment_ids=list(frame.segment_ids),
+                claim_ids=list(frame.claim_ids),
+                processors=list(frame.processors),
             )
-    except VisualExecutionError as exc:
-        run.manifest.add_step("transform.visual_capture", "warning", str(exc))
-        logger.warning("visual.capture status=warning reason=%s", exc)
-        return Visuals(records=None, frames=[])
-    scored = score_visual_records(records.records, prepared.transcript, motives=assessment.motives)
-    visual_records = VisualRecordSet(records=scored.records)
-    visual_scores = VisualScoreReport(satisfaction=scored.satisfaction)
-    _add_visual_satisfaction_step(run, visual_scores)
-    run.manifest.add_step(
-        "transform.visual_capture", "ok", _visual_capture_detail(visual_records)
-    )
-    logger.info("visual.capture status=ok records=%s", len(visual_records.records))
-    return Visuals(
-        records=visual_records,
-        frames=_visual_frame_refs(visual_records, run.request.out_dir),
-        scores=visual_scores,
-    )
-
-
-def _flow(run: Run, prepared: Prepared, visuals: Visuals) -> KnowledgeFlow:
-    with phase(logger, "knowledge_flow.extract"):
-        flow = extract_knowledge_flow(prepared.transcript, visuals.records)
-    route = run.text_product_ai_route("knowledge_flow_extraction")
-    if route is not None:
-        try:
-            supplement = run.text_ai_adapter(route).knowledge_flow_supplement(prepared.transcript)
-        except (CredentialError, TextAiExecutionError) as exc:
-            run.manifest.add_step("knowledge_flow.llm_extract", "warning", str(exc))
-            run.manifest.warn(str(exc))
-            logger.warning("knowledge_flow.llm status=warning reason=%s", exc)
-        else:
-            flow = merge_knowledge_flow_supplement(flow, supplement, prepared.transcript)
-            run.manifest.add_transform_evidence(route.transform_evidence("knowledge_flow"))
-            run.manifest.add_step("knowledge_flow.llm_extract", "ok", route.detail())
-    if flow.nodes:
-        run.manifest.add_step(
-            "knowledge_flow.extract", "ok", f"{len(flow.nodes)} nodes, {len(flow.edges)} edges"
-        )
-    return flow
-
-
-def _visual_capture_detail(records: VisualRecordSet) -> str:
-    kept = sum(1 for item in records.records if item.score is None or item.score.keep)
-    dropped = len(records.records) - kept
-    if dropped:
-        return f"{len(records.records)} records ({kept} kept, {dropped} low-novelty)"
-    return f"{len(records.records)} records"
-
-
-def _add_visual_satisfaction_step(run: Run, scores: VisualScoreReport) -> None:
-    if not scores.satisfaction:
-        return
-    missed = [check for check in scores.satisfaction if check.status == "missed"]
-    if missed:
-        detail = f"{len(missed)} visual satisfaction missed, {len(scores.satisfaction)} checked"
-        run.manifest.add_step("transform.visual_satisfaction", "warning", detail)
-        run.manifest.warn(detail)
-    else:
-        run.manifest.add_step(
-            "transform.visual_satisfaction", "ok", f"{len(scores.satisfaction)} checked"
-        )
-
-
-def _visual_frame_refs(records: VisualRecordSet, out_dir: Path) -> list[ArtifactRef]:
-    refs: list[ArtifactRef] = []
-    seen: set[str] = set()
-    for record in records.records:
-        if record.kind != "capture" or record.artifact_path is None:
-            continue
-        if record.artifact_path in seen:
-            continue
-        seen.add(record.artifact_path)
-        body = (out_dir / record.artifact_path).read_bytes()
-        refs.append(
-            ArtifactRef(
-                kind="visual_frame",
-                path=record.artifact_path,
-                media_type=_visual_frame_media_type(record.artifact_path),
-                bytes=len(body),
-                sha256=hashlib.sha256(body).hexdigest(),
+            for frame in batch.frames
+        ],
+        misses=[
+            FrameMissReceipt(
+                id=miss.id,
+                requested_seconds=miss.requested_seconds,
+                reason=miss.reason,
+                request_ids=list(miss.request_ids),
+                segment_ids=list(miss.segment_ids),
+                claim_ids=list(miss.claim_ids),
             )
-        )
-    return refs
-
-
-def _visual_frame_media_type(path: str) -> str:
-    if path.lower().endswith(".png"):
-        return "image/png"
-    if path.lower().endswith((".jpg", ".jpeg")):
-        return "image/jpeg"
-    return "application/octet-stream"
-
-
-def _visual_plan_detail(assessment: VisualAssessment) -> str:
-    details = []
-    for action in assessment.recipe:
-        if action.name == "ocr" and action.provider_id is not None:
-            details.append(f"local OCR: {action.provider_id}")
-        if action.name == "describe" and action.provider_id is not None:
-            label = "free VLM" if action.route == "free-online" else "configured VLM"
-            details.append(f"{label}: {action.provider_id}")
-    return "; ".join(details) if details else assessment.rationale
+            for miss in batch.misses
+        ],
+    )

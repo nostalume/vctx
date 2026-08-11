@@ -6,9 +6,10 @@ from pathlib import Path
 from vctx.app.prepare import SourcePrepared, prepare_source
 from vctx.app.progress import phase
 from vctx.app.result import PrepareResult, PrepareSummary
+from vctx.app.run import RunRuntimes
 from vctx.artifact.manifest import build_manifest
 from vctx.artifact.publish import PackPublisher
-from vctx.config import PrepareRequest, ResolvedConfig, resolve_config
+from vctx.config import PrepareRequest, ResolvedConfig, load_resolved_config
 from vctx.errors import ConfigError, OperationCancelledError, VctxError
 from vctx.io import write_manifest
 from vctx.util import vctx_version
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
     with phase(logger, "prepare.total"):
-        resolved = resolve_config(request)
+        resolved = load_resolved_config(request)
         _validate_cache_output(request.out_dir, resolved)
         with PackPublisher(request.out_dir) as publisher:
             previous = publisher.previous
@@ -26,36 +27,36 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
             occupied = {source.key.casefold(): source.id for source in previous_by_id.values()}
             completed: set[str] = set()
             seen_inputs: set[str] = set()
-            runtime_cache: dict[str, object] = {}
             results: list[SourcePrepared] = []
             first_error: VctxError | None = None
-            for value in request.inputs:
-                if value in seen_inputs:
-                    continue
-                seen_inputs.add(value)
-                source_request = request.model_copy(
-                    update={"inputs": [value], "out_dir": publisher.stage}
-                )
-                try:
-                    result = prepare_source(
-                        source_request,
-                        resolved,
-                        occupied,
-                        completed,
-                        runtime_cache,
-                        previous_by_id,
-                        publisher.reset_lane,
-                        publisher.rollback_lane,
+            with RunRuntimes() as runtimes:
+                for value in request.inputs:
+                    if value in seen_inputs:
+                        continue
+                    seen_inputs.add(value)
+                    source_request = request.model_copy(
+                        update={"inputs": [value], "out_dir": publisher.stage}
                     )
-                except OperationCancelledError:
-                    raise
-                except VctxError as exc:
-                    first_error = first_error or exc
-                    continue
-                if result is None:
-                    continue
-                results.append(result)
-                first_error = first_error or result.error
+                    try:
+                        result = prepare_source(
+                            source_request,
+                            resolved,
+                            occupied,
+                            completed,
+                            runtimes,
+                            previous_by_id,
+                            publisher.reset_lane,
+                            publisher.rollback_lane,
+                        )
+                    except OperationCancelledError:
+                        raise
+                    except VctxError as exc:
+                        first_error = first_error or exc
+                        continue
+                    if result is None:
+                        continue
+                    results.append(result)
+                    first_error = first_error or result.error
             if not results:
                 assert first_error is not None
                 raise first_error

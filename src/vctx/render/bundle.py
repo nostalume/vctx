@@ -6,11 +6,11 @@ from pydantic import BaseModel
 
 from vctx.artifact.content import Artifact, ArtifactBundle, ArtifactKind
 from vctx.io import model_to_json
-from vctx.models.knowledge_flow import KnowledgeFlow
-from vctx.models.visual import VisualRecordSet, VisualScoreReport
 from vctx.render.markdown import render_context_markdown, render_readable_markdown
 from vctx.source.session import VideoMetadata
 from vctx.transcript import ChunkSet, Transcript
+from vctx.visual.evidence import Evidence
+from vctx.visual.plan import EvidencePlan
 
 OutputFormat = Literal["json", "context", "readable"]
 DEFAULT_FORMATS: set[OutputFormat] = {"json", "context", "readable"}
@@ -40,9 +40,8 @@ def render_artifact_bundle(
     transcript: Transcript,
     chunks: ChunkSet,
     formats: set[OutputFormat],
-    visual_records: VisualRecordSet | None = None,
-    visual_scores: VisualScoreReport | None = None,
-    knowledge_flow: KnowledgeFlow | None = None,
+    evidence: Evidence | None = None,
+    evidence_plan: EvidencePlan | None = None,
     output_language: str = "native",
 ) -> ArtifactBundle:
     del output_language
@@ -55,12 +54,10 @@ def render_artifact_bundle(
                 json_artifact("chunks.json", "chunks", chunks),
             ]
         )
-        if visual_records is not None and visual_records.records:
-            artifacts.append(json_artifact("visual_records.json", "visual_records", visual_records))
-        if visual_scores is not None and visual_scores.satisfaction:
-            artifacts.append(json_artifact("visual_scores.json", "visual_scores", visual_scores))
-        if knowledge_flow is not None and knowledge_flow.nodes:
-            artifacts.append(json_artifact("knowledge_flow.json", "knowledge_flow", knowledge_flow))
+        if evidence is not None and evidence.captures:
+            artifacts.append(json_artifact("evidence.json", "evidence", evidence))
+        if evidence_plan is not None:
+            artifacts.append(json_artifact("evidence-plan.json", "evidence_plan", evidence_plan))
     if "context" in formats:
         artifacts.append(
             markdown_artifact(
@@ -70,8 +67,8 @@ def render_artifact_bundle(
                     metadata,
                     transcript,
                     chunks,
-                    visual_records,
-                    knowledge_flow,
+                    evidence,
+                    evidence_plan,
                 ),
             )
         )
@@ -84,8 +81,8 @@ def render_artifact_bundle(
                     metadata,
                     transcript,
                     chunks,
-                    visual_records,
-                    knowledge_flow,
+                    evidence,
+                    evidence_plan,
                 ),
             )
         )

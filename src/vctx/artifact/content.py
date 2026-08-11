@@ -10,9 +10,8 @@ ArtifactKind = Literal[
     "chunks",
     "context",
     "readable",
-    "visual_records",
-    "visual_scores",
-    "knowledge_flow",
+    "evidence",
+    "evidence_plan",
     "visual_frame",
     "manifest",
 ]
