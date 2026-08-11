@@ -21,9 +21,10 @@ uv tool install "vctx[visual]"  # minimal + PyAV + local OCR/visual extras
 ```
 
 Tier-1 installation coverage is Windows x64, Linux x64, and macOS Apple
-Silicon on Python 3.12–3.14. The CI matrix verifies each published profile on
-those environments. PyAV is packaged now; the visual runtime’s final migration
-away from its current host-ffmpeg frame adapter is tracked separately.
+Silicon on Python 3.12–3.14. The CI matrix installs the built wheel as core,
+ASR, visual, full, and the simultaneous `[asr,visual]` selection on those
+environments. Visual frame production is in-process through PyAV; no host media
+executable is required.
 
 Then run:
 
@@ -95,7 +96,7 @@ uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes
 --media-quality auto|fast|balanced|high
 --asr auto|none|instance:NAME|local:MODEL
 --ocr auto|none
---vision auto|none|instance:NAME|openrouter:MODEL
+--vision auto|none|instance:NAME
 --no-retain-media
 --config PATH
 --offline
@@ -154,31 +155,30 @@ read.md
 Optional visual artifacts:
 
 ```text
-visual_records.json   OCR/VLM/capture evidence
-visual_scores.json    visual satisfaction diagnostics
-frame-*.png           captured frames
+evidence.json         captures with typed OCR/VLM observations
+frames/frame-*.png    display-corrected captured frames
 ```
 
-Optional flow artifact:
+Optional planning artifact:
 
 ```text
-knowledge_flow.json
+evidence-plan.json
 ```
 
 ## Visual workflow
 
-Visual runs use transcript-anchored motives. They fetch video only when useful visual evidence is planned.
+Visual runs use a language-neutral, transcript-anchored evidence plan. They fetch video only when the validated plan requests frames.
 
 ```text
-transcript cues
-  -> visual motives
+canonical transcript windows
+  -> validated claims, relations, and frame requests
   -> frame sampling
   -> OCR and/or VLM description when available
-  -> capture records
-  -> visual_records.json + visual_scores.json
+  -> durable captures with typed processor outcomes
+  -> evidence.json
 ```
 
-Use `OPENROUTER_API_KEY` only when selecting OpenRouter-backed VLM/text routes. Secrets are read from environment or configured `.env` files and are not written to artifacts.
+For the free/ZDR OpenRouter auto route, run `vctx auth openrouter login` (or add `--headless`). It provisions the reserved `keyring:openrouter` slot. Named OpenAI-compatible endpoints accept exactly `env:NAME` or `keyring:NAME`; these references only locate secrets and never select an endpoint or request policy. Secrets are never written to config, logs, or artifacts.
 
 ### Minimal config selector examples
 
@@ -192,11 +192,18 @@ model = "small"
 device = "auto"
 compute = "auto"
 
-[transforms.visual_context]
-use = "auto"  # or "instance:my-vlm" / "openrouter:<model-id>"
+[evidence]
+planner = "auto"  # or "instance:my-planner"
+vision = "auto"   # or "instance:my-vlm"
+ocr = "auto"
+
+[instances.ai.my-vlm]
+base_url = "https://provider.example/v1"
+model = "vision-model"
+credential = "env:MY_AI_KEY"
 ```
 
-Transform config uses one selector field, `use`. Do not combine old-style `route`, `instance`, and `model` fields; named providers live under `[instances.asr.*]` and `[instances.vision.*]`.
+ASR uses `transforms.asr.use`; evidence capabilities use the terse `[evidence]` selectors. Named providers live under `[instances.asr.*]` and `[instances.ai.*]`.
 
 ## What vctx is not
 

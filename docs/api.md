@@ -19,30 +19,51 @@ CLI request
 | Layer | Owns | Must not own |
 | --- | --- | --- |
 | `cli` | flags, request construction, summary printing | provider calls, workflow policy |
-| `app` | admission, workflow order, resolved policy, manifest steps | provider payloads, rendering internals |
+| `app` | effect shells, workflow order, resolved policy, scoped runtime lifetime, manifest steps | provider payloads, rendering internals |
 | `source` | local/URL metadata, subtitles, media acquisition | chunking, rendering, transforms |
-| `transcript` / `subtitles` / `chunking` | deterministic normalization and chunks | provider calls, output policy |
-| `transforms` | ASR, OCR, VLM, and text-model products | final rendering, source acquisition |
+| `transcript` | deterministic parsing, normalization, and chunks | provider calls, output policy |
+| `asr` | local faster-whisper planning, admission, and execution | final rendering, source acquisition |
+| `visual` | evidence planning, PyAV frames, OCR, VLM, and evidence models | source acquisition, workflow composition |
 | `render` | Markdown/JSON projections from typed products | source, model, or network access |
-| `models` | artifact and domain schemas | app, CLI, providers |
-| `net` | HTTP transport | product semantics |
+| `net` | scoped HTTPX client, caller-declared Tenacity retry execution, attempt evidence | product semantics, inferred retry policy |
 
 Dependencies point inward toward typed models:
 
 ```text
-cli -> app -> source/transforms/render/io/artifact -> models
-                 transforms/provider leaves -> net
+cli -> app -> source/asr/visual -> artifact/render/io
+            ai/provider transport -> net
 ```
 
-Forbidden dependencies are `models ->` higher layers, `render ->` acquisition
-or network, `sources ->` transforms/render, and pure transforms -> provider
-clients. Route objects describe a selected capability; they do not own clients,
-sessions, concurrency, or transport lifecycle.
+Forbidden dependencies are `render ->` acquisition or network, `source ->`
+capability execution/render, and capability models -> app composers. Route
+identity, credential location, provider receipt identity, and request policy are
+independent values.
 
-Visual evidence is transcript-motive-led: deterministic cases select bounded
-capture/OCR/VLM actions, `visual_records.json` stores evidence, and
-`visual_scores.json` stores satisfaction diagnostics. No transcript motive means
-no visual fetch. Missed satisfaction is a manifest warning.
+`app/run.py` owns one persistent, deterministically closed HTTP runtime per
+prepare command. Source subtitle/HLS fetches and OpenAI-compatible calls receive
+that runtime explicitly. Metadata and OpenRouter login own shorter scoped
+runtimes. yt-dlp's internal provider transport remains yt-dlp-owned; all other
+vctx HTTP passes through `net.py`. `urllib.parse` is used only for pure URL
+parsing.
+
+Callers declare retry policy on each request. Subtitle/HLS GET permits bounded
+connection, timeout, `429`, and selected `5xx` retries. AI POST permits one retry
+for pre-response connection failure, `429`, or selected `5xx`, preserves the
+idempotency key, and never retries an ambiguous response timeout. OpenRouter
+OAuth exchange is single-attempt. Responses and typed failures report actual
+attempt counts; retries are never stacked.
+
+Configuration file/platform reads (`load_config`) are separate from deterministic
+policy resolution (`resolve_config`). Source syntax selection is separate from
+effectful source opening. AI selection produces a secret-free `AiRoute`; one
+effectful credential read produces a process-local, non-serializable binding.
+Diagnostics and artifacts expose only the credential locator/source.
+
+Visual evidence is transcript-led: a validated language-neutral evidence plan
+selects bounded capture/OCR/VLM actions. `evidence.json` stores captures and typed
+observations; processor admission and failures are recorded in the manifest. No
+validated frame request means no visual fetch. Missed satisfaction is a manifest
+warning.
 
 The output directory is the stable integration boundary. Internal modules may
 move, but CLI behavior, exit status, manifest discovery, and documented artifact
@@ -132,11 +153,11 @@ for one or more explicit inputs. It never combines their content.
 4. If transcript text is still missing and the workflow allows it, use the selected ASR fallback instance.
 5. Normalize transcript segments and build chunks.
 6. If the workflow asks for visual evidence and video media is available:
-   - extract frames with `ffmpeg`
+   - extract display-corrected frames in-process with PyAV
    - run local RapidOCR when `rapidocr` is installed
    - optionally run an OpenAI-compatible/OpenRouter VLM description route
    - preserve frame captures as artifacts
-7. Extract deterministic knowledge flow from transcript and kept visual evidence.
+7. Validate language-neutral claims, relations, and transcript-anchored frame requests.
 8. Optionally merge configured text-model supplements when enabled.
 9. Write JSON/Markdown artifacts and `manifest.json`.
 ```
@@ -147,8 +168,8 @@ Workflow presets decide which branches are allowed:
 | --- | --- | --- | --- | --- |
 | `default` | deterministic transcript; ASR only if configured and needed | auto/optional | deterministic, optional configured supplement | manifest, metadata, transcript/chunks/context/readable |
 | `transcript` | transcript-focused; ASR only if configured and needed | off | off | transcript/chunks/context/readable |
-| `visual` | transcript plus visual evidence when video media exists | on; currently requires `ffmpeg` for frames | deterministic/auto | visual records and frame artifacts when captured |
-| `full` | transcript + visual + configured supplements | on; currently requires `ffmpeg` for frames | on when configured | all applicable artifacts |
+| `visual` | transcript plus visual evidence when video media exists | on; PyAV frame production | deterministic/auto | visual records and frame artifacts when captured |
+| `full` | transcript + visual + configured supplements | on; PyAV frame production | on when configured | all applicable artifacts |
 | `metadata` | metadata only | off | off | `metadata.json` + `manifest.json(status=partial)` |
 
 Configuration answers two questions:
@@ -159,9 +180,9 @@ Configuration answers two questions:
    - `output.*`
 2. If a workflow branch needs a model/tool, which implementation is selected?
    - `transforms.asr.use = "instance:<name>"` -> `[instances.asr.<name>]`, or use `auto`
-   - `transforms.ocr.use = "auto" | "none"` for local frame OCR
-   - `transforms.visual_context.use` -> `auto`, `instance:<name>`, or `openrouter:<model-id>`
-   - `transforms.knowledge_flow.use` for the current text-model supplement path
+   - `evidence.planner` -> `auto`, `none`, or `instance:<name>`
+   - `evidence.vision` -> `auto`, `none`, or `instance:<name>`
+   - `evidence.ocr` -> `auto` or `none`
 
 Current config precedence is high to low:
 
@@ -178,17 +199,22 @@ CLI/request values
 
 ## Required tools and optional extras
 
-Base transcript workflows do not require ASR, OCR, VLM, or `ffmpeg`. Extra tools are only needed when the selected workflow reaches the corresponding branch.
+Base transcript workflows do not require ASR, OCR, VLM, or frame decoding. Extra packages are only needed when the selected workflow reaches the corresponding branch.
 
 | Tool/package | Needed for | Install / availability |
 | --- | --- | --- |
 | `yt-dlp` Python package | URL metadata and subtitles; URL media download when ASR/visual media is needed | Project dependency. `vctx doctor` reports availability. |
-| `ffmpeg` executable | Visual/full workflows that extract video frames; not needed for transcript-only or metadata workflows | Install from your OS package manager or <https://ffmpeg.org/> and ensure `ffmpeg` is on `PATH`. `vctx doctor` checks it. |
-| `av` (PyAV) Python package | Declared visual-profile dependency for the in-process frame-extraction migration | Installed by `vctx[visual]` and `vctx[full]`. The current frame adapter still uses `ffmpeg`; this row is intentionally not a claim that the migration has landed. |
+| `av` (PyAV 18) + Pillow | In-process video decode, display orientation, scaling, and PNG frame publication | Installed by `vctx[visual]` and `vctx[full]`; no host media executable is required. |
 | `rapidocr` + `onnxruntime` Python packages | Local OCR over extracted frames | Install the visual extra, for example `uv sync --extra visual` or package equivalent. If absent, local OCR action is unavailable. |
 | `faster_whisper` Python package | Local ASR through `type = "local-faster-whisper"` | Install the ASR extra, for example `uv sync --extra asr` or package equivalent. |
 | `vctx[full]` optional extra | Installs all local heavy feature extras currently declared by the project | Use `uv sync --extra full` when you want ASR + visual/OCR support in one environment. Default installs stay small. |
-| `OPENROUTER_API_KEY` | OpenRouter registry-backed VLM/text routes | Store in shell env or a file listed by `runtime.env_files`; config stores only the env-var name. |
+| `OPENROUTER_API_KEY` | Optional OpenRouter free/ZDR auto route | Prefer `vctx auth openrouter login`; shell env or a listed `runtime.env_files` file is also accepted. |
+
+Published extras are flat PEP 621 dependency lists. `full` is mechanically
+verified as the normalized union of `asr` and `visual`; selecting `[asr,visual]`
+simultaneously is verified as the equivalent independent composition. CI builds
+the wheel once and runs all profile smokes against that artifact rather than the
+source tree.
 
 ## Current model/tool semantics
 
@@ -217,27 +243,13 @@ compute = "auto"
 cache = "persistent"
 ```
 
-Online ASR instance:
-
-```toml
-[transforms.asr]
-use = "instance:openai-whisper"
-
-[instances.asr.openai-whisper]
-type = "openai-compatible-audio"
-base_url = "https://api.openai.com/v1/audio/transcriptions"
-api_key_env = "OPENAI_API_KEY"
-model = "whisper-1"
-```
-
-`local-default`, `local-model`, and `openai-whisper` are example names, not magic built-ins. The user can name an instance anything and select it with `transforms.asr.use = "instance:<name>"`.
+`local-default` and `local-model` are example names, not magic built-ins. The user can name a local instance anything and select it with `transforms.asr.use = "instance:<name>"`.
 
 Current ASR instance types:
 
 | Type | Behavior |
 | --- | --- |
 | `local-faster-whisper` | Runs local multilingual faster-whisper `small` by default. Managed model ids use `cache.model_dir`; `path:<local-path>` uses local files only. Execution never downloads models. |
-| `openai-compatible-audio` | Sends multipart audio/media to `base_url` with `model` and credential from `api_key_env`; manifest records upload/cost evidence automatically. |
 
 Local ASR always transcribes in the detected language. It uses Silero VAD with
 threshold `0.5`, minimum silence `2000 ms`, and speech padding `400 ms`. An empty
@@ -248,38 +260,53 @@ CTranslate2 directories and never pulls a model.
 
 ### Visual frames, OCR, and VLM descriptions
 
-Visual/full workflows need `ffmpeg` to extract frame images from video media. Transcript-only and metadata workflows do not need `ffmpeg`.
+Visual/full workflows use one PyAV decoder per source. Targets resolve to the frame displayed at the requested media time, apply display orientation, never upscale, and publish PNG captures under `frames/` with a 2560-pixel maximum long edge. OCR, VLM, and the human-visible artifact consume the same pixels.
 
 Local OCR is available only when `rapidocr` is importable. Its provider id is `rapidocr`. `vctx` does not currently expose a separate OCR model selector; RapidOCR model/cache behavior belongs to that package.
 
-Visual descriptions use OpenRouter model resolution or a named vision instance.
+Text and image inference share one OpenAI-compatible AI instance contract.
 
-Automatic/pinned OpenRouter route:
+Automatic OpenRouter-free route:
 
 ```toml
-[transforms.visual_context]
-use = "auto"                    # select a free capable OpenRouter VLM when possible
-# use = "openrouter:<model>"     # pin a specific OpenRouter VLM
+[evidence]
+planner = "auto"                # authenticated OpenRouter free/ZDR router
+vision = "auto"
+ocr = "auto"
 ```
 
-Named vision instance:
+Named AI instance:
 
 ```toml
-[transforms.visual_context]
-use = "instance:my-vlm"
+[evidence]
+vision = "instance:my-vlm"
 
-[instances.vision.my-vlm]
-type = "openai-compatible-vision"
-base_url = "https://example.invalid/v1/chat/completions"
-api_key_env = "MY_VLM_API_KEY"
+[instances.ai.my-vlm]
+base_url = "https://example.invalid/v1"
+credential = "env:MY_VLM_API_KEY"
 model = "my-vision-model"
+format = "auto"                 # schema, json, prompt, or negotiated auto
 ```
 
-`use = "auto"` may fetch/cache OpenRouter registry metadata when network/upload are allowed and `OPENROUTER_API_KEY` is present. It selects the highest-ranked free capable model from vctx's curated capability ranking, then context length and stable id order. Registry metadata filters capability/cost; it does not prove objective model quality.
+`use = "auto"` uses `openrouter/free` only when network use is allowed and an OpenRouter credential is present in the system keyring or `OPENROUTER_API_KEY`. Every request requires zero-data-retention and parameter support. It never selects a paid route.
 
-### Knowledge-flow and text-model supplements
+Credentials are exactly `env:NAME` or `keyring:NAME`. `keyring:openrouter` is a
+storage locator and may be used by any explicitly configured HTTPS instance; it
+does not activate OpenRouter fields or bind a host. Only the built-in auto route
+selects the canonical OpenRouter endpoint and free/ZDR request policy.
 
-Deterministic knowledge-flow extraction does not need a model. Current LLM supplement routing is controlled by `transforms.knowledge_flow`; this also gates LLM essential visual case extraction today. That coupling is current behavior, not the ideal long-term config split.
+Authenticate without putting a secret in config:
+
+```bash
+vctx auth openrouter login             # desktop loopback PKCE
+vctx auth openrouter login --headless  # paste-code PKCE
+vctx auth openrouter status
+vctx auth openrouter logout
+```
+
+### Evidence planning
+
+`evidence.planner` selects one language-neutral structured planning call over deterministic transcript windows. The model may propose claims, relations, and segment anchors, but code validates ownership and derives all frame timestamps. Missing or failed planning produces a transcript-only partial lane without keyword fallback.
 
 ## Commands
 
@@ -324,7 +351,7 @@ Options:
 | `--workflow NAME` | `default` | Select a preparation workflow: `default`, `transcript`, `visual`, `full`, or `metadata`. |
 | `--asr SELECTOR` | config/workflow default | ASR selector: `auto`, `none`, `instance:<name>`, or `local:<model>`. |
 | `--ocr SELECTOR` | config/workflow default | Frame OCR selector: `auto` or `none`. |
-| `--vision SELECTOR` | config/workflow default | Vision-description selector: `auto`, `none`, `instance:<name>`, or `openrouter:<model>`. |
+| `--vision SELECTOR` | config/workflow default | Vision-description selector: `auto`, `none`, or `instance:<name>`. |
 | `--no-retain-media` | unset | Omit required source media from the pack and record that omission in the manifest. |
 | `--offline` | unset | Use offline policy; network/model-service routes are unavailable. |
 | `--config PATH` | unset | Optional TOML config file. Missing fields keep built-in defaults; CLI/request values override config fields. |
@@ -362,10 +389,9 @@ Visual/full or supplement branches may additionally write:
 
 ```text
 DIR/<source-key>/
-  visual_records.json
-  visual_scores.json
-  frame-*.png
-  knowledge_flow.json
+  evidence.json
+  frames/frame-*.png
+  evidence-plan.json
 ```
 
 Artifact orthogonality:
@@ -376,10 +402,9 @@ metadata.json          source metadata
 subtitle.<lang>.<ext>  original native subtitle bytes when retained
 transcript.json        canonical normalized transcript used by transforms
 chunks.json            context-window chunks
-knowledge_flow.json    canonical evidence-linked flow graph
-visual_records.json    canonical OCR/VLM/capture evidence records
-visual_scores.json     visual satisfaction diagnostics
-frame-*.png            frame artifacts referenced by visual records
+evidence-plan.json     validated claims, relations, frame targets, omissions, and receipts
+evidence.json          canonical captures with typed OCR/VLM observations
+frames/frame-*.png     frame artifacts referenced by evidence captures
 context.md             AI-agent context injection projection
 read.md                human inspection projection
 ```
@@ -395,12 +420,11 @@ Current artifact contract:
 | `subtitle.<language>.<ext>` | native subtitle retained | Original acquired subtitle bytes for inspection and reparsing. |
 | `transcript.json` | transcript-bearing workflows | Canonical parsed and deterministically normalized transcript segments. |
 | `chunks.json` | transcript-bearing workflows | Chunked transcript for downstream context windows. |
-| `context.md` | `context` format enabled | Agent-oriented context injection artifact; includes visual records and knowledge-flow summary when available. |
-| `read.md` | `readable` format enabled | Human-readable inspection artifact; includes knowledge-flow summary when available. |
-| `visual_records.json` | visual/full workflow with captured visual evidence | Canonical OCR/VLM/capture evidence records only; no satisfaction diagnostics. |
-| `visual_scores.json` | visual/full workflow with checked visual motives | Satisfaction diagnostics for required visual operations; missed checks are also manifest warnings. |
-| frame image files | visual/full workflow with capture records | PNG frame artifacts referenced from visual records and manifest. |
-| `knowledge_flow.json` | transcript or kept visual evidence yields flow edges | Canonical evidence-linked flow nodes/edges from transcript and kept visual records. |
+| `context.md` | `context` format enabled | Agent-oriented context artifact; includes visual evidence and validated plan claims when available. |
+| `read.md` | `readable` format enabled | Human-readable inspection artifact; includes validated plan claims when available. |
+| `evidence.json` | visual/full workflow with captured visual evidence | Canonical captures and typed `ok`, `empty`, `unavailable`, or `failed` processor observations. |
+| frame image files | visual/full workflow with captures | PNG frame artifacts referenced from evidence and manifest. |
+| `evidence-plan.json` | evidence planning ran, including a valid empty result | Canonical validated claims, relations, derived frame targets, omissions, and per-window receipts. |
 
 Current MVP stage:
 
@@ -408,9 +432,8 @@ Current MVP stage:
 auditable context pack
   -> deterministic transcript/prose flow extraction
   -> motive-led visual evidence when useful
-  -> visual_records.json evidence
-  -> visual_scores.json diagnostics
-  -> evidence-linked knowledge_flow.json
+  -> evidence.json
+  -> validated evidence-plan.json
   -> rendered context/readable projections
 ```
 
@@ -506,25 +529,18 @@ cache = "persistent"             # managed weights under cache.model_dir
 type = "local-faster-whisper"
 model = "path:D:/models/faster-whisper-tiny"  # explicit path => no managed cache/download
 
-[instances.asr.openai-whisper]
-type = "openai-compatible-audio"
-base_url = "https://api.openai.com/v1/audio/transcriptions"
-api_key_env = "OPENAI_API_KEY"   # value can come from shell env or runtime.env_files
-model = "whisper-1"
-
-[transforms.visual_context]
-use = "auto"  # cached/fetched OpenRouter registry selects a free capable VLM when OPENROUTER_API_KEY exists
+[evidence]
+planner = "auto"
+vision = "auto"  # authenticated OpenRouter free/ZDR route when available
+ocr = "auto"
 # or choose a named vision instance:
 # use = "instance:my-vlm"
 
-[instances.vision.my-vlm]
-type = "openai-compatible-vision"
-base_url = "https://example.invalid/v1/chat/completions"
-api_key_env = "MY_VLM_API_KEY"
+[instances.ai.my-vlm]
+base_url = "https://example.invalid/v1"
+credential = "env:MY_VLM_API_KEY"
 model = "my-vision-model"
 
-[transforms.knowledge_flow]
-use = "auto"  # current text-model supplement path; deterministic extraction works without this
 ```
 
 Transform selector field `use` is the public model/tool selection surface. Runtime network/upload constraints come from execution context, not user config. Normal public config should choose exactly one selector value; separate `route`/`instance`/`model` transform fields are not part of the current config surface.
@@ -532,8 +548,7 @@ Transform selector field `use` is the public model/tool selection surface. Runti
 ```text
 auto                  -> let vctx choose the implemented default for that transform
 none                  -> disable that transform branch
-instance:<name>       -> select [instances.asr.<name>] or [instances.vision.<name>]
-openrouter:<model-id> -> remote OpenRouter model route, using OPENROUTER_API_KEY
+instance:<name>       -> select [instances.asr.<name>] or [instances.ai.<name>]
 path:<local-path>     -> local model/resource path; config-relative where supported
 local:<path-or-id>    -> local model id/path for local-capable transforms
 hf:<repo-id>          -> managed local cache route when a compatible runtime exists
@@ -553,22 +568,21 @@ Field semantics:
 | `output.formats` | Default render/artifact formats for `prepare`; the prepare CLI does not expose a `--format` flag. |
 | `output.retain_media` | Retain required URL/local media as manifest-listed pack artifacts; defaults to `true`. |
 | `transforms.asr.use` | ASR fallback selector: `auto`, `none`, `instance:<name>`, `local:<model-or-path>`, or `path:<local-path>`. Runs only if deterministic transcript acquisition fails and media is available. |
-| `transforms.ocr.use` | Local frame-OCR selector: `auto` uses available RapidOCR; `none` disables OCR without disabling visual capture or VLM description. |
-| `transforms.visual_context.use` | Visual-description selector: `auto`, `none`, `instance:<name>`, or `openrouter:<model-id>`. |
-| `instances.vision.<name>` | Named OpenAI-compatible VLM endpoint selected by `transforms.visual_context.use = "instance:<name>"`. |
-| `transforms.knowledge_flow.use` | Current text-model supplement selector. Deterministic knowledge-flow extraction does not need a model. |
-| `instances.asr.<name>.type` | ASR implementation type: `local-faster-whisper` or `openai-compatible-audio`. The `<name>` is arbitrary. |
+| `evidence.ocr` | Local frame-OCR selector: `auto` or `none`. |
+| `evidence.vision` | Visual-description selector: `auto`, `none`, or `instance:<name>`. |
+| `evidence.planner` | Language-neutral evidence-plan selector: `auto`, `none`, or `instance:<name>`. |
+| `instances.ai.<name>` | Provider-neutral OpenAI-compatible `/v1` root and model, reusable by text or image tasks. |
+| `instances.asr.<name>.type` | Local ASR implementation type: `local-faster-whisper`. The `<name>` is arbitrary. |
 | `instances.asr.<name>.model` | Model id such as `small`, or `path:<local-path>` for an immutable local CTranslate2 model. Omission selects multilingual `small`. |
 | `instances.asr.<name>.device` | `auto`, `cpu`, or `cuda`; auto may fall back once to CPU during initialization. |
 | `instances.asr.<name>.compute` | Faster-whisper compute type; defaults to `auto`. |
 | `instances.asr.<name>.cache` | `persistent` stores managed faster-whisper weights under `cache.model_dir`; `disabled` requires `path:<local-path>`. |
-| `instances.asr.<name>.api_key_env` | Environment variable containing an ASR credential. The config stores only the variable name. |
-| `instances.vision.<name>.type` | Vision implementation type. Current implemented value: `openai-compatible-vision`, using chat-completions style image messages. |
-| `instances.vision.<name>.base_url` | VLM chat-completions endpoint. |
-| `instances.vision.<name>.api_key_env` | Environment variable containing the VLM credential; values can come from shell env or `runtime.env_files`. |
-| `instances.vision.<name>.model` | VLM model id sent to the endpoint. |
+| `instances.ai.<name>.base_url` | OpenAI-compatible `/v1` root; vctx appends `/chat/completions`. Remote cleartext HTTP is rejected unless `insecure = true`. |
+| `instances.ai.<name>.credential` | Exactly `env:NAME` or `keyring:NAME`; remote instances require a locator and secrets are never persisted. Names carry no endpoint or policy semantics. |
+| `instances.ai.<name>.model` | Model id sent to the endpoint. |
+| `instances.ai.<name>.format` | `auto`, `schema`, `json`, or `prompt`; auto falls back only when the endpoint explicitly rejects a format. |
 
-Configured online ASR/VLM routes are selected only when a named online instance is selected, required credentials are present, and the manifest can record upload/cost evidence.
+Configured VLM routes are selected only when a named AI instance is selected, its credential is present, and the manifest can record upload/cost evidence. ASR execution is local-only.
 
 ### Auto-adaptive transformations
 
@@ -593,8 +607,8 @@ prepare INPUT...
        -> official/manual subtitles
        -> automatic subtitles
   -> if transcript unavailable and workflow allows transcript fallback:
-       -> select configured ASR instance
-       -> local/configured-online ASR
+       -> select prepared local faster-whisper instance
+       -> local ASR
        -> timestamped transcript
   -> deterministic transcript normalization
   -> if visual-context workflow enables visual context:
@@ -602,17 +616,16 @@ prepare INPUT...
        -> derive VisualOperationMotive values
        -> discover executable visual actions
        -> plan sample/OCR/describe/capture recipe
-       -> extract frame images with ffmpeg
+        -> extract display-corrected frame images with PyAV
        -> run local RapidOCR if planned and installed
        -> run configured/OpenRouter VLM descriptions if planned
-       -> write visual_records.json evidence + visual_scores.json diagnostics + frame artifacts
-  -> deterministic knowledge-flow extraction from transcript and kept visual evidence
-  -> optional text-model supplement when transforms.knowledge_flow selects an executable route
+       -> write evidence.json + frames/ artifacts
+  -> validate and merge language-neutral evidence-plan windows
   -> chunk/render/write artifacts
   -> manifest records every route and provider actually used
 ```
 
-The CLI should not expose raw provider menus for normal usage. Prefix-style `use` values such as `openrouter:<model-id>`, `local:<path>`, `hf:<repo-id>`, `instance:<name>`, `auto`, and `none` are decisive selector shapes where implemented: they infer route behavior instead of requiring separate transform route/model/instance fields. If two implementations can serve the same capability, `vctx` should choose the best project default and record the actual choice in `manifest.json`.
+The CLI does not expose raw provider menus for normal usage. Selector values such as `local:<path>`, `hf:<repo-id>`, `instance:<name>`, `auto`, and `none` infer route behavior without separate transform route/model fields. OpenRouter is only the authenticated free/ZDR auto recipe; other compatible providers use named AI instances. The manifest records the configured and actual model choice.
 
 ### `vctx metadata`
 
@@ -695,7 +708,7 @@ The report resolves the same user-facing policy as `prepare` and shows:
 - ASR, OCR, and vision selectors with readiness
 - `yt-dlp` import
 - source-cache presence without creating or writing it
-- current host `ffmpeg` availability while the frame adapter still requires it
+- installed distribution profile, including in-process PyAV visual readiness
 
 `doctor` is network-free. `--json` produces the same facts for automation and
 never includes credentials.

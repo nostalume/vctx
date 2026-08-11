@@ -19,7 +19,8 @@ cross-video memory, or web/desktop backend.
 - Optional local transforms: faster-whisper for ASR; RapidOCR plus ONNX Runtime
   for frame OCR. Optional OpenAI-compatible/OpenRouter routes provide text and
   vision transforms when explicitly configured.
-- Visual frame extraction currently uses the host `ffmpeg` executable.
+- Visual frame extraction uses PyAV 18 and Pillow in-process; no host media
+  executable is required.
 - Quality gate: Ruff, ty, pytest, behavior-suite LOC budget, then distribution build.
 
 ## Principles
@@ -30,11 +31,13 @@ cross-video memory, or web/desktop backend.
   transforms, never hidden assistant behavior.
 - Make every selected route, warning, effect, and artifact visible in
   `manifest.json`.
-- Keep provider payloads at adapters and use typed internal models across
-  boundaries.
-- Preserve dependency direction: `cli -> app -> source/transforms/render/io ->
-  models`; render does not acquire sources or call providers, and models do not
-  depend on higher layers.
-- The visual path is motive-led: acquire media only for transcript-anchored
-  visual evidence; store evidence in `visual_records.json` and satisfaction
-  diagnostics in `visual_scores.json`.
+- Keep deterministic selection separate from effects. Command-scoped runtimes
+  own HTTP lifetime; callers declare retry semantics and `net.py` executes them.
+- Keep provider payloads inside `ai.py`; credential locators, instance identity,
+  and request policy are independent typed values.
+- Preserve dependency direction: `cli -> app -> affiliated source/asr/visual
+  capabilities -> artifact/render/io`; render does not acquire sources or call
+  providers, and capability modules do not depend on app composers.
+- The visual path is plan-led: a language-neutral AI result may request only
+  transcript-anchored frames; code validates anchors and derives timestamps
+  before media acquisition.

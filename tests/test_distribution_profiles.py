@@ -19,8 +19,9 @@ def test_distribution_profiles_have_the_declared_capability_closure() -> None:
     assert set(extras) == {"asr", "visual", "full"}
     assert set(extras["asr"]) == {"faster-whisper>=1.2.1"}
     assert set(extras["visual"]) == {
-        "av>=17.1.0",
+        "av>=18.0.0",
         "onnxruntime>=1.20.0",
+        "pillow>=12.0.0",
         "rapidocr>=3.4.2",
     }
     assert set(extras["full"]) == set(extras["asr"]) | set(extras["visual"])

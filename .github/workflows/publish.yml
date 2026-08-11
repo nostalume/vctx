@@ -46,5 +46,29 @@ jobs:
       - name: Build distributions
         run: uv build
 
+      - name: Inspect and smoke built wheel
+        shell: bash
+        run: |
+          wheel=$(find dist -name '*.whl' -print -quit)
+          python -m zipfile -l "$wheel" > wheel-files.txt
+          if grep -E '(^|/)(tests|\.agents|scripts|\.github)/|models/|transforms/' wheel-files.txt; then
+            echo "development residue or obsolete owners found in wheel" >&2
+            exit 1
+          fi
+          uv run --isolated --no-project --with "$wheel" python -c "import vctx"
+          uv run --isolated --no-project --with "$wheel" vctx --help >/dev/null
+
+      - name: Run release-only network gates
+        shell: bash
+        run: |
+          wheel=$(find dist -name '*.whl' -print -quit)
+          cache="$RUNNER_TEMP/vctx-release-cache"
+          uv run --isolated --no-project --with "$wheel[asr]" vctx models pull asr --asr local:tiny --cache-dir "$cache"
+          uv run --isolated --no-project --with "$wheel[asr]" vctx models verify asr --asr local:tiny --cache-dir "$cache"
+          uv run --isolated --no-project --with "$wheel" vctx prepare \
+            https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes \
+            --out fixed-source --cache-dir "$cache"
+          uv run --isolated --no-project --with "$wheel" python -c "import json, pathlib; root=pathlib.Path('fixed-source'); manifest=json.loads((root/'manifest.json').read_text()); lane=root/manifest['sources'][0]['path']; required=('metadata.json','transcript.json','chunks.json','context.md','read.md'); assert all((lane/name).is_file() for name in required)"
+
       - name: Publish distributions to PyPI
         run: uv publish --trusted-publishing always
