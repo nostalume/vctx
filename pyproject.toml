@@ -1,6 +1,6 @@
 [project]
 name = "vctx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Video to context pack CLI for AI agents and automation."
 license = "MIT"
 authors = [
@@ -46,6 +46,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vctx"]
+
+[tool.hatch.build]
+exclude = [
+    "/.*",
+    "/.agents",
+    "/.github",
+    "/dist",
+    "/docs",
+    "/scripts",
+    "/tests",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
