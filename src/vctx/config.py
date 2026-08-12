@@ -1,25 +1,36 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
-from platformdirs import user_cache_path
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, model_validator
+from platformdirs import user_cache_path, user_config_path
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    TypeAdapter,
+    model_validator,
+)
 
-from vctx.render.bundle import DEFAULT_FORMATS, OutputFormat
+from vctx.ai import AiInstanceConfig
+from vctx.errors import ConfigError
+
+type Projection = Literal["context", "read"]
 
 
-class WorkflowProfile(StrEnum):
-    DEFAULT = "default"
+class PrepareTarget(StrEnum):
     TRANSCRIPT = "transcript"
-    VISUAL = "visual"
-    FULL = "full"
-    METADATA = "metadata"
+    EVIDENCE = "evidence"
+    SUMMARY = "summary"
 
 
-class MediaProfile(StrEnum):
+class MediaQuality(StrEnum):
+    AUTO = "auto"
     FAST = "fast"
     BALANCED = "balanced"
     HIGH = "high"
@@ -48,9 +59,7 @@ def _source_session(value: object) -> object:
         return BrowserSourceSession(browser=value.removeprefix("browser:"))
     if value.startswith("cookies-file:"):
         return CookieFileSourceSession(path=Path(value.removeprefix("cookies-file:")))
-    raise ValueError(
-        "source.yt_dlp.session must be none, browser:<name>, or cookies-file:<path>"
-    )
+    raise ValueError("source.yt_dlp.session must be none, browser:<name>, or cookies-file:<path>")
 
 
 SourceSession = Annotated[
@@ -118,25 +127,28 @@ class YtDlpSourceOptions(BaseModel):
     session: SourceSession = Field(default_factory=NoSourceSession)
     network: SourceNetwork = Field(default_factory=DirectSourceNetwork)
     playlist: PlaylistSelection = Field(default_factory=DefaultPlaylistSelection)
-    media_profile: MediaProfile = MediaProfile.BALANCED
     subtitle_languages: list[str] = Field(default_factory=list)
 
 
 class RuntimeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    workflow: WorkflowProfile | None = None
-    cache_dir: Path | None = None
-    keep_temp: bool = False
     offline: bool = False
     env_files: list[Path] = Field(default_factory=list)
+
+
+class CacheInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_dir: Path | None = None
+    model_dir: Path | None = None
 
 
 class SourceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
-
+    media_quality: MediaQuality = MediaQuality.AUTO
 
 class AutoUse(BaseModel):
     kind: Literal["auto"] = "auto"
@@ -166,11 +178,11 @@ def _transform_use(value: object) -> object:
     if value.startswith("instance:"):
         return InstanceUse(name=value.removeprefix("instance:"))
     prefix, separator, _rest = value.partition(":")
-    if separator and prefix in {"openrouter", "path", "local", "hf"}:
+    if separator and prefix in {"path", "local", "hf"}:
         return ModelRefUse(ref=value)
     raise ValueError(
-        "transform use must be auto, none, instance:<name>, openrouter:<model>, "
-        "path:<local-path>, local:<path-or-id>, or hf:<repo-id>"
+        "transform use must be auto, none, instance:<name>, path:<local-path>, "
+        "local:<path-or-id>, or hf:<repo-id>"
     )
 
 
@@ -180,36 +192,42 @@ TransformUse = Annotated[
     BeforeValidator(_transform_use),
 ]
 
-AsrInstanceType = Literal["local-faster-whisper", "openai-compatible-audio"]
+AsrInstanceType = Literal["local-faster-whisper"]
 InstanceCachePolicy = Literal["persistent", "disabled"]
 
 
 class PrepareRequest(BaseModel):
-    input: str
+    inputs: list[str] = Field(min_length=1)
     out_dir: Path
     overwrite: bool = False
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
     cache_dir: Path | None = None
-    keep_temp: bool | None = None
-    formats: set[OutputFormat] | None = None
-    workflow: WorkflowProfile | None = None
+    projections: set[Projection] | None = None
+    target: PrepareTarget = PrepareTarget.TRANSCRIPT
+    asr_use: TransformUse | str | None = None
+    ocr_use: TransformUse | str | None = None
+    vision_use: TransformUse | str | None = None
     offline: bool | None = None
     config_path: Path | None = None
     subtitle_languages: list[str] = Field(default_factory=list)
-    output_language: str | None = None
+    retain_media: bool | None = None
+    media_quality: MediaQuality | None = None
 
 
 class RuntimeConfig(BaseModel):
-    cache_dir: Path
-    keep_temp: bool
     offline: bool
-    workflow: WorkflowProfile
     env_files: list[Path] = Field(default_factory=list)
+
+
+class CacheConfig(BaseModel):
+    source_dir: Path
+    model_dir: Path
 
 
 class SourceConfig(BaseModel):
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
+    media_quality: MediaQuality
 
 
 class CapabilityPolicy(BaseModel):
@@ -246,43 +264,59 @@ class CapabilityInput(BaseModel):
     use: TransformUse = Field(default_factory=AutoUse)
 
 
+def _capability_input(value: object) -> object:
+    return {"use": value} if isinstance(value, str) else value
+
+
+CapabilitySelection = Annotated[CapabilityInput, BeforeValidator(_capability_input)]
+
+
 class TransformInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     asr: CapabilityInput = Field(default_factory=CapabilityInput)
-    visual_context: CapabilityInput = Field(default_factory=CapabilityInput)
-    knowledge_flow: CapabilityInput = Field(default_factory=CapabilityInput)
 
 
-class TransformConfig(BaseModel):
-    asr: CapabilityPolicy
-    visual_context: CapabilityPolicy
-    knowledge_flow: CapabilityPolicy
+class EvidenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    planner: CapabilitySelection = Field(default_factory=CapabilityInput)
+    vision: CapabilitySelection = Field(default_factory=CapabilityInput)
+    ocr: CapabilitySelection = Field(default_factory=CapabilityInput)
+
+
+class EvidenceConfig(BaseModel):
+    planner: CapabilityPolicy
+    vision: CapabilityPolicy
+    ocr: CapabilityPolicy
+
+
+class SummaryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use: TransformUse = Field(default_factory=AutoUse)
+    language: str = "native"
+
+
+class SummaryConfig(BaseModel):
+    policy: CapabilityPolicy
+    language: str
 
 
 class OutputConfig(BaseModel):
-    formats: set[OutputFormat]
+    projections: set[Projection]
     chunk_max_chars: int
     chunk_max_seconds: int | None
-    language: str = "native"
+    retain_media: bool = True
 
 
 class OutputInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    formats: set[OutputFormat] | None = None
+    projections: set[Projection] | None = None
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
-    language: str | None = None
-
-
-class VisionInstanceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: str
-    base_url: str | None = None
-    api_key_env: str | None = None
-    model: str | None = None
+    retain_media: StrictBool | None = None
 
 
 class AsrInstanceConfig(BaseModel):
@@ -290,25 +324,27 @@ class AsrInstanceConfig(BaseModel):
 
     type: AsrInstanceType
     model: str | None = None
-    model_policy: Literal["auto", "tiny", "base", "small", "medium", "large"] = "auto"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    compute: str = "auto"
     cache: InstanceCachePolicy = "persistent"
-    base_url: str | None = None
-    api_key_env: str | None = None
 
 
 class InstanceRegistry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     asr: dict[str, AsrInstanceConfig] = Field(default_factory=dict)
-    vision: dict[str, VisionInstanceConfig] = Field(default_factory=dict)
+    ai: dict[str, AiInstanceConfig] = Field(default_factory=dict)
 
 
 class ConfigInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime: RuntimeInput = Field(default_factory=RuntimeInput)
+    cache: CacheInput = Field(default_factory=CacheInput)
     source: SourceInput = Field(default_factory=SourceInput)
     transforms: TransformInput = Field(default_factory=TransformInput)
+    evidence: EvidenceInput = Field(default_factory=EvidenceInput)
+    summary: SummaryInput = Field(default_factory=SummaryInput)
     output: OutputInput = Field(default_factory=OutputInput)
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
 
@@ -325,34 +361,38 @@ class ConfigPathContext(BaseModel):
         return [self.resolve_config_path(value) for value in values]
 
 
+class ConfigFile(BaseModel):
+    origin: Literal["explicit", "workspace", "environment", "global", "none"] = "none"
+    path: Path | None = None
+
+
 class ResolvedConfig(BaseModel):
+    target: PrepareTarget
     runtime: RuntimeConfig
+    cache: CacheConfig
     source: SourceConfig
-    transforms: TransformConfig
+    asr: CapabilityPolicy
+    evidence: EvidenceConfig
+    summary: SummaryConfig
     output: OutputConfig
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
+    config_file: ConfigFile = Field(default_factory=ConfigFile)
 
 
-def _workflow_capabilities(
-    workflow: WorkflowProfile,
-) -> tuple[bool, bool, bool]:
-    if workflow == WorkflowProfile.METADATA:
-        return (False, False, False)
-    if workflow == WorkflowProfile.TRANSCRIPT:
-        return (True, False, False)
-    if workflow == WorkflowProfile.VISUAL:
-        return (True, True, False)
-    if workflow == WorkflowProfile.FULL:
-        return (True, True, True)
-    return (True, False, False)
+def _target_capabilities(target: PrepareTarget) -> tuple[bool, bool]:
+    evidence = target in {PrepareTarget.EVIDENCE, PrepareTarget.SUMMARY}
+    return evidence, target == PrepareTarget.SUMMARY
 
 
-def _read_config(path: Path | None) -> ConfigInput:
+def load_config(path: Path | None) -> ConfigInput:
     if path is None:
         return ConfigInput()
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return ConfigInput.model_validate(data)
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        return ConfigInput.model_validate(data)
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"invalid configuration: {exc}") from exc
 
 
 def _resolve_ytdlp_source_paths(
@@ -377,10 +417,7 @@ def _resolve_instance_registry(
             name: _resolve_asr_instance_paths(instance, paths)
             for name, instance in instances.asr.items()
         },
-        vision={
-            name: _resolve_vision_instance_paths(instance, paths)
-            for name, instance in instances.vision.items()
-        },
+        ai=instances.ai,
     )
 
 
@@ -393,67 +430,63 @@ def _resolve_asr_instance_paths(
     return instance.model_copy(update={"model": str(resolved_model)})
 
 
-def _resolve_vision_instance_paths(
-    instance: VisionInstanceConfig, paths: ConfigPathContext
-) -> VisionInstanceConfig:
-    if instance.model is None or not instance.model.startswith("path:"):
-        return instance
-    resolved_model = paths.resolve_config_path(Path(instance.model.removeprefix("path:")))
-    return instance.model_copy(update={"model": str(resolved_model)})
-
-
 def _validate_instance_refs(config: ConfigInput) -> None:
     if (
         isinstance(config.transforms.asr.use, InstanceUse)
         and config.transforms.asr.use.name not in config.instances.asr
     ):
         raise ValueError(
-            "transforms.asr.use references unknown ASR instance: "
-            f"{config.transforms.asr.use.name}"
+            f"transforms.asr.use references unknown ASR instance: {config.transforms.asr.use.name}"
         )
     if (
-        isinstance(config.transforms.visual_context.use, InstanceUse)
-        and config.transforms.visual_context.use.name not in config.instances.vision
+        isinstance(config.evidence.vision.use, InstanceUse)
+        and config.evidence.vision.use.name not in config.instances.ai
     ):
         raise ValueError(
-            "transforms.visual_context.use references unknown vision instance: "
-            f"{config.transforms.visual_context.use.name}"
+            f"evidence.vision references unknown AI instance: {config.evidence.vision.use.name}"
         )
+    if (
+        isinstance(config.evidence.planner.use, InstanceUse)
+        and config.evidence.planner.use.name not in config.instances.ai
+    ):
+        raise ValueError(
+            f"evidence.planner references unknown AI instance: {config.evidence.planner.use.name}"
+        )
+    if isinstance(config.summary.use, InstanceUse):
+        name = config.summary.use.name
+        if name not in config.instances.ai:
+            raise ValueError(f"summary.use references unknown AI instance: {name}")
 
 
 def _validate_instance_compatibility(
-    transforms: TransformConfig, instances: InstanceRegistry
+    evidence: EvidenceConfig, summary: SummaryConfig, instances: InstanceRegistry
 ) -> None:
-    if isinstance(transforms.asr.use, InstanceUse) and transforms.asr.enabled:
-        _validate_asr_instance_compatibility(
-            instances.asr[transforms.asr.use.name],
-        )
-    if isinstance(transforms.visual_context.use, InstanceUse) and transforms.visual_context.enabled:
-        _validate_vision_instance_compatibility(
-            instances.vision[transforms.visual_context.use.name],
-        )
+    for policy in (evidence.vision, evidence.planner, summary.policy):
+        if isinstance(policy.use, InstanceUse) and policy.enabled:
+            instances.ai[policy.use.name].admit(policy.use.name)
 
 
-def _validate_asr_instance_compatibility(instance: AsrInstanceConfig) -> None:
-    if instance.type == "openai-compatible-audio" and (
-        instance.base_url is None or instance.api_key_env is None or instance.model is None
-    ):
-        raise ValueError(
-            "openai-compatible-audio ASR instance requires base_url, api_key_env, and model"
-        )
-
-
-def _validate_vision_instance_compatibility(instance: VisionInstanceConfig) -> None:
-    if instance.type != "openai-compatible-vision":
-        raise ValueError("vision instance requires type openai-compatible-vision")
-    if instance.base_url is None or instance.api_key_env is None or instance.model is None:
-        raise ValueError(
-            "openai-compatible-vision instance requires base_url, api_key_env, and model"
-        )
-
-
-def _default_cache_dir() -> Path:
+def default_cache_dir() -> Path:
     return user_cache_path("vctx", appauthor=False)
+
+
+def select_config_file(explicit: Path | None) -> ConfigFile:
+    if explicit is not None:
+        return ConfigFile(origin="explicit", path=_absolute(explicit))
+    candidate = Path.cwd() / "vctx.toml"
+    if candidate.is_file():
+        return ConfigFile(origin="workspace", path=candidate)
+    value = os.environ.get("VCTX_CONFIG")
+    if value:
+        return ConfigFile(origin="environment", path=_absolute(Path(value)))
+    global_path = user_config_path("vctx", appauthor=False) / "config.toml"
+    if global_path.is_file():
+        return ConfigFile(origin="global", path=global_path)
+    return ConfigFile()
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(path))
 
 
 def _coalesce[T](*values: T | None, default: T) -> T:
@@ -463,51 +496,86 @@ def _coalesce[T](*values: T | None, default: T) -> T:
     return default
 
 
-
 def _resolve_policy(
     raw: CapabilityInput,
     enabled: bool,
 ) -> CapabilityPolicy:
+    if not enabled:
+        return CapabilityPolicy(enabled=False)
     if raw.enabled is not None:
         enabled = raw.enabled
     elif "use" in raw.model_fields_set and not isinstance(raw.use, AutoUse):
-        enabled = True
+        enabled = not isinstance(raw.use, DisabledUse)
     return CapabilityPolicy(enabled=enabled, use=raw.use)
 
 
-def resolve_config(request: PrepareRequest) -> ResolvedConfig:
+def _resolve_use(use: TransformUse, enabled: bool) -> CapabilityPolicy:
+    return CapabilityPolicy(
+        enabled=enabled and not isinstance(use, DisabledUse),
+        use=use,
+    )
+
+
+def _request_policy(raw: CapabilityInput, use: TransformUse | str | None) -> CapabilityInput:
+    if use is None:
+        return raw
+    if isinstance(use, str):
+        use = TypeAdapter(TransformUse).validate_python(use)
+    return raw.model_copy(
+        update={
+            "enabled": not isinstance(use, DisabledUse),
+            "use": use,
+        }
+    )
+
+
+def resolve_config(
+    request: PrepareRequest,
+    config: ConfigInput,
+    *,
+    default_cache_root: Path,
+) -> ResolvedConfig:
     """Resolve user request/config omissions into concrete default/auto policy."""
 
-    config = _read_config(request.config_path)
-    _validate_instance_refs(config)
+    try:
+        _validate_instance_refs(config)
+        return _resolve_config(request, config, default_cache_root=default_cache_root)
+    except ValueError as exc:
+        raise ConfigError(f"invalid configuration: {exc}") from exc
+
+
+def _resolve_config(
+    request: PrepareRequest,
+    config: ConfigInput,
+    *,
+    default_cache_root: Path,
+) -> ResolvedConfig:
     path_context = ConfigPathContext(
         base_dir=request.config_path.parent if request.config_path is not None else None
     )
 
-    workflow = _coalesce(
-        request.workflow,
-        config.runtime.workflow,
-        default=WorkflowProfile.DEFAULT,
-    )
+    target = request.target
     offline = _coalesce(request.offline, config.runtime.offline, default=False)
-    keep_temp = _coalesce(request.keep_temp, config.runtime.keep_temp, default=False)
-    asr, visual_context, knowledge_flow = _workflow_capabilities(workflow)
+    evidence_enabled, summary_enabled = _target_capabilities(target)
 
-    cache_dir = _coalesce(
-        request.cache_dir,
-        (
-            path_context.resolve_config_path(config.runtime.cache_dir)
-            if config.runtime.cache_dir is not None
-            else None
-        ),
-        default=_default_cache_dir(),
+    cache_root = (
+        _absolute(request.cache_dir) if request.cache_dir is not None else default_cache_root
+    )
+    source_dir = (
+        cache_root / "source"
+        if request.cache_dir is not None or config.cache.source_dir is None
+        else path_context.resolve_config_path(config.cache.source_dir)
+    )
+    model_dir = (
+        cache_root / "models"
+        if request.cache_dir is not None or config.cache.model_dir is None
+        else path_context.resolve_config_path(config.cache.model_dir)
     )
 
-    formats = _coalesce(request.formats, config.output.formats, default=DEFAULT_FORMATS)
-    language = _coalesce(
-        request.output_language,
-        config.output.language,
-        default="native",
+    projections = _coalesce(
+        request.projections,
+        config.output.projections,
+        default=cast(set[Projection], {"context", "read"}),
     )
 
     ytdlp_source = _resolve_ytdlp_source_paths(config.source.yt_dlp, path_context)
@@ -516,26 +584,41 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
             update={"subtitle_languages": request.subtitle_languages}
         )
 
-    transforms = TransformConfig(
-        asr=_resolve_policy(config.transforms.asr, asr),
-        visual_context=_resolve_policy(config.transforms.visual_context, visual_context),
-        knowledge_flow=_resolve_policy(config.transforms.knowledge_flow, knowledge_flow),
+    asr = _resolve_policy(_request_policy(config.transforms.asr, request.asr_use), True)
+    evidence = EvidenceConfig(
+        ocr=_resolve_policy(
+            _request_policy(config.evidence.ocr, request.ocr_use),
+            evidence_enabled,
+        ),
+        vision=_resolve_policy(
+            _request_policy(config.evidence.vision, request.vision_use),
+            evidence_enabled,
+        ),
+        planner=_resolve_policy(config.evidence.planner, evidence_enabled),
+    )
+    summary = SummaryConfig(
+        policy=_resolve_use(config.summary.use, summary_enabled),
+        language=config.summary.language,
     )
     instances = _resolve_instance_registry(config.instances, path_context)
-    _validate_instance_compatibility(transforms, instances)
+    _validate_instance_compatibility(evidence, summary, instances)
 
     return ResolvedConfig(
+        target=target,
         runtime=RuntimeConfig(
-            cache_dir=cache_dir,
-            keep_temp=keep_temp,
             offline=offline,
-            workflow=workflow,
             env_files=path_context.resolve_config_paths(config.runtime.env_files),
         ),
-        source=SourceConfig(yt_dlp=ytdlp_source),
-        transforms=transforms,
+        cache=CacheConfig(source_dir=source_dir, model_dir=model_dir),
+        source=SourceConfig(
+            yt_dlp=ytdlp_source,
+            media_quality=request.media_quality or config.source.media_quality,
+        ),
+        asr=asr,
+        evidence=evidence,
+        summary=summary,
         output=OutputConfig(
-            formats=formats,
+            projections=projections,
             chunk_max_chars=_coalesce(
                 request.chunk_max_chars,
                 config.output.chunk_max_chars,
@@ -546,7 +629,22 @@ def resolve_config(request: PrepareRequest) -> ResolvedConfig:
                 config.output.chunk_max_seconds,
                 default=None,
             ),
-            language=language,
+            retain_media=_coalesce(
+                request.retain_media,
+                config.output.retain_media,
+                default=True,
+            ),
         ),
         instances=instances,
     )
+
+
+def load_resolved_config(request: PrepareRequest) -> ResolvedConfig:
+    selected = select_config_file(request.config_path)
+    selected_request = request.model_copy(update={"config_path": selected.path})
+    resolved = resolve_config(
+        selected_request,
+        load_config(selected.path),
+        default_cache_root=default_cache_dir(),
+    )
+    return resolved.model_copy(update={"config_file": selected})

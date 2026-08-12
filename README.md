@@ -1,163 +1,69 @@
 # vctx
 
-`vctx` prepares clean context packs from video URLs, local media, and transcript files.
-
-It is for people and agents who want source-grounded video context without a chat app, RAG stack, or hidden model workflow.
+`vctx` is a CLI-first context compiler. It turns video URLs, local media, and
+subtitle files into inspectable context packs for people and downstream agents.
+It is not a chat app, RAG system, or hidden model workflow.
 
 ## Install
 
-From PyPI with uv:
-
-```bash
+```console
 uv tool install "vctx[full]"
 ```
 
-`[full]` is the recommended install for normal users; it includes local ASR and visual/OCR extras. Smaller installs are available when you only need part of the stack:
+Smaller profiles are available:
 
-```bash
-uv tool install vctx            # minimal transcript/URL workflows
-uv tool install "vctx[asr]"     # minimal + local faster-whisper ASR
-uv tool install "vctx[visual]"  # minimal + local OCR/visual extras
+```console
+uv tool install vctx
+uv tool install "vctx[asr]"
+uv tool install "vctx[visual]"
 ```
 
-Then run:
+Visual processing uses PyAV in-process; no host FFmpeg executable is required.
 
-```bash
-vctx prepare INPUT --out DIR
+## First run
+
+```console
+vctx models pull asr ocr
+vctx prepare ./captions.srt --out ./pack
+vctx verify ./pack
+vctx render ./pack --format read
 ```
 
-For one-off use without installing the tool globally:
+Prepare stops at transcripts by default. Request later products explicitly:
 
-```bash
-uvx vctx prepare INPUT --out DIR
-uvx --from "vctx[full]" vctx prepare INPUT --out DIR
+```console
+vctx prepare VIDEO --out ./pack --to evidence
+vctx prepare VIDEO --out ./pack --to summary
 ```
 
-## Install for development
+Start with `pack/manifest.json`. Each input has one independent source lane with
+canonical JSON, readable projections, retained source material, and any captured
+frames. Preparing into a verified pack reuses matching work; `--overwrite`
+explicitly rebuilds requested lanes.
 
-```bash
-uv sync
+## Configuration
+
+Copy [examples/vctx.toml](examples/vctx.toml), or configure a named compatible
+AI endpoint with [examples/openai-compatible.toml](examples/openai-compatible.toml).
+
+```console
+vctx doctor --json
+vctx prompt
 ```
 
-Optional local media/model extras:
+Config selection is `--config`, then `./vctx.toml`, `VCTX_CONFIG`, the platform
+global config, then built-ins. See [docs/api.md](docs/api.md) for the complete CLI,
+configuration, path-resolution, cache, and artifact contracts.
 
-```bash
-uv sync --extra asr
-uv sync --extra visual
+## Development
+
+```console
 uv sync --extra full
+uv run ruff check .
+uv run ty check
+uv run pytest
 ```
-
-## Essential API
-
-### Prepare a context pack
-
-```bash
-uv run vctx prepare INPUT --out DIR
-```
-
-Examples:
-
-```bash
-uv run vctx prepare ./captions.srt --out ./out/captions
-uv run vctx prepare ./lecture.vtt --out ./out/lecture
-uv run vctx prepare "https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes" --workflow visual --out ./out/ted
-```
-
-### Useful options
-
-```text
---workflow default|transcript|visual|full|metadata
---config PATH
---offline
---overwrite
---chunk-max-chars INT
---chunk-max-seconds INT
---cache-dir PATH
---verbose
---debug
-```
-
-### Inspect output
-
-Start with:
-
-```text
-DIR/manifest.json
-DIR/readable.md
-DIR/context.md
-```
-
-Core artifacts:
-
-```text
-metadata.json
-transcript.raw.json
-transcript.clean.json
-chunks.json
-transcript.md
-```
-
-Optional visual artifacts:
-
-```text
-visual_records.json   OCR/VLM/capture evidence
-visual_scores.json    visual satisfaction diagnostics
-visual/frames/*.png   captured frames
-```
-
-Optional flow artifact:
-
-```text
-knowledge_flow.json
-```
-
-## Visual workflow
-
-Visual runs use transcript-anchored motives. They fetch video only when useful visual evidence is planned.
-
-```text
-transcript cues
-  -> visual motives
-  -> frame sampling
-  -> OCR and/or VLM description when available
-  -> capture records
-  -> visual_records.json + visual_scores.json
-```
-
-Use `OPENROUTER_API_KEY` only when selecting OpenRouter-backed VLM/text routes. Secrets are read from environment or configured `.env` files and are not written to artifacts.
-
-### Minimal config selector examples
-
-```toml
-[transforms.asr]
-use = "instance:local-default"
-
-[instances.asr.local-default]
-type = "local-faster-whisper"
-model_policy = "auto"
-
-[transforms.visual_context]
-use = "auto"  # or "instance:my-vlm" / "openrouter:<model-id>"
-```
-
-Transform config uses one selector field, `use`. Do not combine old-style `route`, `instance`, and `model` fields; named providers live under `[instances.asr.*]` and `[instances.vision.*]`.
-
-## What vctx is not
-
-- not an AI chat app
-- not a video Q&A system
-- not a knowledge base
-- not a vector/RAG framework
-- not a web backend
-- not a hidden paid model caller
-
-## Developer docs
-
-- [`docs/api.md`](docs/api.md) — CLI/config/artifacts.
-- [`docs/architecture.md`](docs/architecture.md) — boundaries.
-- [`docs/graph/README.md`](docs/graph/README.md) — module/API graphs.
-- [`docs/development.md`](docs/development.md) — develop/test/integration workflow.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [LICENSE](LICENSE).
