@@ -40,7 +40,7 @@ def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_r
         source_id="example__lecture",
         revision=Revision(kind="observed", value="revision"),
         observed_at=datetime(2026, 1, 1, tzinfo=UTC),
-        metadata=VideoMetadata(id="example__lecture", source_type="url", source=source),
+        metadata=VideoMetadata(id="example__lecture", source=source),
         has_media=True,
     )
     captured: list[YtDlpParams] = []
@@ -66,7 +66,7 @@ def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_r
                 "requested_downloads": [{"filepath": str(path)}],
             }
 
-    monkeypatch.setattr(ytdlp_module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(ytdlp_module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)
     monkeypatch.setattr(
         ytdlp_module.shutil,
         "disk_usage",

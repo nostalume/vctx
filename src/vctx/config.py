@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import os
 import tomllib
-from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
-from platformdirs import user_cache_path
+from platformdirs import user_cache_path, user_config_path
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -19,15 +19,14 @@ from pydantic import (
 
 from vctx.ai import AiInstanceConfig
 from vctx.errors import ConfigError
-from vctx.render.bundle import DEFAULT_FORMATS, OutputFormat
+
+type Projection = Literal["context", "read"]
 
 
-class WorkflowProfile(StrEnum):
-    DEFAULT = "default"
+class PrepareTarget(StrEnum):
     TRANSCRIPT = "transcript"
-    VISUAL = "visual"
-    FULL = "full"
-    METADATA = "metadata"
+    EVIDENCE = "evidence"
+    SUMMARY = "summary"
 
 
 class MediaQuality(StrEnum):
@@ -134,17 +133,8 @@ class YtDlpSourceOptions(BaseModel):
 class RuntimeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    workflow: WorkflowProfile | None = None
-    keep_temp: bool = False
     offline: bool = False
     env_files: list[Path] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_old_cache(cls, value: object) -> object:
-        if isinstance(value, dict) and "cache_dir" in value:
-            raise ValueError("runtime.cache_dir was removed; use [cache].source_dir and model_dir")
-        return value
 
 
 class CacheInput(BaseModel):
@@ -159,16 +149,6 @@ class SourceInput(BaseModel):
 
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
     media_quality: MediaQuality = MediaQuality.AUTO
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_old_media_profile(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            yt_dlp = cast(Mapping[str, object], value).get("yt_dlp")
-            if isinstance(yt_dlp, Mapping) and "media_profile" in yt_dlp:
-                raise ValueError("source.yt_dlp.media_profile: use source.media_quality")
-        return value
-
 
 class AutoUse(BaseModel):
     kind: Literal["auto"] = "auto"
@@ -223,24 +203,20 @@ class PrepareRequest(BaseModel):
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
     cache_dir: Path | None = None
-    keep_temp: bool | None = None
-    formats: set[OutputFormat] | None = None
-    workflow: WorkflowProfile | None = None
+    projections: set[Projection] | None = None
+    target: PrepareTarget = PrepareTarget.TRANSCRIPT
     asr_use: TransformUse | str | None = None
     ocr_use: TransformUse | str | None = None
     vision_use: TransformUse | str | None = None
     offline: bool | None = None
     config_path: Path | None = None
     subtitle_languages: list[str] = Field(default_factory=list)
-    output_language: str | None = None
     retain_media: bool | None = None
     media_quality: MediaQuality | None = None
 
 
 class RuntimeConfig(BaseModel):
-    keep_temp: bool
     offline: bool
-    workflow: WorkflowProfile
     env_files: list[Path] = Field(default_factory=list)
 
 
@@ -301,10 +277,6 @@ class TransformInput(BaseModel):
     asr: CapabilityInput = Field(default_factory=CapabilityInput)
 
 
-class TransformConfig(BaseModel):
-    asr: CapabilityPolicy
-
-
 class EvidenceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -319,21 +291,31 @@ class EvidenceConfig(BaseModel):
     ocr: CapabilityPolicy
 
 
+class SummaryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use: TransformUse = Field(default_factory=AutoUse)
+    language: str = "native"
+
+
+class SummaryConfig(BaseModel):
+    policy: CapabilityPolicy
+    language: str
+
+
 class OutputConfig(BaseModel):
-    formats: set[OutputFormat]
+    projections: set[Projection]
     chunk_max_chars: int
     chunk_max_seconds: int | None
-    language: str = "native"
     retain_media: bool = True
 
 
 class OutputInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    formats: set[OutputFormat] | None = None
+    projections: set[Projection] | None = None
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
-    language: str | None = None
     retain_media: StrictBool | None = None
 
 
@@ -362,6 +344,7 @@ class ConfigInput(BaseModel):
     source: SourceInput = Field(default_factory=SourceInput)
     transforms: TransformInput = Field(default_factory=TransformInput)
     evidence: EvidenceInput = Field(default_factory=EvidenceInput)
+    summary: SummaryInput = Field(default_factory=SummaryInput)
     output: OutputInput = Field(default_factory=OutputInput)
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
 
@@ -378,28 +361,27 @@ class ConfigPathContext(BaseModel):
         return [self.resolve_config_path(value) for value in values]
 
 
+class ConfigFile(BaseModel):
+    origin: Literal["explicit", "workspace", "environment", "global", "none"] = "none"
+    path: Path | None = None
+
+
 class ResolvedConfig(BaseModel):
+    target: PrepareTarget
     runtime: RuntimeConfig
     cache: CacheConfig
     source: SourceConfig
-    transforms: TransformConfig
+    asr: CapabilityPolicy
     evidence: EvidenceConfig
+    summary: SummaryConfig
     output: OutputConfig
     instances: InstanceRegistry = Field(default_factory=InstanceRegistry)
+    config_file: ConfigFile = Field(default_factory=ConfigFile)
 
 
-def _workflow_capabilities(
-    workflow: WorkflowProfile,
-) -> tuple[bool, bool, bool]:
-    if workflow == WorkflowProfile.METADATA:
-        return (False, False, False)
-    if workflow == WorkflowProfile.TRANSCRIPT:
-        return (True, False, False)
-    if workflow == WorkflowProfile.VISUAL:
-        return (True, True, True)
-    if workflow == WorkflowProfile.FULL:
-        return (True, True, True)
-    return (True, False, False)
+def _target_capabilities(target: PrepareTarget) -> tuple[bool, bool]:
+    evidence = target in {PrepareTarget.EVIDENCE, PrepareTarget.SUMMARY}
+    return evidence, target == PrepareTarget.SUMMARY
 
 
 def load_config(path: Path | None) -> ConfigInput:
@@ -470,16 +452,41 @@ def _validate_instance_refs(config: ConfigInput) -> None:
         raise ValueError(
             f"evidence.planner references unknown AI instance: {config.evidence.planner.use.name}"
         )
+    if isinstance(config.summary.use, InstanceUse):
+        name = config.summary.use.name
+        if name not in config.instances.ai:
+            raise ValueError(f"summary.use references unknown AI instance: {name}")
 
 
-def _validate_instance_compatibility(evidence: EvidenceConfig, instances: InstanceRegistry) -> None:
-    for policy in (evidence.vision, evidence.planner):
+def _validate_instance_compatibility(
+    evidence: EvidenceConfig, summary: SummaryConfig, instances: InstanceRegistry
+) -> None:
+    for policy in (evidence.vision, evidence.planner, summary.policy):
         if isinstance(policy.use, InstanceUse) and policy.enabled:
             instances.ai[policy.use.name].admit(policy.use.name)
 
 
 def default_cache_dir() -> Path:
     return user_cache_path("vctx", appauthor=False)
+
+
+def select_config_file(explicit: Path | None) -> ConfigFile:
+    if explicit is not None:
+        return ConfigFile(origin="explicit", path=_absolute(explicit))
+    candidate = Path.cwd() / "vctx.toml"
+    if candidate.is_file():
+        return ConfigFile(origin="workspace", path=candidate)
+    value = os.environ.get("VCTX_CONFIG")
+    if value:
+        return ConfigFile(origin="environment", path=_absolute(Path(value)))
+    global_path = user_config_path("vctx", appauthor=False) / "config.toml"
+    if global_path.is_file():
+        return ConfigFile(origin="global", path=global_path)
+    return ConfigFile()
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(path))
 
 
 def _coalesce[T](*values: T | None, default: T) -> T:
@@ -493,11 +500,20 @@ def _resolve_policy(
     raw: CapabilityInput,
     enabled: bool,
 ) -> CapabilityPolicy:
+    if not enabled:
+        return CapabilityPolicy(enabled=False)
     if raw.enabled is not None:
         enabled = raw.enabled
     elif "use" in raw.model_fields_set and not isinstance(raw.use, AutoUse):
-        enabled = True
+        enabled = not isinstance(raw.use, DisabledUse)
     return CapabilityPolicy(enabled=enabled, use=raw.use)
+
+
+def _resolve_use(use: TransformUse, enabled: bool) -> CapabilityPolicy:
+    return CapabilityPolicy(
+        enabled=enabled and not isinstance(use, DisabledUse),
+        use=use,
+    )
 
 
 def _request_policy(raw: CapabilityInput, use: TransformUse | str | None) -> CapabilityInput:
@@ -538,16 +554,13 @@ def _resolve_config(
         base_dir=request.config_path.parent if request.config_path is not None else None
     )
 
-    workflow = _coalesce(
-        request.workflow,
-        config.runtime.workflow,
-        default=WorkflowProfile.DEFAULT,
-    )
+    target = request.target
     offline = _coalesce(request.offline, config.runtime.offline, default=False)
-    keep_temp = _coalesce(request.keep_temp, config.runtime.keep_temp, default=False)
-    asr, visual_enabled, planner_enabled = _workflow_capabilities(workflow)
+    evidence_enabled, summary_enabled = _target_capabilities(target)
 
-    cache_root = request.cache_dir or default_cache_root
+    cache_root = (
+        _absolute(request.cache_dir) if request.cache_dir is not None else default_cache_root
+    )
     source_dir = (
         cache_root / "source"
         if request.cache_dir is not None or config.cache.source_dir is None
@@ -559,11 +572,10 @@ def _resolve_config(
         else path_context.resolve_config_path(config.cache.model_dir)
     )
 
-    formats = _coalesce(request.formats, config.output.formats, default=DEFAULT_FORMATS)
-    language = _coalesce(
-        request.output_language,
-        config.output.language,
-        default="native",
+    projections = _coalesce(
+        request.projections,
+        config.output.projections,
+        default=cast(set[Projection], {"context", "read"}),
     )
 
     ytdlp_source = _resolve_ytdlp_source_paths(config.source.yt_dlp, path_context)
@@ -572,28 +584,29 @@ def _resolve_config(
             update={"subtitle_languages": request.subtitle_languages}
         )
 
-    transforms = TransformConfig(
-        asr=_resolve_policy(_request_policy(config.transforms.asr, request.asr_use), asr),
-    )
+    asr = _resolve_policy(_request_policy(config.transforms.asr, request.asr_use), True)
     evidence = EvidenceConfig(
         ocr=_resolve_policy(
             _request_policy(config.evidence.ocr, request.ocr_use),
-            visual_enabled,
+            evidence_enabled,
         ),
         vision=_resolve_policy(
             _request_policy(config.evidence.vision, request.vision_use),
-            visual_enabled,
+            evidence_enabled,
         ),
-        planner=_resolve_policy(config.evidence.planner, planner_enabled),
+        planner=_resolve_policy(config.evidence.planner, evidence_enabled),
+    )
+    summary = SummaryConfig(
+        policy=_resolve_use(config.summary.use, summary_enabled),
+        language=config.summary.language,
     )
     instances = _resolve_instance_registry(config.instances, path_context)
-    _validate_instance_compatibility(evidence, instances)
+    _validate_instance_compatibility(evidence, summary, instances)
 
     return ResolvedConfig(
+        target=target,
         runtime=RuntimeConfig(
-            keep_temp=keep_temp,
             offline=offline,
-            workflow=workflow,
             env_files=path_context.resolve_config_paths(config.runtime.env_files),
         ),
         cache=CacheConfig(source_dir=source_dir, model_dir=model_dir),
@@ -601,10 +614,11 @@ def _resolve_config(
             yt_dlp=ytdlp_source,
             media_quality=request.media_quality or config.source.media_quality,
         ),
-        transforms=transforms,
+        asr=asr,
         evidence=evidence,
+        summary=summary,
         output=OutputConfig(
-            formats=formats,
+            projections=projections,
             chunk_max_chars=_coalesce(
                 request.chunk_max_chars,
                 config.output.chunk_max_chars,
@@ -615,7 +629,6 @@ def _resolve_config(
                 config.output.chunk_max_seconds,
                 default=None,
             ),
-            language=language,
             retain_media=_coalesce(
                 request.retain_media,
                 config.output.retain_media,
@@ -627,8 +640,11 @@ def _resolve_config(
 
 
 def load_resolved_config(request: PrepareRequest) -> ResolvedConfig:
-    return resolve_config(
-        request,
-        load_config(request.config_path),
+    selected = select_config_file(request.config_path)
+    selected_request = request.model_copy(update={"config_path": selected.path})
+    resolved = resolve_config(
+        selected_request,
+        load_config(selected.path),
         default_cache_root=default_cache_dir(),
     )
+    return resolved.model_copy(update={"config_file": selected})

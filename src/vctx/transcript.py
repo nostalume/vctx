@@ -5,8 +5,6 @@ import re
 from collections.abc import Sequence
 from typing import Annotated, Literal
 
-import srt
-import webvtt
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vctx.errors import EmptyChunksError, InvalidTranscriptError
@@ -100,7 +98,7 @@ class TranscriptProvenance(BaseModel):
 
 
 class Transcript(BaseModel):
-    video_id: str
+    source_id: str
     provenance: TranscriptProvenance
     segments: list[TranscriptSegment]
 
@@ -160,7 +158,7 @@ class TranscriptChunk(BaseModel):
 
 
 class ChunkSet(BaseModel):
-    video_id: str
+    source_id: str
     strategy: str
     chunks: list[TranscriptChunk]
 
@@ -203,8 +201,10 @@ def normalize_transcript(raw: Transcript) -> Transcript:
     return raw.model_copy(update={"segments": reassign_segment_ids(cleaned)})
 
 
-def parse_transcript_payload(payload: TranscriptPayload, *, video_id: str) -> Transcript:
+def parse_transcript_payload(payload: TranscriptPayload, *, source_id: str) -> Transcript:
     if payload.format == "srt":
+        import srt
+
         items = srt.parse(payload.text)
         segments = [
             TranscriptSegment(
@@ -217,6 +217,8 @@ def parse_transcript_payload(payload: TranscriptPayload, *, video_id: str) -> Tr
             for index, item in enumerate(items, start=1)
         ]
     elif payload.format == "vtt":
+        import webvtt
+
         captions = webvtt.from_buffer(io.StringIO(payload.text)).captions
         segments = [
             TranscriptSegment(
@@ -230,7 +232,7 @@ def parse_transcript_payload(payload: TranscriptPayload, *, video_id: str) -> Tr
         ]
     else:
         raise InvalidTranscriptError(f"unsupported transcript format: {payload.format}")
-    return Transcript(video_id=video_id, provenance=payload.provenance, segments=segments)
+    return Transcript(source_id=source_id, provenance=payload.provenance, segments=segments)
 
 
 def chunk_transcript(transcript: Transcript, options: ChunkOptions) -> ChunkSet:
@@ -244,8 +246,8 @@ def chunk_transcript(transcript: Transcript, options: ChunkOptions) -> ChunkSet:
     if pending:
         chunks.append(_build_chunk(len(chunks) + 1, pending))
     if not chunks:
-        raise EmptyChunksError(f"chunking produced no chunks for {transcript.video_id}")
-    return ChunkSet(video_id=transcript.video_id, strategy="chars-v1", chunks=chunks)
+        raise EmptyChunksError(f"chunking produced no chunks for {transcript.source_id}")
+    return ChunkSet(source_id=transcript.source_id, strategy="chars-v1", chunks=chunks)
 
 
 def _timestamp_to_seconds(value: str) -> float:

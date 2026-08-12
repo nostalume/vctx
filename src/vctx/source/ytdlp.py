@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import shutil
 from collections.abc import Mapping
@@ -8,10 +9,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, TypeAlias, cast
+from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
-import yt_dlp
 from pydantic import BaseModel
 
 from vctx.config import (
@@ -150,6 +150,7 @@ class YtDlpSession:
             self.receipts.append(_media_receipt(request, status="failed"))
             raise
         params = _download_params(planned, self.options)
+        yt_dlp = _yt_dlp()
         try:
             with yt_dlp.YoutubeDL(params) as ydl:
                 raw_info = ydl.process_ie_result(deepcopy(self.info), download=True)
@@ -197,6 +198,7 @@ class YtDlpSourceAdapter:
             raise OfflineSourceError(
                 "offline URL cache miss: no verified source cache is available"
             )
+        yt_dlp = _yt_dlp()
         try:
             info = _extract_info(value, options)
         except yt_dlp.utils.DownloadError as exc:
@@ -384,9 +386,13 @@ def _extract_info(value: str, options: YtDlpSourceOptions) -> YtDlpInfo:
         "socket_timeout": 30,
     }
     _apply_source_options(params, options)
-    with yt_dlp.YoutubeDL(params) as ydl:
+    with _yt_dlp().YoutubeDL(params) as ydl:
         raw_info = ydl.extract_info(value, download=False)
     return _info_dict(raw_info)
+
+
+def _yt_dlp() -> Any:
+    return importlib.import_module("yt_dlp")
 
 
 def _source_record(locator: str, info: YtDlpInfo) -> SourceRecord:
@@ -397,12 +403,10 @@ def _source_record(locator: str, info: YtDlpInfo) -> SourceRecord:
     )
     metadata = VideoMetadata(
         id=source_id,
-        source_type="url",
         source=SourceRef(kind="url", value=canonical),
         title=_as_optional_str(info.get("title")),
         uploader=_as_optional_str(info.get("uploader")),
         duration_seconds=_as_optional_float(info.get("duration")),
-        webpage_url=canonical,
         language=_as_optional_str(info.get("language")),
         extractor=extractor,
         raw_provider="yt-dlp",
@@ -474,8 +478,8 @@ def _info_dict(raw_info: YtDlpValue) -> YtDlpInfo:
 
 def _media_id(info: Mapping[str, YtDlpValue]) -> str:
     extractor = _as_optional_str(info.get("extractor"))
-    video_id = _as_optional_str(info.get("id")) or "unknown"
-    return f"{extractor}__{video_id}" if extractor else f"url__{video_id}"
+    identity = _as_optional_str(info.get("id")) or "unknown"
+    return f"{extractor}__{identity}" if extractor else f"url__{identity}"
 
 
 def _select_subtitle_candidate(

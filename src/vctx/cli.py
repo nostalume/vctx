@@ -1,37 +1,53 @@
 from __future__ import annotations
 
-import logging
-import os
+from collections.abc import Callable
+from enum import StrEnum
+from importlib import import_module
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
-from platformdirs import user_config_path
 
-from vctx.app.auth import AuthError, OpenRouterAuth, desktop_login, system_keyring
-from vctx.app.cache import cache_status, prune_cache, render_cache
-from vctx.app.chunk import write_chunk_file
-from vctx.app.doctor import doctor_report
-from vctx.app.metadata import inspect_metadata, render_metadata_text
-from vctx.app.models import (
-    model_status,
-    pull_models,
-    render_model_receipts,
-    select_asr_model_id,
-    verify_models,
-)
-from vctx.app.pack import prepare_context_pack
-from vctx.app.render import RenderFormat, write_render_file
-from vctx.config import MediaQuality, PrepareRequest, WorkflowProfile, load_resolved_config
 from vctx.errors import VctxError
-from vctx.io import model_to_json
-from vctx.net import HttpxNetRuntime, NetRuntime
 
-app = typer.Typer(no_args_is_help=True)
-models_app = typer.Typer(no_args_is_help=True)
-cache_app = typer.Typer(no_args_is_help=True)
-auth_app = typer.Typer(no_args_is_help=True)
-openrouter_auth_app = typer.Typer(no_args_is_help=True)
+if TYPE_CHECKING:
+    from vctx.app.auth import OpenRouterAuth
+    from vctx.net import NetRuntime
+
+class RenderFormat(StrEnum):
+    CONTEXT = "context"
+    READ = "read"
+    TRANSCRIPT = "transcript"
+
+
+class PrepareTarget(StrEnum):
+    TRANSCRIPT = "transcript"
+    EVIDENCE = "evidence"
+    SUMMARY = "summary"
+
+
+class MediaQuality(StrEnum):
+    AUTO = "auto"
+    FAST = "fast"
+    BALANCED = "balanced"
+    HIGH = "high"
+
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+models_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+cache_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+auth_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+openrouter_auth_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+_AGENT_PROMPT = """# vctx agent context
+- Prepare finite media or transcript sources into one durable pack.
+- Read `manifest.json` first; it indexes independent source lanes and observed outcomes.
+- For multiple sources, select a manifest source key when rendering one result.
+- `context.md` is compact agent input; `read.md` is the readable report.
+- Render canonical pack products, then verify the complete pack before trusting it.
+- Treat listed artifacts as immutable; rerun prepare to publish a new generation.
+- Reuse is automatic; request overwrite only to refresh or rebuild admitted work.
+- Use `vctx doctor --json` to discover config, cache, and capability readiness.
+- Use command-specific `--help` for exact syntax.
+"""
 app.add_typer(models_app, name="models")
 app.add_typer(cache_app, name="cache")
 app.add_typer(auth_app, name="auth")
@@ -39,6 +55,8 @@ auth_app.add_typer(openrouter_auth_app, name="openrouter")
 
 
 def _openrouter_auth(net: NetRuntime | None = None) -> OpenRouterAuth:
+    from vctx.app.auth import AuthError, OpenRouterAuth, system_keyring
+
     try:
         return OpenRouterAuth(keyring=system_keyring(), net=net)
     except AuthError as exc:
@@ -50,6 +68,9 @@ def _openrouter_auth(net: NetRuntime | None = None) -> OpenRouterAuth:
 def openrouter_login_command(
     headless: Annotated[bool, typer.Option("--headless")] = False,
 ) -> None:
+    from vctx.app.auth import AuthError, desktop_login
+    from vctx.net import HttpxNetRuntime
+
     with HttpxNetRuntime() as net:
         auth = _openrouter_auth(net)
         try:
@@ -77,322 +98,189 @@ def openrouter_logout_command() -> None:
     typer.echo("OpenRouter authentication removed from the system keyring.")
 
 
-def _cache_command(
-    action: Literal["status", "prune"],
-    cache_dir: Path | None,
-    config: Path | None,
-    json_output: bool,
-    *,
-    age: str | None = None,
-    all_records: bool = False,
-    dry_run: bool = False,
-) -> None:
-    try:
-        resolved = load_resolved_config(
-            PrepareRequest(
-                inputs=["cache-operation"],
-                out_dir=Path("."),
-                config_path=_select_config_path(config),
-                cache_dir=cache_dir,
-            )
-        )
-        report = (
-            cache_status(resolved.cache.source_dir)
-            if action == "status"
-            else prune_cache(
-                resolved.cache.source_dir,
-                age=age,
-                all_records=all_records,
-                dry_run=dry_run,
-            )
-        )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
-    typer.echo(render_cache(report, json_output=json_output), nl=False)
-
-
 @cache_app.command("status")
 def cache_status_command(
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    _cache_command("status", cache_dir, config, json_output)
+    report = _call(lambda: _cache(cache_dir, config).status())
+    typer.echo(_render_cache(report, json_output), nl=False)
 
 
 @cache_app.command("prune")
 def cache_prune_command(
-    age: Annotated[
-        str | None, typer.Option("--age", help="Prune entries older than 30d/12h/4w.")
-    ] = None,
+    age: Annotated[str | None, typer.Option("--age", help="Age such as 30d, 12h, or 4w.")] = None,
     all_records: Annotated[bool, typer.Option("--all", help="Prune every source record.")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    _cache_command(
-        "prune", cache_dir, config, json_output, age=age, all_records=all_records, dry_run=dry_run
+    report = _call(
+        lambda: _cache(cache_dir, config).prune(
+            age=age, all_records=all_records, dry_run=dry_run
+        )
     )
-
-
-def _models_command(
-    action: Literal["pull", "status", "verify"],
-    capabilities: list[str] | None,
-    cache_dir: Path | None,
-    json_output: bool,
-    config: Path | None,
-    asr: str | None,
-) -> None:
-    try:
-        resolved = load_resolved_config(
-            PrepareRequest(
-                inputs=["model-lifecycle"],
-                out_dir=Path("."),
-                workflow=WorkflowProfile.TRANSCRIPT,
-                config_path=_select_config_path(config),
-                cache_dir=cache_dir,
-                asr_use=asr,
-            )
-        )
-        asr_model_id = select_asr_model_id(resolved)
-        operation = {
-            "pull": pull_models,
-            "status": model_status,
-            "verify": verify_models,
-        }[action]
-        receipts = operation(
-            capabilities,
-            cache_dir=resolved.cache.model_dir,
-            asr_model_id=asr_model_id,
-        )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
-    typer.echo(render_model_receipts(receipts, json_output=json_output), nl=False)
+    typer.echo(_render_cache(report, json_output), nl=False)
 
 
 @models_app.command("pull")
 def models_pull_command(
-    capabilities: Annotated[
-        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
-    ] = None,
+    capabilities: Annotated[list[str] | None, typer.Argument(help="asr/ocr; default: both")] = None,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    _models_command("pull", capabilities, cache_dir, json_output, config, asr)
+    receipts = _call(lambda: _models(cache_dir, config, asr).pull(capabilities))
+    typer.echo(_render_models(receipts, json_output), nl=False)
 
 
 @models_app.command("status")
 def models_status_command(
-    capabilities: Annotated[
-        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
-    ] = None,
+    capabilities: Annotated[list[str] | None, typer.Argument(help="asr/ocr; default: both")] = None,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    _models_command("status", capabilities, cache_dir, json_output, config, asr)
+    receipts = _call(lambda: _models(cache_dir, config, asr).status(capabilities))
+    typer.echo(_render_models(receipts, json_output), nl=False)
 
 
 @models_app.command("verify")
 def models_verify_command(
-    capabilities: Annotated[
-        list[str] | None, typer.Argument(help="Capabilities: asr and/or ocr; default: both.")
-    ] = None,
+    capabilities: Annotated[list[str] | None, typer.Argument(help="asr/ocr; default: both")] = None,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    _models_command("verify", capabilities, cache_dir, json_output, config, asr)
+    receipts = _call(lambda: _models(cache_dir, config, asr).verify(capabilities))
+    typer.echo(_render_models(receipts, json_output), nl=False)
 
 
 @app.command("prepare")
 def prepare_command(
     inputs: list[str],
     out: Annotated[Path, typer.Option("--out", help="Output directory for durable artifacts.")],
-    overwrite: Annotated[
-        bool,
-        typer.Option(
-            "--overwrite",
-            help="Rebuild requested lanes when updating an existing verified pack.",
-        ),
-    ] = False,
+    overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
     chunk_max_chars: Annotated[int | None, typer.Option("--chunk-max-chars")] = None,
     chunk_max_seconds: Annotated[int | None, typer.Option("--chunk-max-seconds")] = None,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     media_quality: Annotated[MediaQuality | None, typer.Option("--media-quality")] = None,
-    keep_temp: Annotated[bool | None, typer.Option("--keep-temp")] = None,
-    workflow: Annotated[
-        WorkflowProfile | None,
-        typer.Option(
-            "--workflow",
-            help="Preparation workflow instance: default, transcript, visual, full, or metadata.",
-        ),
-    ] = None,
-    asr: Annotated[
-        str | None,
-        typer.Option("--asr", help="ASR selector: auto, none, instance:<name>, or local:<model>."),
-    ] = None,
-    ocr: Annotated[
-        str | None,
-        typer.Option("--ocr", help="OCR selector: auto or none."),
-    ] = None,
-    vision: Annotated[
-        str | None,
-        typer.Option(
-            "--vision",
-            help="Vision selector: auto, none, or instance:<name>.",
-        ),
-    ] = None,
-    no_retain_media: Annotated[
-        bool,
-        typer.Option(
-            "--no-retain-media",
-            help="Do not retain required source media in the output pack.",
-        ),
-    ] = False,
-    offline: Annotated[
-        bool | None,
-        typer.Option(
-            "--offline",
-            help="Use the offline workflow policy; network routes unavailable.",
-        ),
-    ] = None,
-    config: Annotated[
-        Path | None,
-        typer.Option("--config", help="Optional TOML config file for workflow defaults."),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option("--verbose", help="Emit INFO progress logs to stderr."),
-    ] = False,
-    debug: Annotated[
-        bool,
-        typer.Option("--debug", help="Emit DEBUG progress logs to stderr."),
-    ] = False,
-    log_file: Annotated[
-        Path | None,
-        typer.Option("--log-file", help="Write prepare logs to this file."),
-    ] = None,
+    target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
+    asr: Annotated[str | None, typer.Option("--asr", help="ASR selector.")] = None,
+    ocr: Annotated[str | None, typer.Option("--ocr")] = None,
+    vision: Annotated[str | None, typer.Option("--vision", help="Vision selector.")] = None,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    offline: Annotated[bool | None, typer.Option("--offline", help="Deny network routes.")] = None,
+    config: Annotated[Path | None, typer.Option("--config", help="TOML config file.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", help="INFO logs to stderr.")] = False,
+    debug: Annotated[bool, typer.Option("--debug", help="DEBUG logs to stderr.")] = False,
+    log_file: Annotated[Path | None, typer.Option("--log-file", help="Write logs to file.")] = None,
 ) -> None:
-    _configure_logging(verbose=verbose, debug=debug, log_file=log_file)
-    try:
-        result = prepare_context_pack(
-            PrepareRequest(
-                inputs=inputs,
-                out_dir=out,
-                overwrite=overwrite,
-                chunk_max_chars=chunk_max_chars,
-                chunk_max_seconds=chunk_max_seconds,
-                cache_dir=cache_dir,
-                media_quality=media_quality,
-                keep_temp=keep_temp,
-                workflow=workflow,
-                asr_use=asr,
-                ocr_use=ocr,
-                vision_use=vision,
-                retain_media=False if no_retain_media else None,
-                offline=offline,
-                config_path=_select_config_path(config),
-            )
-        )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
+    from vctx.app.pack import prepare_context_pack
+    from vctx.app.progress import configure_logging
+    from vctx.config import (
+        MediaQuality as ConfigMediaQuality,
+    )
+    from vctx.config import (
+        PrepareRequest,
+    )
+    from vctx.config import (
+        PrepareTarget as ConfigPrepareTarget,
+    )
 
-    if result.manifest.status == "partial":
-        typer.echo(f"Wrote partial context pack: {result.out_dir}")
-    else:
-        typer.echo(f"Wrote context pack: {result.out_dir}")
-    typer.echo(f"Manifest: {result.out_dir / 'manifest.json'}")
-    for line in result.summary.render_cli_lines():
-        typer.echo(line)
+    configure_logging(verbose=verbose, debug=debug, log_file=log_file)
+    request = PrepareRequest(
+        inputs=inputs,
+        out_dir=out,
+        overwrite=overwrite,
+        chunk_max_chars=chunk_max_chars,
+        chunk_max_seconds=chunk_max_seconds,
+        cache_dir=cache_dir,
+        media_quality=(
+            ConfigMediaQuality(media_quality.value) if media_quality is not None else None
+        ),
+        target=ConfigPrepareTarget(target.value),
+        asr_use=asr,
+        ocr_use=ocr,
+        vision_use=vision,
+        retain_media=False if no_retain_media else None,
+        offline=offline,
+        config_path=config,
+    )
+    result = _call(lambda: prepare_context_pack(request))
+    typer.echo(result.render_cli(), nl=False)
 
 
 @app.command("metadata")
 def metadata_command(
     input: str,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Print normalized VideoMetadata JSON."),
-    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print metadata JSON.")] = False,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     offline: Annotated[bool | None, typer.Option("--offline")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
 ) -> None:
-    try:
-        metadata = inspect_metadata(
+    from vctx.app.metadata import inspect_metadata, render_metadata_text
+    from vctx.artifact.bundle import encode_json
+
+    metadata = _call(
+        lambda: inspect_metadata(
             input,
-            config_path=_select_config_path(config),
+            config_path=config,
             cache_dir=cache_dir,
             offline=offline,
         )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
+    )
 
     if json_output:
-        typer.echo(model_to_json(metadata), nl=False)
+        typer.echo(encode_json(metadata), nl=False)
     else:
         typer.echo(render_metadata_text(metadata), nl=False)
 
 
-@app.command("chunk")
-def chunk_command(
-    transcript: Path,
-    out: Annotated[Path, typer.Option("--out", help="Output chunks JSON file.")],
-    chunk_max_chars: Annotated[int, typer.Option("--chunk-max-chars")] = 6000,
-    chunk_max_seconds: Annotated[int | None, typer.Option("--chunk-max-seconds")] = None,
-) -> None:
-    try:
-        out_path = write_chunk_file(
-            transcript,
-            out,
-            max_chars=chunk_max_chars,
-            max_seconds=chunk_max_seconds,
-        )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
-
-    typer.echo(f"Wrote chunks: {out_path}")
-
-
 @app.command("render")
 def render_command(
-    metadata: Annotated[Path, typer.Option("--metadata", help="Input metadata JSON file.")],
-    transcript: Annotated[
-        Path,
-        typer.Option("--transcript", help="Input transcript JSON file."),
-    ],
-    out: Annotated[Path, typer.Option("--out", help="Output Markdown file.")],
+    pack: Annotated[Path, typer.Argument(help="Schema-3 context pack.")],
     format: Annotated[RenderFormat, typer.Option("--format", help="Render format.")],
-    chunks: Annotated[Path | None, typer.Option("--chunks", help="Input chunks JSON file.")] = None,
+    source: Annotated[str | None, typer.Option("--source", help="Source key.")] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="External output file.")] = None,
 ) -> None:
-    try:
-        out_path = write_render_file(
-            metadata_path=metadata,
-            transcript_path=transcript,
-            chunks_path=chunks,
-            out_path=out,
-            format=format,
-        )
-    except VctxError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(exc.exit_code) from exc
+    from vctx.app.render import render_pack
 
-    typer.echo(f"Wrote render: {out_path}")
+    result = _call(
+        lambda: render_pack(
+            pack,
+            source_key=source,
+            format=format.value,
+            out=out,
+        )
+    )
+
+    if result.path is None:
+        assert result.content is not None
+        typer.echo(result.content, nl=False)
+    else:
+        typer.echo(f"Wrote render: {result.path}")
+
+
+@app.command("verify")
+def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3 context pack.")]) -> None:
+    from vctx.app.pack import verify_context_pack
+
+    report = _call(lambda: verify_context_pack(pack))
+    typer.echo(
+        f"verified schema {report.manifest.schema_version} pack: "
+        f"{len(report.manifest.sources)} source(s)"
+    )
 
 
 @app.command("doctor")
 def doctor_command(
-    workflow: Annotated[WorkflowProfile | None, typer.Option("--workflow")] = None,
+    target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision")] = None,
@@ -402,11 +290,14 @@ def doctor_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
+    from vctx.app.doctor import doctor_report
+    from vctx.config import PrepareTarget as ConfigPrepareTarget
+
     typer.echo(
         doctor_report(
-            config_path=_select_config_path(config),
+            config_path=config,
             cache_dir=cache_dir,
-            workflow=workflow,
+            target=ConfigPrepareTarget(target.value),
             asr=asr,
             ocr=ocr,
             vision=vision,
@@ -418,52 +309,49 @@ def doctor_command(
     )
 
 
+@app.command("prompt")
+def prompt_command() -> None:
+    typer.echo(_AGENT_PROMPT, nl=False)
+
+
 def main() -> None:
     app()
 
 
-def _select_config_path(explicit: Path | None) -> Path | None:
-    if explicit is not None:
-        return explicit
-    cwd = Path.cwd()
-    for candidate in (cwd / "vctx.toml", cwd / ".vctx.toml"):
-        if candidate.exists():
-            return candidate
-    env_config = os.environ.get("VCTX_CONFIG")
-    if env_config:
-        return Path(env_config)
-    global_config = _global_config_path()
-    return global_config if global_config.exists() else None
+def _resolved(cache_dir: Path | None, config: Path | None, *, asr: str | None = None):
+    from vctx.config import PrepareRequest, load_resolved_config
+
+    return load_resolved_config(
+        PrepareRequest(
+            inputs=["operation"], out_dir=Path("."), cache_dir=cache_dir,
+            config_path=config, asr_use=asr,
+        )
+    )
 
 
-def _global_config_path() -> Path:
-    return user_config_path("vctx", appauthor=False) / "config.toml"
+def _cache(cache_dir: Path | None, config: Path | None):
+    from vctx.app.cache import Cache
+
+    return Cache.open(_resolved(cache_dir, config))
 
 
-def _configure_logging(*, verbose: bool, debug: bool, log_file: Path | None) -> None:
-    logger = logging.getLogger("vctx")
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
+def _models(cache_dir: Path | None, config: Path | None, asr: str | None):
+    from vctx.app.models import Models
 
-    if not verbose and not debug and log_file is None:
-        logger.addHandler(logging.NullHandler())
-        logger.setLevel(logging.CRITICAL + 1)
-        logger.propagate = False
-        return
+    return Models.open(_resolved(cache_dir, config, asr=asr))
 
-    level = logging.DEBUG if debug else logging.INFO
-    formatter = logging.Formatter("%(levelname)s %(name)s %(message)s")
-    if verbose or debug:
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        stream_handler.setLevel(level)
-        logger.addHandler(stream_handler)
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        file_handler.setLevel(level)
-        logger.addHandler(file_handler)
-    logger.setLevel(level)
-    logger.propagate = False
+
+def _render_models(receipts: Any, json_output: bool) -> str:
+    return import_module("vctx.app.models").render_model_receipts(receipts, json_output=json_output)
+
+
+def _render_cache(report: Any, json_output: bool) -> str:
+    return import_module("vctx.app.cache").render_cache(report, json_output=json_output)
+
+
+def _call[T](operation: Callable[[], T]) -> T:
+    try:
+        return operation()
+    except VctxError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(exc.exit_code) from exc

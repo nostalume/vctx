@@ -7,14 +7,15 @@ import json
 import os
 import shutil
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
+from vctx.artifact.bundle import encode_json
 from vctx.config import ResolvedConfig
 from vctx.errors import VctxError
-from vctx.io import model_to_json
 
 ModelCapability = Literal["asr", "ocr"]
 ModelState = Literal["ready", "missing", "corrupt"]
@@ -36,8 +37,33 @@ class ModelReceipt(BaseModel):
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class Models:
+    cache_dir: Path
+    asr_model_id: str
+
+    @classmethod
+    def open(cls, resolved: ResolvedConfig) -> Models:
+        return cls(resolved.cache.model_dir, select_asr_model_id(resolved))
+
+    def pull(self, capabilities: list[str] | None) -> list[ModelReceipt]:
+        return pull_models(
+            capabilities, cache_dir=self.cache_dir, asr_model_id=self.asr_model_id
+        )
+
+    def status(self, capabilities: list[str] | None) -> list[ModelReceipt]:
+        return model_status(
+            capabilities, cache_dir=self.cache_dir, asr_model_id=self.asr_model_id
+        )
+
+    def verify(self, capabilities: list[str] | None) -> list[ModelReceipt]:
+        return verify_models(
+            capabilities, cache_dir=self.cache_dir, asr_model_id=self.asr_model_id
+        )
+
+
 def select_asr_model_id(resolved: ResolvedConfig) -> str:
-    policy = resolved.transforms.asr
+    policy = resolved.asr
     model_ref = policy.model_ref()
     if model_ref is not None:
         if model_ref.startswith("local:"):
@@ -155,7 +181,7 @@ def _pull(capability: ModelCapability, cache_root: Path, *, asr_model_id: str) -
         integrity=digest,
     )
     path = _receipt_path(capability, cache_root)
-    _write_atomic(path, model_to_json(receipt))
+    _write_atomic(path, encode_json(receipt))
     return receipt
 
 

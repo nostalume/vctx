@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from types import TracebackType
-from typing import Literal, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, runtime_checkable
 
-import httpx
 from pydantic import BaseModel, Field
 from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt
+
+if TYPE_CHECKING:
+    import httpx
 
 NetPurpose = Literal[
     "model_registry",
@@ -15,6 +18,7 @@ NetPurpose = Literal[
     "vision_description",
     "asr_transcription",
     "evidence_plan",
+    "summary",
     "openrouter_auth",
 ]
 NetMethod = Literal["GET", "POST"]
@@ -75,7 +79,16 @@ class HttpxNetRuntime:
         client: httpx.Client | None = None,
     ) -> None:
         self.per_provider_concurrency = per_provider_concurrency
-        self._client = client or httpx.Client(limits=httpx.Limits(max_connections=max_connections))
+        httpx_module = _httpx()
+        self._httpx = httpx_module
+        self._client = client or httpx_module.Client(
+            limits=httpx_module.Limits(max_connections=max_connections),
+            mounts={
+                "http://127.0.0.1": httpx_module.HTTPTransport(),
+                "http://localhost": httpx_module.HTTPTransport(),
+                "http://[::1]": httpx_module.HTTPTransport(),
+            },
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -100,7 +113,7 @@ class HttpxNetRuntime:
             request.url,
             headers=request.headers,
             content=request.body,
-            timeout=httpx.Timeout(
+            timeout=self._httpx.Timeout(
                 request.timeout_s,
                 connect=request.connect_timeout_s or request.timeout_s,
             ),
@@ -167,6 +180,7 @@ def _request_with_retry(
 
 
 def _retryable_exception(exc: Exception, policy: RetryPolicy) -> bool:
+    httpx = _httpx()
     if isinstance(exc, httpx.ConnectTimeout):
         return policy.retry_connect
     if isinstance(exc, httpx.TimeoutException | TimeoutError):
@@ -174,6 +188,10 @@ def _retryable_exception(exc: Exception, policy: RetryPolicy) -> bool:
     return policy.retry_connect and isinstance(
         exc, httpx.ConnectError | ConnectionError | OSError
     )
+
+
+def _httpx() -> Any:
+    return importlib.import_module("httpx")
 
 
 def _retry_delay(state: RetryCallState, policy: RetryPolicy) -> float:

@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
-from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from tests.support import asr_ready
-from vctx.artifact.manifest import Manifest
 from vctx.cli import app
 from vctx.source.session import MediaAsset
 
@@ -64,12 +61,12 @@ cache = "persistent"
         "context.md",
     }
     assert manifest["status"] == "ok"
-    assert _step_status(manifest, "transcript.extract") == "warning"
-    assert _step_status(manifest, "source.media") == "ok"
-    assert _step_status(manifest, "transform.asr") == "ok"
-    assert _step_detail(manifest, "transform.asr") == "faster-whisper:tiny"
-    asr_step = _step(manifest, "transform.asr")
-    assert asr_step["receipt"]["kind"] == "asr"
+    asr_route = next(
+        item
+        for item in source_entry["effects"]
+        if item["operation"] == "asr" and item["route"] == "local"
+    )
+    assert (asr_route["provider"], asr_route["model"]) == ("faster-whisper", "tiny")
 
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["provenance"]["method"] == "asr"
@@ -77,31 +74,3 @@ cache = "persistent"
     assert transcript["segments"][0]["text"] == "Hello from fake ASR."
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "Hello from fake ASR." in context
-    asr_step["receipt"]["unexpected"] = True
-    with pytest.raises(ValidationError):
-        Manifest.model_validate(manifest)
-
-
-def _step_status(manifest: dict[str, Any], name: str) -> str:
-    step = _step(manifest, name)
-    status = step["status"]
-    assert isinstance(status, str)
-    return status
-
-
-def _step_detail(manifest: dict[str, Any], name: str) -> str:
-    step = _step(manifest, name)
-    detail = step["detail"]
-    assert isinstance(detail, str)
-    return detail
-
-
-def _step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    steps = manifest["sources"][0]["steps"]
-    assert isinstance(steps, list)
-    for raw_step in steps:
-        assert isinstance(raw_step, dict)
-        step = cast(dict[str, Any], raw_step)
-        if step["name"] == name:
-            return step
-    raise AssertionError(f"missing manifest step: {name}")

@@ -19,7 +19,7 @@ def asr_ready_segments(
 ) -> AsrReady:
     return AsrReady(
         transcript=Transcript(
-            video_id=media_id,
+            source_id=media_id,
             provenance=TranscriptProvenance(
                 method="asr", language=language, format="json", provider="faster-whisper"
             ),

@@ -82,7 +82,7 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
         "subtitles": {},
         "automatic_captions": {},
     }
-    monkeypatch.setattr(ytdlp_module.yt_dlp, "YoutubeDL", FakeYoutubeDLMedia)
+    monkeypatch.setattr(ytdlp_module._yt_dlp(), "YoutubeDL", FakeYoutubeDLMedia)
 
     class FakeAsrAdapter:
         def __init__(self, **kwargs: JsonValue) -> None:
@@ -127,33 +127,21 @@ model = "tiny"
     source_entry = cast(JsonObject, cast(list[JsonObject], manifest["sources"])[0])
     lane = out_dir / cast(str, source_entry["path"])
     assert manifest["status"] == "ok"
-    assert _step_status(manifest, "source.media") == "ok"
-    assert _step_status(manifest, "transform.asr") == "ok"
-    receipt = cast(list[JsonObject], source_entry["assets"])[0]
-    assert receipt["kind"] == "audio"
-    assert receipt["retained"] is retain_media
+    artifacts = cast(list[JsonObject], source_entry["artifacts"])
+    retained = [item for item in artifacts if item["kind"] == "media"]
     if retain_media:
-        assert receipt["path"] in {
-            item["path"] for item in cast(list[JsonObject], source_entry["assets"])
-        }
+        assert len(retained) == 1
+        assert (lane / cast(str, retained[0]["path"])).is_file()
     else:
-        assert not (lane / "audio.webm").exists()
-    assert source_entry["transform_evidence"] == [
-        {
-            "capability": "asr",
-            "selected_route": "local",
-            "provider_id": "faster-whisper",
-            "model_id": "tiny",
-            "requires_user_config": False,
-            "uploaded": False,
-            "cost_may_apply": False,
-            "deterministic": False,
-            "source_artifacts": [],
-            "output_artifacts": [],
-            "reason": "default local ASR route available",
-            "warnings": [],
-        }
-    ]
+        assert retained == []
+        assert not any(path.name.startswith("media.") for path in lane.iterdir())
+    effects = cast(list[JsonObject], source_entry["effects"])
+    route = next(item for item in effects if item["operation"] == "asr")
+    assert (route["route"], route["provider"], route["model"]) == (
+        "local",
+        "faster-whisper",
+        "tiny",
+    )
     clean = cast(
         JsonObject,
         json.loads((lane / "transcript.json").read_text(encoding="utf-8")),
@@ -171,20 +159,3 @@ model = "tiny"
     assert FakeYoutubeDLMedia.downloaded_path.parent == (
         tmp_path / "cache" / "source" / "tmp" / "yt-dlp"
     )
-
-
-def _step_status(manifest: JsonObject, name: str) -> str:
-    step = _step(manifest, name)
-    status = step["status"]
-    assert isinstance(status, str)
-    return status
-
-
-def _step(manifest: JsonObject, name: str) -> JsonObject:
-    source = cast(JsonObject, cast(list[JsonObject], manifest["sources"])[0])
-    steps = cast(list[JsonObject], source["steps"])
-    for raw_step in steps:
-        assert isinstance(raw_step, dict)
-        if raw_step["name"] == name:
-            return raw_step
-    raise AssertionError(f"missing manifest step: {name}")

@@ -31,6 +31,14 @@ AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a"}
 VIDEO_SUFFIXES = {".mp4", ".webm"}
 
 
+def _file_digest(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class LocalMediaAsset(BaseModel):
     id: str
     source: SourceRef
@@ -126,7 +134,6 @@ class LocalFileSourceAdapter:
         identity = sha256(str(path.resolve()).casefold().encode()).hexdigest()[:12]
         metadata = VideoMetadata(
             id=f"local__{identity}",
-            source_type="local-file",
             source=SourceRef(kind="file", value=str(path)),
             title=path.stem,
             raw_provider="local-file",
@@ -135,7 +142,7 @@ class LocalFileSourceAdapter:
             path=path,
             record=SourceRecord(
                 source_id=metadata.id,
-                revision=Revision(kind="immutable", value=sha256(path.read_bytes()).hexdigest()),
+                revision=Revision(kind="immutable", value=_file_digest(path)),
                 observed_at=datetime.now(UTC),
                 metadata=metadata,
                 has_subtitles=path.suffix.lower() in SUPPORTED_TRANSCRIPT_SUFFIXES,

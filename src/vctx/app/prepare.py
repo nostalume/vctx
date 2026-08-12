@@ -3,48 +3,36 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
-from vctx.app.media_retention import materialize_source_assets
+from vctx.app.evidence import EvidenceOutcome, evidence_products
 from vctx.app.progress import phase
 from vctx.app.run import (
-    Run,
+    PrepareRun,
     RunRuntimes,
-    open_run,
+    open_prepare_run,
     select_asr_instance,
 )
-from vctx.app.visual import VisualProducts, visual_products
-from vctx.artifact.content import Artifact
+from vctx.artifact.bundle import Artifact, product_bundle, write_artifact, write_bundle
 from vctx.artifact.manifest import (
     ArtifactRef,
-    AsrStepReceipt,
     ManifestSource,
+    ProductOutcome,
 )
 from vctx.asr import (
     AsrEnvironment,
     AsrOutcome,
     AsrPlan,
-    AsrReceipt,
     plan_asr,
     run_asr,
 )
-from vctx.config import (
-    AsrInstanceConfig,
-    PrepareRequest,
-    ResolvedConfig,
-    WorkflowProfile,
-)
-from vctx.errors import CacheError, NoTranscriptError, ProviderError, VctxError
-from vctx.io import (
-    model_to_json,
-    write_artifact,
-    write_artifact_bundle,
-)
-from vctx.render.bundle import render_artifact_bundle
+from vctx.config import AsrInstanceConfig, PrepareRequest, PrepareTarget, ResolvedConfig
+from vctx.errors import CacheError, NoTranscriptError, ProviderError, SourceConflictError, VctxError
 from vctx.source.session import (
     AsrAudioRequest,
     MediaAsset,
+    Revision,
 )
+from vctx.summary import SummaryOutcome, SummaryPacket, SummaryWriter
 from vctx.transcript import (
     ChunkOptions,
     ChunkSet,
@@ -60,7 +48,7 @@ _ASR_MISSING_HINT = "Prepare the small ASR model with: vctx models pull asr"
 
 
 @dataclass(frozen=True)
-class Prepared:
+class TranscriptProducts:
     transcript: Transcript
     chunks: ChunkSet
 
@@ -75,9 +63,7 @@ class AsrReady:
 @dataclass(frozen=True)
 class SourcePrepared:
     source: ManifestSource
-    artifacts: list[ArtifactRef]
-    request: PrepareRequest
-    resolved: ResolvedConfig
+    input_value: str
     error: VctxError | None = None
 
 
@@ -85,33 +71,44 @@ def prepare_source(
     request: PrepareRequest,
     resolved: ResolvedConfig,
     occupied: dict[str, str],
-    completed: set[str],
+    completed: dict[str, Revision | None],
     runtimes: RunRuntimes,
     previous: dict[str, ManifestSource] | None = None,
     reset_lane: Callable[[str], None] | None = None,
     rollback_lane: Callable[[str], None] | None = None,
 ) -> SourcePrepared | None:
-    logger.info("prepare.start input=%s out=%s", request.inputs[0], request.out_dir)
-    run = open_run(request, resolved, occupied, runtimes)
-    if run.source.record.source_id in completed:
-        return None
-    completed.add(run.source.record.source_id)
+    run = open_prepare_run(request, resolved, occupied, runtimes)
+    source_id = run.source.record.source_id
+    revision = run.source.record.revision
+    if source_id in completed:
+        admitted = completed[source_id]
+        if admitted is not None and admitted == revision:
+            return None
+        completed[source_id] = None
+        raise SourceConflictError(source_id, run.manifest.key)
+    completed[source_id] = revision
     prior = (previous or {}).get(run.source.record.source_id)
-    if prior is not None and prior.revision == run.source.record.revision and not request.overwrite:
-        return SourcePrepared(prior, prior.artifacts, run.request, resolved)
+    if (
+        prior is not None
+        and prior.revision == run.source.record.revision
+        and not request.overwrite
+        and _satisfies(prior, resolved)
+    ):
+        return SourcePrepared(prior, run.request.inputs[0])
     if reset_lane is not None:
         reset_lane(run.manifest.key)
     try:
-        if run.resolved.runtime.workflow == WorkflowProfile.METADATA:
-            run.manifest.add_step("transcript.extract", "skipped", "metadata workflow selected")
-            run.manifest.warn("metadata workflow selected; transcript pipeline skipped")
-            return _partial(run)
         transcript = _transcript(run)
-        if isinstance(transcript, SourcePrepared):
-            return transcript
+        if transcript is None:
+            return _partial(run)
         prepared = _prepared(run, transcript)
-        products = visual_products(run, prepared)
-        return _finish(run, prepared, products)
+        evidence = (
+            evidence_products(run, prepared)
+            if run.resolved.target != PrepareTarget.TRANSCRIPT
+            else None
+        )
+        summary = _summary_products(run, prepared, evidence)
+        return _finish(run, prepared, evidence, summary)
     except (CacheError, ProviderError) as exc:
         return _error_result(run, exc)
     except VctxError:
@@ -120,7 +117,17 @@ def prepare_source(
         raise
 
 
-def _transcript(run: Run) -> TranscriptPayload | Transcript | SourcePrepared:
+def _satisfies(source: ManifestSource, resolved: ResolvedConfig) -> bool:
+    outcomes = {item.product: item.status for item in source.outcomes}
+    kinds = {item.kind for item in source.artifacts}
+    return (
+        outcomes.get(resolved.target.value) == "ready"
+        and resolved.output.projections <= kinds
+        and (not resolved.output.retain_media or outcomes.get("retained-media") == "ready")
+    )
+
+
+def _transcript(run: PrepareRun) -> TranscriptPayload | Transcript | None:
     with phase(logger, "transcript.extract"):
         logger.info("transcript.extract start")
         try:
@@ -133,12 +140,12 @@ def _transcript(run: Run) -> TranscriptPayload | Transcript | SourcePrepared:
     run.subtitle = payload
     logger.info("transcript.extract status=ok provenance=%s", payload.provenance_label())
     asr_plan = plan_asr(
-        run.resolved.transforms.asr,
+        run.resolved.asr,
         AsrEnvironment(offline=run.resolved.runtime.offline),
         has_transcript=True,
         has_media=False,
     )
-    run.manifest.add_transform_evidence(asr_plan.evidence_seed)
+    run.manifest.add_effect(asr_plan.effect_seed)
     run.manifest.add_step(
         "transform.asr",
         "skipped" if asr_plan.selected == "skipped" else "ok",
@@ -149,17 +156,17 @@ def _transcript(run: Run) -> TranscriptPayload | Transcript | SourcePrepared:
 
 
 def _asr_transcript(
-    run: Run,
+    run: PrepareRun,
     transcript_error: NoTranscriptError,
-) -> Transcript | SourcePrepared:
+) -> Transcript | None:
     run.manifest.add_step("transcript.extract", "warning", str(transcript_error))
     source = _asr_source(run, transcript_error)
-    if isinstance(source, SourcePrepared):
-        return source
+    if source is None:
+        return None
 
     ready = _asr_ready(run, source)
-    if isinstance(ready, SourcePrepared):
-        return ready
+    if ready is None:
+        return None
 
     with phase(logger, "asr.execute"):
         logger.info(
@@ -178,93 +185,94 @@ def _asr_transcript(
     return _asr_outcome(run, outcome)
 
 
-def _asr_outcome(run: Run, outcome: AsrOutcome) -> Transcript | SourcePrepared:
+def _asr_outcome(run: PrepareRun, outcome: AsrOutcome) -> Transcript | None:
     if outcome.kind == "ready":
         detail = f"{outcome.receipt.provider}:{outcome.receipt.model}"
-        run.manifest.add_step("transform.asr", "ok", detail, _asr_step_receipt(outcome.receipt))
+        run.manifest.add_step("transform.asr", "ok", detail)
         logger.info("asr.execute status=ok provenance=%s", detail)
         return outcome.transcript
     detail = outcome.reason
     if outcome.receipt.failure is not None:
         detail = f"{outcome.receipt.failure}: {detail}"
-    run.manifest.add_step("transform.asr", "warning", detail, _asr_step_receipt(outcome.receipt))
+    run.manifest.add_step("transform.asr", "warning", detail)
     run.manifest.warn(detail)
     logger.warning("asr.execute status=%s reason=%s", outcome.kind, detail)
-    return _partial(run)
+    return None
 
 
-def _asr_step_receipt(receipt: AsrReceipt) -> AsrStepReceipt:
-    return AsrStepReceipt.model_validate(receipt, from_attributes=True)
-
-
-def _asr_source(run: Run, transcript_error: NoTranscriptError) -> AsrPlan | SourcePrepared:
+def _asr_source(run: PrepareRun, transcript_error: NoTranscriptError) -> AsrPlan | None:
     pre_media_asr_plan = plan_asr(
-        run.resolved.transforms.asr,
+        run.resolved.asr,
         run.load_asr_environment(),
         has_transcript=False,
         has_media=True,
     )
     if pre_media_asr_plan.selected != "local":
-        run.manifest.add_transform_evidence(pre_media_asr_plan.evidence_seed)
+        run.manifest.add_effect(pre_media_asr_plan.effect_seed)
         run.manifest.add_step("source.media", "skipped", "no executable ASR route selected")
         run.manifest.add_step("transform.asr", "warning", pre_media_asr_plan.reason)
         run.manifest.warn(_capitalize_warning(str(transcript_error)))
         run.manifest.warn(_ASR_MISSING_HINT)
         logger.warning("asr.route status=unavailable reason=%s", pre_media_asr_plan.reason)
-        return _partial(run)
+        return None
 
     try:
         logger.info("source.media start purpose=asr")
-        run.media = run.source.media(
-            request=AsrAudioRequest(
+        request = (
+            run.visual_media_request()
+            if run.resolved.target != PrepareTarget.TRANSCRIPT
+            else AsrAudioRequest(
                 temp_dir=run.source_cache.root / "tmp" / "yt-dlp",
                 refresh=run.request.overwrite,
-            ),
+            )
+        )
+        run.media = run.source.media(
+            request=request,
             permit=run.media_permit,
         )
     except NoTranscriptError as media_exc:
         asr_plan = plan_asr(
-            run.resolved.transforms.asr,
+            run.resolved.asr,
             run.load_asr_environment(),
             has_transcript=False,
             has_media=False,
         )
         run.manifest.add_step("source.media", "warning", str(media_exc))
-        run.manifest.add_transform_evidence(asr_plan.evidence_seed)
+        run.manifest.add_effect(asr_plan.effect_seed)
         run.manifest.add_step("transform.asr", "warning", asr_plan.reason)
         run.manifest.warn(_capitalize_warning(str(transcript_error)))
         run.manifest.warn(_ASR_MISSING_HINT)
         logger.warning("source.media status=warning purpose=asr reason=%s", media_exc)
-        return _partial(run)
+        return None
 
     run.manifest.add_step("source.media", "ok", _media_detail(run.media))
     logger.info("source.media status=ok purpose=asr path=%s", run.media.local_path)
     asr_plan = plan_asr(
-        run.resolved.transforms.asr,
+        run.resolved.asr,
         run.load_asr_environment(),
         has_transcript=False,
         has_media=True,
     )
     if asr_plan.selected != "local":
-        run.manifest.add_transform_evidence(asr_plan.evidence_seed)
+        run.manifest.add_effect(asr_plan.effect_seed)
         run.manifest.add_step("transform.asr", "warning", asr_plan.reason)
         run.manifest.warn(_capitalize_warning(str(transcript_error)))
         run.manifest.warn(asr_plan.reason)
         logger.warning("asr.route status=unavailable reason=%s", asr_plan.reason)
-        return _partial(run)
+        return None
     logger.info("asr.route selected=%s reason=%s", asr_plan.selected, asr_plan.reason)
     return asr_plan
 
 
-def _asr_ready(run: Run, asr_plan: AsrPlan) -> AsrReady | SourcePrepared:
+def _asr_ready(run: PrepareRun, asr_plan: AsrPlan) -> AsrReady | None:
     instance = select_asr_instance(run.resolved)
     if instance is None:
         run.manifest.add_step("transform.asr", "warning", "ASR instance is not configured")
         run.manifest.warn("ASR instance is not configured")
         logger.warning("asr.ready status=warning reason=missing-instance")
-        return _partial(run)
+        return None
 
-    run.manifest.add_transform_evidence(asr_plan.evidence_seed)
+    run.manifest.add_effect(asr_plan.effect_seed)
     assert run.media is not None
     logger.info(
         "asr.ready status=ok provider=%s model=%s credential=%s",
@@ -275,11 +283,11 @@ def _asr_ready(run: Run, asr_plan: AsrPlan) -> AsrReady | SourcePrepared:
     return AsrReady(plan=asr_plan, media=run.media, instance=instance)
 
 
-def _prepared(run: Run, payload: TranscriptPayload | Transcript) -> Prepared:
+def _prepared(run: PrepareRun, payload: TranscriptPayload | Transcript) -> TranscriptProducts:
     raw = (
         payload
         if isinstance(payload, Transcript)
-        else parse_transcript_payload(payload, video_id=run.metadata.id)
+        else parse_transcript_payload(payload, source_id=run.metadata.id)
     )
     run.manifest.add_step("transcript.parse", "ok", raw.provenance.format)
     logger.info("transcript.parse status=ok format=%s", raw.provenance.format)
@@ -297,134 +305,123 @@ def _prepared(run: Run, payload: TranscriptPayload | Transcript) -> Prepared:
     )
     run.manifest.add_step("chunk", "ok", f"{len(chunks.chunks)} chunks")
     logger.info("chunk status=ok chunks=%s", len(chunks.chunks))
-    return Prepared(transcript=clean, chunks=chunks)
+    return TranscriptProducts(transcript=clean, chunks=chunks)
 
 
-def _finish(run: Run, prepared: Prepared, products: VisualProducts) -> SourcePrepared:
+def _summary_products(
+    run: PrepareRun, prepared: TranscriptProducts, evidence: EvidenceOutcome | None
+) -> SummaryOutcome | None:
+    if run.resolved.target != PrepareTarget.SUMMARY:
+        return None
+    if evidence is None or evidence.status == "unavailable":
+        return SummaryOutcome(
+            status="unavailable", omissions=["evidence stage did not complete"]
+        )
+    route = run.summary_ai_route()
+    if route is None:
+        detail = "summary model unavailable; publishing earlier products"
+        run.manifest.warn(detail)
+        return SummaryOutcome(status="unavailable", omissions=[detail])
+    run.manifest.add_effect(route.effect("summary"))
+    packet = SummaryPacket.from_products(
+        prepared.transcript, evidence.evidence_plan, evidence.evidence
+    )
+    return SummaryWriter(run.ai_client(route)).write(
+        packet, language=run.resolved.summary.language
+    )
+
+
+def _finish(
+    run: PrepareRun,
+    prepared: TranscriptProducts,
+    evidence: EvidenceOutcome | None,
+    summary: SummaryOutcome | None,
+) -> SourcePrepared:
     with phase(logger, "prepare.finish"):
-        bundle = render_artifact_bundle(
+        evidence_value = evidence.evidence if evidence else None
+        plan = evidence.evidence_plan if evidence else None
+        bundle = product_bundle(
             metadata=run.metadata,
             transcript=prepared.transcript,
             chunks=prepared.chunks,
-            formats=run.resolved.output.formats,
-            evidence=products.evidence,
-            evidence_plan=products.evidence_plan,
-            output_language=run.resolved.output.language,
+            projections=run.resolved.output.projections,
+            evidence=evidence_value,
+            evidence_plan=plan,
+            summary=summary.summary if summary else None,
         )
-        artifact_refs = write_artifact_bundle(run.request.out_dir, bundle)
-        artifact_refs.extend(products.frames)
+        artifact_refs = write_bundle(run.request.out_dir, bundle)
+        if evidence:
+            artifact_refs.extend(evidence.frames)
+        outcomes = [
+            ProductOutcome(
+                product="transcript",
+                status="ready",
+                artifacts=["transcript.json", "chunks.json"],
+            )
+        ]
+        if evidence:
+            outcomes.append(_product_outcome("evidence", evidence, artifact_refs))
+        if summary:
+            outcomes.append(_product_outcome("summary", summary, artifact_refs))
         run.artifacts = artifact_refs
-        _retain_or_error(run, artifact_refs)
-        final_manifest = run.manifest.finish(
-            status="partial" if products.partial else "ok",
-            artifacts=artifact_refs,
-            receipts=run.source.receipts,
-        )
+        run.retain(artifact_refs)
+        final_manifest = run.finish(artifact_refs, outcomes)
     logger.info("prepare.finish status=ok artifacts=%s", len(artifact_refs))
-    return SourcePrepared(
-        source=final_manifest,
-        artifacts=artifact_refs,
-        request=run.request,
-        resolved=run.resolved,
-    )
+    return SourcePrepared(final_manifest, run.request.inputs[0])
 
 
-def _partial(run: Run) -> SourcePrepared:
+def _partial(run: PrepareRun) -> SourcePrepared:
     run.request.out_dir.mkdir(parents=True, exist_ok=True)
     artifact_ref = write_artifact(
         run.request.out_dir,
-        Artifact(
-            name="metadata.json",
-            kind="metadata",
-            media_type="application/json",
-            content=model_to_json(run.metadata),
-        ),
+        Artifact.json("metadata.json", "metadata", run.metadata),
     )
     artifact_refs = [artifact_ref]
     run.artifacts = artifact_refs
-    _retain_or_error(run, artifact_refs)
+    run.retain(artifact_refs)
+    unavailable = ProductOutcome(
+        product=run.resolved.target,
+        status="unavailable",
+        omissions=["transcript unavailable; later products were not started"],
+    )
+    run.manifest.add_outcome(unavailable)
     final_manifest = run.manifest.finish(
         status="partial", artifacts=artifact_refs, receipts=run.source.receipts
     )
     logger.info("prepare.finish status=partial artifacts=%s", len(artifact_refs))
-    return SourcePrepared(
-        source=final_manifest,
-        artifacts=artifact_refs,
-        request=run.request,
-        resolved=run.resolved,
+    return SourcePrepared(final_manifest, run.request.inputs[0])
+
+
+def _product_outcome(
+    product: str, outcome: EvidenceOutcome | SummaryOutcome, artifacts: list[ArtifactRef]
+) -> ProductOutcome:
+    kinds = (
+        {"evidence", "evidence_plan", "visual_frame"}
+        if product == "evidence"
+        else {"summary"}
+    )
+    return ProductOutcome(
+        product=product,
+        status=outcome.status,
+        artifacts=[item.path for item in artifacts if item.kind in kinds],
+        omissions=list(outcome.omissions),
     )
 
 
-def _retain_assets(run: Run) -> None:
-    media = run.media
-    if media is None and Path(run.request.inputs[0]).is_file():
-        try:
-            media = run.source.media(
-                request=AsrAudioRequest(
-                    temp_dir=run.source_cache.path_for("tmp/retention"),
-                ),
-                permit=run.media_permit,
-            )
-        except NoTranscriptError:
-            media = None
-    assets = materialize_source_assets(
-        media,
-        run.subtitle,
-        run.request.out_dir,
-        retain=run.resolved.output.retain_media,
-    )
-    for asset in assets:
-        run.manifest.add_source_asset(asset)
-    if not assets:
-        return
-    retained = [asset for asset in assets if asset.retained]
-    if retained:
-        run.manifest.add_step(
-            "source.asset_retention",
-            "ok",
-            ", ".join(asset.path or "" for asset in retained),
-        )
-    else:
-        run.manifest.add_step(
-            "source.asset_retention",
-            "skipped",
-            assets[0].omission_reason,
-        )
-
-
-def _retain_or_error(run: Run, artifact_refs: list[ArtifactRef]) -> None:
-    try:
-        _retain_assets(run)
-    except CacheError:
-        run.manifest.add_step("source.asset_retention", "error", "integrity or copy failure")
-        raise
-
-
-def _error_result(run: Run, exc: CacheError | ProviderError) -> SourcePrepared:
+def _error_result(run: PrepareRun, exc: CacheError | ProviderError) -> SourcePrepared:
     run.request.out_dir.mkdir(parents=True, exist_ok=True)
     artifacts = run.artifacts
     if not artifacts:
         artifacts = [
             write_artifact(
                 run.request.out_dir,
-                Artifact(
-                    name="metadata.json",
-                    kind="metadata",
-                    media_type="application/json",
-                    content=model_to_json(run.metadata),
-                ),
+                Artifact.json("metadata.json", "metadata", run.metadata),
             )
         ]
     detail = "provider failure" if isinstance(exc, ProviderError) else "storage failure"
     run.manifest.add_step("source.failure", "error", detail)
     failed = run.manifest.finish(status="error", artifacts=artifacts, receipts=run.source.receipts)
-    return SourcePrepared(
-        source=failed,
-        artifacts=artifacts,
-        request=run.request,
-        resolved=run.resolved,
-        error=exc,
-    )
+    return SourcePrepared(failed, run.request.inputs[0], error=exc)
 
 
 def _transcript_detail(payload: TranscriptPayload) -> str:
@@ -443,6 +440,4 @@ def _media_detail(media: MediaAsset) -> str:
 
 
 def _capitalize_warning(message: str) -> str:
-    if not message:
-        return message
     return message[:1].upper() + message[1:]

@@ -4,22 +4,20 @@ import hashlib
 import re
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from vctx.artifact.content import ArtifactKind
 from vctx.source.session import EffectReceipt, Revision, SourceRecord
-from vctx.transcript import AsrProvenance
 
 StepStatus = Literal["ok", "skipped", "warning", "error"]
 RunStatus = Literal["ok", "partial", "error"]
-SelectedRoute = Literal[
-    "skipped", "deterministic", "local", "free-online", "configured-online", "unavailable"
-]
-CapabilityName = Literal["asr", "visual_context", "evidence_plan"]
+ProductStatus = Literal["ready", "partial", "unavailable"]
 Freshness = Literal["immutable", "observed-online", "unverified-offline"]
+_TOKEN = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+_OPERATION = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
+_KEY = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 _RESERVED = {
     "con",
     "prn",
@@ -34,228 +32,176 @@ class ClosedModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class AsrStepReceipt(AsrProvenance):
-    kind: Literal["asr"] = "asr"
-    failure: (
-        Literal[
-            "missing_package",
-            "missing_model",
-            "corrupt_model",
-            "unwritable_cache",
-            "unsupported_hardware",
-            "inference_failed",
-            "confirmation_failed",
-            "invalid_timestamps",
-            "invalid_response",
-        ]
-        | None
-    ) = None
+def _bounded_token(value: str) -> str:
+    if _TOKEN.fullmatch(value) is None:
+        raise ValueError("value must be bounded lowercase portable text")
+    return value
 
 
-class FrameCaptureReceipt(ClosedModel):
-    id: str
-    path: str
-    requested_seconds: float = Field(ge=0)
-    actual_seconds: float = Field(ge=0)
-    original_width: int = Field(gt=0)
-    original_height: int = Field(gt=0)
-    orientation: Literal[0, 90, 180, 270]
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-    sha256: str = Field(min_length=64, max_length=64)
-    request_ids: list[str]
-    segment_ids: list[str]
-    claim_ids: list[str]
-    processors: list[Literal["ocr", "describe"]]
-
-
-class FrameMissReceipt(ClosedModel):
-    id: str
-    requested_seconds: float = Field(ge=0)
-    reason: Literal["target_out_of_range"]
-    request_ids: list[str]
-    segment_ids: list[str]
-    claim_ids: list[str]
-
-
-class FrameStepReceipt(ClosedModel):
-    kind: Literal["frames"] = "frames"
-    recipe: Literal["pyav-display-v1"] = "pyav-display-v1"
-    captures: list[FrameCaptureReceipt]
-    misses: list[FrameMissReceipt]
-
-
-type StepReceipt = Annotated[AsrStepReceipt | FrameStepReceipt, Field(discriminator="kind")]
-
-
-class ManifestStep(ClosedModel):
-    name: str
-    status: StepStatus
-    detail: str | None = None
-    receipt: StepReceipt | None = None
+def _portable_path(value: str) -> str:
+    if "\\" in value or not value or value.startswith(("/", "//")):
+        raise ValueError("artifact path must be a contained POSIX path")
+    path = PurePosixPath(value)
+    if path.as_posix() != value or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("artifact path must be a contained POSIX path")
+    for part in path.parts:
+        reserved = part.split(".", 1)[0].casefold() in _RESERVED
+        if ":" in part or part.endswith((" ", ".")) or reserved:
+            raise ValueError("artifact path is not portable")
+    return value
 
 
 class ArtifactRef(ClosedModel):
-    kind: ArtifactKind
+    kind: str
     path: str
-    media_type: str
+    media_type: str = Field(min_length=1, max_length=127)
     bytes: int = Field(ge=0)
-    sha256: str = Field(min_length=64, max_length=64)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
-    @model_validator(mode="after")
-    def contained_lane_path(self) -> ArtifactRef:
-        path = PurePosixPath(self.path)
-        valid_frame = (
-            self.kind == "visual_frame"
-            and len(path.parts) == 2
-            and path.parts[0] == "frames"
-            and path.suffix == ".png"
-        )
-        valid_direct = self.kind != "visual_frame" and len(path.parts) == 1
-        if path.is_absolute() or path.name in {"", ".", ".."} or not (valid_frame or valid_direct):
-            raise ValueError("artifact path is outside its canonical source-lane location")
-        return self
+    _kind_is_portable = field_validator("kind")(_bounded_token)
+    _path_is_portable = field_validator("path")(_portable_path)
 
 
-class SourceEffect(ClosedModel):
-    operation: Literal["observe", "subtitle", "media"]
-    status: Literal["cache_hit", "succeeded", "denied", "failed"]
-    attempts: int = Field(ge=0)
-    purpose: Literal["transcript", "asr", "visual", "input"] | None = None
-    requested_policy: str | None = None
-    selected_policy: str | None = None
+class ProductOutcome(ClosedModel):
+    product: str
+    status: ProductStatus
+    artifacts: list[str] = Field(default_factory=list, max_length=256)
+    omissions: list[str] = Field(default_factory=list, max_length=64)
 
+    _product_is_portable = field_validator("product")(_bounded_token)
+    _artifact_paths_are_portable = field_validator("artifacts")(
+        lambda values: [_portable_path(value) for value in values]
+    )
+
+    @field_validator("omissions")
     @classmethod
-    def from_receipt(cls, receipt: EffectReceipt) -> SourceEffect:
-        return cls(**receipt.model_dump(exclude={"detail"}))
-
-
-class SourceAssetCore(ClosedModel):
-    retained: bool
-    path: str | None = None
-    media_type: str | None = None
-    bytes: int | None = None
-    sha256: str | None = None
-    omission_reason: str | None = None
+    def omissions_are_bounded(cls, values: list[str]) -> list[str]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError("outcome omissions must contain 1..500 characters")
+        return values
 
     @model_validator(mode="after")
-    def retention_fields_are_consistent(self) -> SourceAssetCore:
-        if self.retained:
-            if self.path is None or self.bytes is None or self.sha256 is None:
-                raise ValueError("retained source assets require path, bytes, and sha256")
-            path = PurePosixPath(self.path)
-            if path.is_absolute() or len(path.parts) != 1 or path.name in {"", ".", ".."}:
-                raise ValueError("source asset path must be one direct source-lane child")
-            if self.bytes < 0 or len(self.sha256) != 64:
-                raise ValueError("source asset integrity fields are invalid")
-            if self.omission_reason is not None:
-                raise ValueError("retained source assets cannot have an omission reason")
-        elif any(value is not None for value in (self.path, self.bytes, self.sha256)):
-            raise ValueError("omitted source assets cannot claim retained bytes")
-        elif self.omission_reason is None:
-            raise ValueError("omitted source assets require an omission reason")
+    def outcome_is_consistent(self) -> ProductOutcome:
+        if len(self.artifacts) != len({path.casefold() for path in self.artifacts}):
+            raise ValueError("outcome artifact paths must be unique")
+        if self.status == "ready" and self.omissions:
+            raise ValueError("ready outcomes cannot contain omissions")
         return self
 
 
-class SubtitleSourceAsset(SourceAssetCore):
-    kind: Literal["subtitle"] = "subtitle"
-    purpose: Literal["transcript"] = "transcript"
-    format: Literal["vtt", "srt", "json", "plain", "unknown"]
-    language: str | None = None
-
-
-class AudioSourceAsset(SourceAssetCore):
-    kind: Literal["audio"] = "audio"
-    purpose: Literal["asr"] = "asr"
-    requested_profile: None = None
-    selected_format: str
-
-
-class VideoSourceAsset(SourceAssetCore):
-    kind: Literal["video"] = "video"
-    purpose: Literal["visual"] = "visual"
-    requested_profile: Literal["auto", "fast", "balanced", "high"]
-    selected_format: str
-
-
-class InputSourceAsset(SourceAssetCore):
-    kind: Literal["input"] = "input"
-    purpose: Literal["input"] = "input"
-    selected_format: str
-
-
-SourceAsset = Annotated[
-    SubtitleSourceAsset | AudioSourceAsset | VideoSourceAsset | InputSourceAsset,
-    Field(discriminator="kind"),
-]
-
-
-class TransformEvidence(ClosedModel):
-    capability: CapabilityName
-    selected_route: SelectedRoute
-    provider_id: str | None = None
-    model_id: str | None = None
-    requires_user_config: bool = False
+class ManifestEffect(ClosedModel):
+    operation: str
+    status: str
+    attempts: int = Field(default=0, ge=0, le=100)
+    route: str | None = Field(default=None, max_length=128)
+    provider: str | None = Field(default=None, max_length=128)
+    model: str | None = Field(default=None, max_length=256)
     uploaded: bool = False
     cost_may_apply: bool = False
-    deterministic: bool = False
-    source_artifacts: list[str] = Field(default_factory=list)
-    output_artifacts: list[str] = Field(default_factory=list)
-    reason: str
-    warnings: list[str] = Field(default_factory=list)
+    diagnostic: str | None = Field(default=None, max_length=500)
+
+    @field_validator("operation")
+    @classmethod
+    def operation_is_bounded(cls, value: str) -> str:
+        if _OPERATION.fullmatch(value) is None:
+            raise ValueError("operation must be bounded lowercase portable text")
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def status_is_bounded(cls, value: str) -> str:
+        return _bounded_token(value.replace("-", "_"))
+
+    @classmethod
+    def from_receipt(cls, receipt: EffectReceipt) -> ManifestEffect:
+        return cls(
+            operation=receipt.operation,
+            status=receipt.status,
+            attempts=receipt.attempts,
+            route=receipt.selected_policy or receipt.requested_policy,
+            diagnostic=receipt.detail,
+        )
+
+
+class RunFailure(ClosedModel):
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    category: str
+    diagnostic: str = Field(min_length=1, max_length=500)
+
+    _category_is_portable = field_validator("category")(_bounded_token)
+
+
+class PackRun(ClosedModel):
+    id: UUID
+    requested_target: str
+    failures: list[RunFailure] = Field(default_factory=list, max_length=256)
+
+    _target_is_portable = field_validator("requested_target")(_bounded_token)
 
 
 class ManifestSource(ClosedModel):
-    id: str
+    id: str = Field(min_length=1, max_length=512)
     key: str
     path: str
     kind: Literal["url", "file"]
     revision: Revision
     freshness: Freshness
     observed_at: datetime
-    title: str | None = None
-    duration_seconds: float | None = None
+    title: str | None = Field(default=None, max_length=1000)
+    duration_seconds: float | None = Field(default=None, ge=0)
     status: RunStatus
-    artifacts: list[ArtifactRef]
-    effects: list[SourceEffect]
-    assets: list[SourceAsset]
-    steps: list[ManifestStep]
-    warnings: list[str] = Field(default_factory=list)
-    transform_evidence: list[TransformEvidence] = Field(default_factory=list)
+    artifacts: list[ArtifactRef] = Field(max_length=1024)
+    outcomes: list[ProductOutcome] = Field(max_length=128)
+    effects: list[ManifestEffect] = Field(max_length=1024)
 
     @field_validator("key")
     @classmethod
     def key_is_portable(cls, value: str) -> str:
-        if len(value) > 64 or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value) is None:
+        if len(value) > 64 or _KEY.fullmatch(value) is None:
             raise ValueError("source key must be bounded lowercase portable text")
         if value.casefold() in _RESERVED:
             raise ValueError("source key is reserved on a supported filesystem")
         return value
 
     @model_validator(mode="after")
-    def path_matches_key(self) -> ManifestSource:
+    def source_index_is_consistent(self) -> ManifestSource:
         if self.path != self.key or PurePosixPath(self.path).parts != (self.key,):
             raise ValueError("source path must equal its direct-child key")
+        paths = [artifact.path.casefold() for artifact in self.artifacts]
+        if len(paths) != len(set(paths)):
+            raise ValueError("artifact paths must be unique within a source lane")
+        indexed = set(paths)
+        products = [outcome.product for outcome in self.outcomes]
+        if len(products) != len(set(products)):
+            raise ValueError("product outcomes must be unique")
+        for outcome in self.outcomes:
+            if any(path.casefold() not in indexed for path in outcome.artifacts):
+                raise ValueError("product outcome references an unlisted artifact")
         return self
 
 
 class Manifest(ClosedModel):
-    schema_version: Literal["2"] = "2"
+    schema_version: Literal["3"] = "3"
     tool: Literal["vctx"] = "vctx"
-    tool_version: str
+    tool_version: str = Field(min_length=1, max_length=64)
     pack_id: UUID
-    updated_run_id: UUID
+    run: PackRun
     status: RunStatus
     created_at: datetime
     updated_at: datetime
-    sources: list[ManifestSource]
+    sources: list[ManifestSource] = Field(max_length=1024)
 
     @model_validator(mode="after")
     def sources_are_unique(self) -> Manifest:
         for field in ("id", "key", "path"):
-            values = [getattr(source, field) for source in self.sources]
+            values = [str(getattr(source, field)).casefold() for source in self.sources]
             if len(values) != len(set(values)):
                 raise ValueError(f"manifest source {field} values must be unique")
+        revisions = [
+            (source.id, source.revision.kind, source.revision.value) for source in self.sources
+        ]
+        if len(revisions) != len(set(revisions)):
+            raise ValueError("manifest source identity/revision pairs must be unique")
         return self
 
 
@@ -270,36 +216,45 @@ class ManifestBuilder:
             if offline
             else "observed-online"
         )
-        self.steps: list[ManifestStep] = []
-        self.warnings: list[str] = []
-        self.transform_evidence: list[TransformEvidence] = []
-        self.source_assets: list[SourceAsset] = []
+        self.effects: list[ManifestEffect] = []
+        self.outcomes: dict[str, ProductOutcome] = {}
+        self.omissions: list[str] = []
 
     @classmethod
     def start(cls, source: SourceRecord, key: str, *, offline: bool) -> ManifestBuilder:
         return cls(source, key, offline=offline)
 
     def add_step(
-        self,
-        name: str,
-        status: StepStatus,
-        detail: str | None = None,
-        receipt: StepReceipt | None = None,
+        self, name: str, status: StepStatus, detail: str | None = None, receipt: object = None
     ) -> None:
-        self.steps.append(ManifestStep(name=name, status=status, detail=detail, receipt=receipt))
+        del receipt
+        mapped = {"ok": "succeeded", "warning": "warning", "error": "failed"}.get(
+            status, status
+        )
+        self.effects.append(
+            ManifestEffect(operation=name, status=mapped, diagnostic=detail)
+        )
 
     def warn(self, message: str) -> None:
-        self.warnings.append(message)
+        self.omissions.append(message[:500])
 
-    def add_transform_evidence(self, evidence: TransformEvidence) -> None:
-        self.transform_evidence.append(evidence)
+    def add_effect(self, effect: ManifestEffect) -> None:
+        self.effects.append(effect)
 
-    def add_source_asset(self, asset: SourceAsset) -> None:
-        self.source_assets.append(asset)
+    def add_outcome(self, outcome: ProductOutcome) -> None:
+        self.outcomes[outcome.product] = outcome
 
     def finish(
         self, status: RunStatus, artifacts: list[ArtifactRef], receipts: list[EffectReceipt]
     ) -> ManifestSource:
+        unique = {artifact.path.casefold(): artifact for artifact in artifacts}
+        if len(unique) != len(artifacts):
+            raise ValueError("each retained file must have exactly one artifact record")
+        outcomes = dict(self.outcomes)
+        if self.omissions:
+            outcomes["prepare"] = ProductOutcome(
+                product="prepare", status="partial", omissions=self.omissions[:64]
+            )
         metadata = self.source.metadata
         return ManifestSource(
             id=self.source.source_id,
@@ -313,11 +268,11 @@ class ManifestBuilder:
             duration_seconds=metadata.duration_seconds,
             status=status,
             artifacts=artifacts,
-            effects=[SourceEffect.from_receipt(receipt) for receipt in receipts],
-            assets=self.source_assets,
-            steps=self.steps,
-            warnings=self.warnings,
-            transform_evidence=self.transform_evidence,
+            outcomes=list(outcomes.values()),
+            effects=[
+                *(ManifestEffect.from_receipt(receipt) for receipt in receipts),
+                *self.effects,
+            ],
         )
 
 
@@ -342,6 +297,8 @@ def build_manifest(
     *,
     incomplete: bool = False,
     previous: Manifest | None = None,
+    failures: list[RunFailure] | None = None,
+    requested_target: str = "prepare",
 ) -> Manifest:
     now = datetime.now(UTC)
     statuses = {source.status for source in sources}
@@ -354,7 +311,7 @@ def build_manifest(
     return Manifest(
         tool_version=tool_version,
         pack_id=previous.pack_id if previous else uuid4(),
-        updated_run_id=uuid4(),
+        run=PackRun(id=uuid4(), requested_target=requested_target, failures=failures or []),
         status=status,
         created_at=previous.created_at if previous else now,
         updated_at=now,

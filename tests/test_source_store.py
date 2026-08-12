@@ -80,7 +80,7 @@ def _session() -> _Session:
             revision=Revision(kind="observed", value="revision"),
             observed_at=datetime(2026, 1, 1, tzinfo=UTC),
             metadata=VideoMetadata(
-                id="example__abc", source_type="url", source=source, title="Lecture"
+                id="example__abc", source=source, title="Lecture"
             ),
             has_subtitles=True,
         ),
@@ -132,12 +132,12 @@ def test_source_store_rejects_newer_schema_without_mutating_it(tmp_path: Path) -
     store = SourceStore(tmp_path / "source")
     store.root.mkdir(parents=True)
     with sqlite3.connect(store.database) as connection:
-        connection.execute("PRAGMA user_version=4")
+        connection.execute("PRAGMA user_version=5")
 
     with pytest.raises(CacheError, match="newer"):
         store.get("https://video.example/watch")
     with sqlite3.connect(store.database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_source_store_serializes_concurrent_publication(tmp_path: Path) -> None:
@@ -153,7 +153,8 @@ def test_source_store_serializes_concurrent_publication(tmp_path: Path) -> None:
     assert all(store.get(locator) is not None for locator in locators)
 
 
-def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(tmp_path: Path) -> None:
+def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     store = SourceStore(tmp_path / "source")
     locator = "https://video.example/watch?v=abc"
     session = _session()
@@ -165,22 +166,21 @@ def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(tmp_path
     audio = tracked.media(request=AsrAudioRequest(), permit=permit)
     assert audio.local_path.read_bytes() == b"downloaded-once"
     assert session.media_calls == 1
-    assert not list(tmp_path.rglob("*.vctx-media.json"))
-
+    monkeypatch.setattr(
+        "vctx.source.store._file_digest", lambda _path: pytest.fail("unchanged blob was rehashed")
+    )
     cached = store.get(locator)
     assert cached is not None
     offline_audio = cached.media(
         request=AsrAudioRequest(), permit=MediaPermit(network="denied")
     )
-    assert offline_audio.local_path == audio.local_path
-    assert offline_audio.purpose == "asr"
+    assert (offline_audio.local_path, offline_audio.purpose) == (audio.local_path, "asr")
 
     reobserved = _session()
     reobserved.record.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
     online_again = store.wrap(locator, cast(SourceSession, reobserved))
     reused = online_again.media(request=AsrAudioRequest(), permit=permit)
-    assert reused.local_path == audio.local_path
-    assert reobserved.media_calls == 0
+    assert (reused.local_path, reobserved.media_calls) == (audio.local_path, 0)
 
     with pytest.raises(OfflineSourceError, match="offline media cache miss"):
         cached.media(

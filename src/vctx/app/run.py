@@ -12,20 +12,26 @@ from vctx.ai import (
     AiRoute,
     AiRuntimePool,
     AiTask,
-    CredentialRef,
     Keyring,
-    read_credential,
-    select_ai_route,
+    admit_ai_binding,
 )
 from vctx.app.auth import AuthError, system_keyring
 from vctx.app.models import ModelLifecycleError, require_prepared_model
-from vctx.artifact.manifest import ArtifactRef, ManifestBuilder, source_key
+from vctx.artifact.bundle import retain_source_files
+from vctx.artifact.manifest import (
+    ArtifactRef,
+    ManifestBuilder,
+    ManifestSource,
+    ProductOutcome,
+    source_key,
+)
 from vctx.asr import AsrEnvironment, AsrRuntimePool
 from vctx.config import AsrInstanceConfig, CapabilityPolicy, PrepareRequest, ResolvedConfig
-from vctx.errors import NoTranscriptError
+from vctx.errors import CacheError, NoTranscriptError
 from vctx.net import HttpxNetRuntime, NetRuntime
 from vctx.source.admission import open_source, select_source
 from vctx.source.session import (
+    AsrAudioRequest,
     MediaAsset,
     MediaPermit,
     ObservePermit,
@@ -63,7 +69,7 @@ class RunRuntimes:
 
 
 @dataclass
-class Run:
+class PrepareRun:
     request: PrepareRequest
     resolved: ResolvedConfig
     manifest: ManifestBuilder
@@ -89,6 +95,10 @@ class Run:
         binding = self.ai_bindings.get("evidence_plan")
         return binding.route if binding is not None else None
 
+    def summary_ai_route(self) -> AiRoute | None:
+        binding = self.ai_bindings.get("summary")
+        return binding.route if binding is not None else None
+
     def ai_client(self, route: AiRoute) -> AiClient:
         return AiClient(
             self.ai_bindings[route.task],
@@ -108,13 +118,69 @@ class Run:
             self.asr_environment = _load_asr_environment(self.resolved)
         return self.asr_environment
 
+    def finish(
+        self, artifacts: list[ArtifactRef], outcomes: list[ProductOutcome]
+    ) -> ManifestSource:
+        for outcome in outcomes:
+            self.manifest.add_outcome(outcome)
+        requested = next(item for item in outcomes if item.product == self.resolved.target)
+        status = (
+            "ok"
+            if requested.status == "ready" and all(item.status == "ready" for item in outcomes)
+            else "partial"
+        )
+        return self.manifest.finish(status, artifacts, self.source.receipts)
 
-def open_run(
+    def retain(self, artifacts: list[ArtifactRef]) -> None:
+        media = self.media
+        if media is None and Path(self.request.inputs[0]).is_file():
+            try:
+                media = self.source.media(
+                    request=AsrAudioRequest(
+                        temp_dir=self.source_cache.path_for("tmp/retention")
+                    ),
+                    permit=self.media_permit,
+                )
+            except NoTranscriptError:
+                media = None
+        try:
+            retained, omissions = retain_source_files(
+                media,
+                self.subtitle,
+                self.request.out_dir,
+                retain=self.resolved.output.retain_media,
+            )
+        except CacheError:
+            self.manifest.add_step(
+                "source.asset_retention", "error", "integrity or copy failure"
+            )
+            raise
+        artifacts.extend(retained)
+        if retained:
+            self.manifest.add_outcome(
+                ProductOutcome(
+                    product="retained-media",
+                    status="ready",
+                    artifacts=[artifact.path for artifact in retained],
+                )
+            )
+            detail = ", ".join(artifact.path for artifact in retained)
+            self.manifest.add_step("source.asset_retention", "ok", detail)
+        elif omissions:
+            self.manifest.add_outcome(
+                ProductOutcome(
+                    product="retained-media", status="unavailable", omissions=omissions
+                )
+            )
+            self.manifest.add_step("source.asset_retention", "skipped", omissions[0])
+
+
+def open_prepare_run(
     request: PrepareRequest,
     resolved: ResolvedConfig,
     occupied: dict[str, str],
     runtimes: RunRuntimes,
-) -> Run:
+) -> PrepareRun:
     network = "denied" if resolved.runtime.offline else "allowed"
     permit = ObservePermit(operation="prepare", network=network)
     cache = SourceStore(resolved.cache.source_dir)
@@ -136,23 +202,23 @@ def open_run(
     lane_request = request.model_copy(update={"out_dir": request.out_dir / key})
     manifest = ManifestBuilder.start(source.record, key, offline=resolved.runtime.offline)
     logger.info(
-        "prepare.config workflow=%s cache=%s config=%s offline=%s",
-        resolved.runtime.workflow,
+        "prepare.config target=%s cache=%s config=%s offline=%s",
+        resolved.target,
         cache.root,
-        request.config_path or "built-in defaults + CLI",
+        resolved.config_file.path or "built-in defaults + CLI",
         resolved.runtime.offline,
     )
-    logger.debug("prepare.output formats=%s", ",".join(resolved.output.formats))
+    logger.debug("prepare.output projections=%s", ",".join(resolved.output.projections))
     manifest.add_step("source.detect", "ok", source.name)
     logger.info("source.detect adapter=%s", source.name)
     metadata = source.record.metadata
     manifest.add_step("metadata.extract", "ok")
     logger.info(
-        "metadata.extract status=ok id=%s source_type=%s",
+        "metadata.extract status=ok id=%s source_kind=%s",
         metadata.id,
-        metadata.source_type,
+        metadata.source.kind,
     )
-    return Run(
+    return PrepareRun(
         request=lane_request,
         resolved=resolved,
         manifest=manifest,
@@ -183,63 +249,25 @@ def _ai_bindings(resolved: ResolvedConfig) -> dict[AiTask, AiBinding]:
     selections: tuple[tuple[AiTask, CapabilityPolicy], ...] = (
         ("evidence_plan", resolved.evidence.planner),
         ("vision_description", resolved.evidence.vision),
+        ("summary", resolved.summary.policy),
     )
     for task, policy in selections:
-        binding = _ai_binding(task, policy, resolved, keyring)
+        binding = admit_ai_binding(
+            task=task,
+            instance_name=policy.instance_name(),
+            auto=policy.auto(),
+            instances=resolved.instances.ai,
+            offline=resolved.runtime.offline,
+            env_files=resolved.runtime.env_files,
+            keyring=keyring,
+        )
         if binding is not None:
             bindings[task] = binding
     return bindings
 
 
-def _ai_binding(
-    task: AiTask,
-    policy: CapabilityPolicy,
-    resolved: ResolvedConfig,
-    keyring: Keyring | None,
-) -> AiBinding | None:
-    if policy.disabled():
-        return None
-    credential = None
-    auto_ref = None
-    if policy.auto():
-        for candidate in (
-            CredentialRef("env:OPENROUTER_API_KEY"),
-            CredentialRef("keyring:openrouter"),
-        ):
-            try:
-                credential = read_credential(
-                    candidate,
-                    env_files=resolved.runtime.env_files,
-                    keyring=keyring,
-                )
-            except ValueError:
-                continue
-            auto_ref = candidate
-            break
-    route = select_ai_route(
-        task=task,
-        instance_name=policy.instance_name(),
-        auto=policy.auto(),
-        instances=resolved.instances.ai,
-        offline=False,
-        auto_credential=auto_ref,
-    )
-    if route is None:
-        return None
-    if route.instance.credential is not None and credential is None:
-        try:
-            credential = read_credential(
-                route.instance.credential,
-                env_files=resolved.runtime.env_files,
-                keyring=keyring,
-            )
-        except ValueError:
-            return None
-    return AiBinding(route, credential)
-
-
 def _load_asr_environment(resolved: ResolvedConfig) -> AsrEnvironment:
-    instance_name = resolved.transforms.asr.instance_name()
+    instance_name = resolved.asr.instance_name()
     instance = select_asr_instance(resolved)
     if instance is None:
         return AsrEnvironment(offline=resolved.runtime.offline)
@@ -254,10 +282,10 @@ def _load_asr_environment(resolved: ResolvedConfig) -> AsrEnvironment:
 
 
 def select_asr_instance(resolved: ResolvedConfig) -> AsrInstanceConfig | None:
-    name = resolved.transforms.asr.instance_name()
+    name = resolved.asr.instance_name()
     if name is not None:
         return resolved.instances.asr.get(name)
-    if resolved.transforms.asr.enabled:
+    if resolved.asr.enabled:
         return AsrInstanceConfig(type="local-faster-whisper", model="small")
     return None
 

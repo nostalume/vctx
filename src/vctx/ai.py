@@ -13,13 +13,10 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError, model_validator
 
-from vctx.artifact.manifest import CapabilityName, TransformEvidence
-from vctx.net import NetError, NetRequest, NetResponse, NetRuntime, RetryPolicy
+from vctx.artifact.manifest import ManifestEffect
+from vctx.net import NetError, NetPurpose, NetRequest, NetResponse, NetRuntime, RetryPolicy
 
-type AiTask = Literal[
-    "evidence_plan",
-    "vision_description",
-]
+type AiTask = Literal["evidence_plan", "summary", "vision_description"]
 type AiFormat = Literal["schema", "json", "prompt"]
 type AiFormatPolicy = Literal["auto", "schema", "json", "prompt"]
 type AiRequestPolicy = Literal["generic", "openrouter-free-zdr"]
@@ -145,18 +142,16 @@ class AiRoute(ClosedModel):
     def detail(self) -> str:
         return f"{self.provider_id}: {self.model}"
 
-    def transform_evidence(self, capability: CapabilityName) -> TransformEvidence:
-        return TransformEvidence(
-            capability=capability,
-            selected_route=self.selected,
-            provider_id=self.provider_id,
-            model_id=self.model,
-            requires_user_config=self.selected == "configured-online",
+    def effect(self, operation: AiTask) -> ManifestEffect:
+        return ManifestEffect(
+            operation=operation,
+            status="selected",
+            route=self.selected,
+            provider=self.provider_id,
+            model=self.model,
             uploaded=self.selected != "local",
             cost_may_apply=self.instance.cost != "free",
-            deterministic=False,
-            reason=self.reason,
-            warnings=self.warnings,
+            diagnostic="; ".join([self.reason, *self.warnings])[:500],
         )
 
 
@@ -596,6 +591,53 @@ def select_ai_route(
     )
 
 
+def admit_ai_binding(
+    *,
+    task: AiTask,
+    instance_name: str | None,
+    auto: bool,
+    instances: Mapping[str, AiInstanceConfig],
+    offline: bool,
+    env_files: list[Path] | None = None,
+    keyring: Keyring | None = None,
+) -> AiBinding | None:
+    if offline:
+        return None
+    credential = None
+    auto_ref = None
+    if auto:
+        for candidate in (
+            CredentialRef("env:OPENROUTER_API_KEY"),
+            CredentialRef("keyring:openrouter"),
+        ):
+            try:
+                credential = read_credential(candidate, env_files=env_files, keyring=keyring)
+            except ValueError:
+                continue
+            auto_ref = candidate
+            break
+    route = select_ai_route(
+        task=task,
+        instance_name=instance_name,
+        auto=auto,
+        instances=instances,
+        offline=False,
+        auto_credential=auto_ref,
+    )
+    if route is None:
+        return None
+    if route.instance.credential is not None and credential is None:
+        try:
+            credential = read_credential(
+                route.instance.credential,
+                env_files=env_files,
+                keyring=keyring,
+            )
+        except ValueError:
+            return None
+    return AiBinding(route, credential)
+
+
 class Keyring(Protocol):
     priority: float
 
@@ -635,7 +677,5 @@ def _dotenv_credential(name: str, paths: list[Path]) -> str | None:
     return None
 
 
-def _net_purpose(task: AiTask) -> Literal["vision_description", "evidence_plan"]:
-    if task == "vision_description":
-        return "vision_description"
-    return "evidence_plan"
+def _net_purpose(task: AiTask) -> NetPurpose:
+    return task

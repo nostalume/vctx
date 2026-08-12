@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -58,6 +57,22 @@ class OfflineRuntime:
         pass
 
 
+class ConflictingYoutubeDL(FakeYoutubeDL):
+    def extract_info(self, value: str, download: bool = False) -> dict[str, object]:
+        duration = 1 if value.endswith("one") else 2
+        return {
+            "id": "shared",
+            "title": f"Revision {duration}",
+            "duration": duration,
+            "webpage_url": value,
+            "extractor": "example",
+            "subtitles": {
+                "en": [{"ext": "vtt", "url": "https://cdn.example/shared.vtt"}]
+            },
+            "automatic_captions": {},
+        }
+
+
 def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -86,7 +101,7 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
         "automatic_captions": {},
     }
     FakeYoutubeDL.observations = 0
-    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)
     monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     out_dir = tmp_path / "out"
 
@@ -118,26 +133,31 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     }
     assert "manifest-secret" not in json.dumps(manifest)
     assert manifest["status"] == "ok"
-    assert manifest["schema_version"] == "2"
-    subtitle_asset = source_entry["assets"][0]
+    assert manifest["schema_version"] == "3"
+
+
+    subtitle_asset = next(
+        item for item in source_entry["artifacts"] if item["kind"] == "subtitle"
+    )
     assert subtitle_asset["kind"] == "subtitle"
     assert subtitle_asset["path"] == "subtitle.en.vtt"
     assert (lane / subtitle_asset["path"]).read_text(encoding="utf-8") == (
         FakeSubtitleRuntime.response_text
     )
-    assert [effect["operation"] for effect in source_entry["effects"]] == [
+    source_effects = [
+        effect["operation"]
+        for effect in source_entry["effects"]
+        if effect["operation"] in {"observe", "subtitle", "media"}
+    ]
+    assert source_effects == [
         "observe",
         "subtitle",
     ]
-    assert _step_status(manifest, "source.detect") == "ok"
-    assert _step_status(manifest, "metadata.extract") == "ok"
-    assert _step_status(manifest, "transcript.extract") == "ok"
-    assert _step_detail(manifest, "transcript.extract") == "yt-dlp:official_subtitles:en:vtt"
 
     metadata = json.loads((lane / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["id"] == "example__abc"
     assert metadata["title"] == "URL Lecture"
-    assert metadata["source_type"] == "url"
+    assert metadata["source"]["kind"] == "url"
 
     clean = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert clean["segments"][0]["text"] == (
@@ -147,6 +167,43 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     context = (lane / "context.md").read_text(encoding="utf-8")
     assert "# Agent Context Pack" in context
     assert "The workflow takes a video URL" in context
+
+
+@pytest.mark.parametrize("urls", [("one", "two"), ("two", "one")])
+def test_batch_rejects_conflicting_revisions_independently_of_input_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, urls: tuple[str, str]
+) -> None:
+    import vctx.app.run as run_module
+    import vctx.source.ytdlp as module
+
+    FakeSubtitleRuntime.response_text = (
+        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nShared source.\n"
+    )
+    monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", ConflictingYoutubeDL)
+    monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
+    local = tmp_path / "independent.srt"
+    local.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nIndependent.\n", encoding="utf-8"
+    )
+    out = tmp_path / "out"
+
+    result = runner.invoke(
+        app,
+        [
+            "prepare",
+            f"https://video.example/{urls[0]}",
+            str(local),
+            f"https://video.example/{urls[1]}",
+            "--out",
+            str(out),
+        ],
+    )
+
+    assert result.exit_code == 3
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert [source["title"] for source in manifest["sources"]] == ["independent"]
+    assert len(manifest["run"]["failures"]) == 2
+    assert "video.example" not in json.dumps(manifest["run"]["failures"])
 
 
 def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
@@ -167,7 +224,7 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
     FakeSubtitleRuntime.response_text = (
         "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nCached transcript survives offline.\n"
     )
-    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)
     monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     cache = tmp_path / "cache"
 
@@ -178,7 +235,7 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
     assert online.exit_code == 0, online.output
 
     monkeypatch.setattr(
-        module.yt_dlp,
+        module._yt_dlp(),
         "YoutubeDL",
         lambda _params: pytest.fail("offline admission attempted provider discovery"),
     )
@@ -208,7 +265,12 @@ def test_prepare_url_seeds_verified_cache_for_network_free_offline_run(
     clean = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert clean["segments"][0]["text"] == "Cached transcript survives offline."
     assert source_entry["freshness"] == "unverified-offline"
-    assert [(item["operation"], item["status"]) for item in source_entry["effects"]] == [
+    source_effects = [
+        (item["operation"], item["status"])
+        for item in source_entry["effects"]
+        if item["operation"] in {"observe", "subtitle", "media"}
+    ]
+    assert source_effects == [
         ("observe", "cache_hit"),
         ("subtitle", "cache_hit"),
     ]
@@ -231,7 +293,7 @@ def test_online_prepare_degrades_when_source_cache_cannot_be_written(
     FakeSubtitleRuntime.response_text = (
         "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nUncached result remains usable.\n"
     )
-    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)
     monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     blocked_cache = tmp_path / "cache"
     blocked_cache.write_text("not a directory", encoding="utf-8")
@@ -251,42 +313,3 @@ def test_online_prepare_degrades_when_source_cache_cannot_be_written(
     assert result.exit_code == 0, result.output
     manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
     assert (tmp_path / "out" / manifest["sources"][0]["path"] / "transcript.json").is_file()
-
-
-def _step_status(manifest: dict[str, Any], name: str) -> str:
-    step = _step(manifest, name)
-    status = step["status"]
-    assert isinstance(status, str)
-    return status
-
-
-def _step_detail(manifest: dict[str, Any], name: str) -> str:
-    step = _step(manifest, name)
-    detail = step["detail"]
-    assert isinstance(detail, str)
-    return detail
-
-
-def _step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    steps = manifest["sources"][0]["steps"]
-    assert isinstance(steps, list)
-    for raw_step in steps:
-        assert isinstance(raw_step, dict)
-        step = cast(dict[str, Any], raw_step)
-        if step["name"] == name:
-            return step
-    raise AssertionError(f"missing manifest step: {name}")
-
-
-def _has_edge(flow: dict[str, Any], source: str, target: str) -> bool:
-    nodes = flow["nodes"]
-    edges = flow["edges"]
-    assert isinstance(nodes, list)
-    assert isinstance(edges, list)
-    node_labels = {node["id"]: node["label"] for node in nodes if isinstance(node, dict)}
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        if node_labels[edge["source"]] == source and node_labels[edge["target"]] == target:
-            return True
-    return False

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -30,44 +29,6 @@ class FakeYoutubeDL:
         return self.info
 
 
-def test_prepare_metadata_workflow_writes_metadata_only_partial_pack(tmp_path: Path) -> None:
-    source = tmp_path / "lecture.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:01,000
-hello
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-
-    result = runner.invoke(
-        app,
-        ["prepare", str(source), "--out", str(out_dir), "--workflow", "metadata"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Wrote partial context pack" in result.output
-    assert "Workflow: metadata" in result.output
-    assert "Status: partial" in result.output
-    assert "Warnings:" in result.output
-    assert "/metadata.json" in result.output
-    assert "Context:" not in result.output
-    assert (out_dir / "manifest.json").exists()
-
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-    source_entry = manifest["sources"][0]
-    lane = out_dir / source_entry["path"]
-    assert (lane / "metadata.json").exists()
-    assert not (lane / "transcript.json").exists()
-    assert not (lane / "chunks.json").exists()
-    assert not (lane / "context.md").exists()
-    assert manifest["status"] == "partial"
-    assert {artifact["path"] for artifact in source_entry["artifacts"]} == {"metadata.json"}
-    assert source_entry["warnings"] == ["metadata workflow selected; transcript pipeline skipped"]
-    assert _step_status(manifest, "transcript.extract") == "skipped"
-
-
 def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -81,7 +42,7 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
         "subtitles": {},
         "automatic_captions": {},
     }
-    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)
     out_dir = tmp_path / "out"
 
     result = runner.invoke(
@@ -91,7 +52,7 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
 
     assert result.exit_code == 0, result.output
     assert "Wrote partial context pack" in result.output
-    assert "Workflow: default" in result.output
+    assert "Target: transcript" in result.output
     assert "Status: partial" in result.output
     assert "Routes:" in result.output
     assert "/metadata.json" in result.output
@@ -106,10 +67,11 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
     metadata = json.loads((lane / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["id"] == "example__abc"
     assert manifest["status"] == "partial"
-    assert _step_status(manifest, "transcript.extract") == "warning"
-    assert _step_status(manifest, "transform.asr") == "warning"
-    assert "No subtitles found" in "\n".join(source_entry["warnings"])
-    assert "vctx models pull asr" in "\n".join(source_entry["warnings"])
+    omissions = "\n".join(
+        item for outcome in source_entry["outcomes"] for item in outcome["omissions"]
+    )
+    assert "No subtitles found" in omissions
+    assert "vctx models pull asr" in omissions
 
 
 def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(
@@ -118,7 +80,7 @@ def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(
     import vctx.source.ytdlp as module
 
     monkeypatch.setattr(
-        module.yt_dlp,
+        module._yt_dlp(),
         "YoutubeDL",
         lambda _params: pytest.fail("offline source admission attempted network access"),
     )
@@ -182,16 +144,3 @@ def test_prepare_rejects_cache_output_containment_before_writing(
     assert result.exit_code == 2
     assert "must not contain each other" in result.output
     assert not out_dir.exists()
-
-
-def _step_status(manifest: dict[str, Any], name: str) -> str:
-    steps = manifest["sources"][0]["steps"]
-    assert isinstance(steps, list)
-    for raw_step in steps:
-        assert isinstance(raw_step, dict)
-        step = cast(dict[str, Any], raw_step)
-        if step["name"] == name:
-            status = step["status"]
-            assert isinstance(status, str)
-            return status
-    raise AssertionError(f"missing manifest step: {name}")

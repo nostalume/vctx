@@ -2,13 +2,34 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel
 
+from vctx.config import ResolvedConfig
 from vctx.errors import CacheError, ConfigError
 from vctx.source.store import CacheInventory, PruneReceipt, SourceStore
+
+
+@dataclass(frozen=True)
+class Cache:
+    root: Path
+
+    @classmethod
+    def open(cls, resolved: ResolvedConfig) -> Cache:
+        return cls(resolved.cache.source_dir)
+
+    def status(self) -> CacheInventory:
+        return cache_status(self.root)
+
+    def prune(
+        self, *, age: str | None = None, all_records: bool = False, dry_run: bool = False
+    ) -> PruneReceipt:
+        return prune_cache(
+            self.root, age=age, all_records=all_records, dry_run=dry_run
+        )
 
 
 def cache_status(root: Path) -> CacheInventory:

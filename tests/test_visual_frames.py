@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from PIL import Image
 
 from vctx.source.local import LocalMediaAsset
 from vctx.source.session import SourceRef
 from vctx.visual.frame import FrameError, capture
 from vctx.visual.plan import PlannedFrame
+
+Image = pytest.importorskip("PIL.Image")
+pytest.importorskip("av")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "frame.mp4"
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vctx.config import PrepareRequest, WorkflowProfile, load_resolved_config
+from vctx.config import PrepareRequest, load_resolved_config
 from vctx.net import HttpxNetRuntime
 from vctx.source.admission import open_source, select_source
 from vctx.source.session import ObservePermit, VideoMetadata
@@ -20,7 +20,6 @@ def inspect_metadata(
         PrepareRequest(
             inputs=[value],
             out_dir=Path("."),
-            workflow=WorkflowProfile.METADATA,
             config_path=config_path,
             cache_dir=cache_dir,
             offline=offline,
@@ -44,14 +43,13 @@ def inspect_metadata(
 def render_metadata_text(metadata: VideoMetadata) -> str:
     lines: list[str] = [
         f"id: {metadata.id}",
-        f"source_type: {metadata.source_type}",
+        f"source_kind: {metadata.source.kind}",
         f"source: {metadata.source.value}",
     ]
     optional_fields = {
         "title": metadata.title,
         "uploader": metadata.uploader,
         "duration_seconds": metadata.duration_seconds,
-        "webpage_url": metadata.webpage_url,
         "language": metadata.language,
         "extractor": metadata.extractor,
         "raw_provider": metadata.raw_provider,

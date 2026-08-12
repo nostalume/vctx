@@ -122,8 +122,8 @@ def test_successful_invalid_output_never_falls_back_or_repairs() -> None:
         runtimes=AiRuntimePool(),
         clock=lambda: 1.0,
     ).complete(
-        task="evidence_plan",
-        request_id="window-1",
+        task="summary",
+        request_id="summary",
         messages=[AiMessage(role="user", content="answer")],
         result=Answer,
     )

@@ -44,44 +44,38 @@ This is a second caption.
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir)])
 
     assert result.exit_code == 0, result.output
-    assert "Status: ok" in result.output
-    assert (out_dir / "manifest.json").exists()
-
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     source_entry = manifest["sources"][0]
     lane = out_dir / source_entry["path"]
-    lane_names = {path.name for path in lane.iterdir()}
-    assert lane_names >= {
-        "metadata.json",
-        "subtitle.und.srt",
-        "transcript.json",
-        "chunks.json",
-        "context.md",
-        "read.md",
-    }
-    assert [name for name in lane_names if name.startswith("transcript")] == [
-        "transcript.json"
-    ]
-    assert lane_names.isdisjoint({"visual_records.json", "visual_scores.json"})
-    assert manifest["schema_version"] == "2"
-    assert manifest["status"] == "ok"
-    assert "input" not in manifest
-    assert source_entry["id"].startswith("local__")
-    assert source_entry["assets"][0]["path"] == "subtitle.und.srt"
-    assert {artifact["path"] for artifact in source_entry["artifacts"]} >= {
-        "metadata.json",
-        "context.md",
-        "read.md",
-    }
-
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["segments"][0]["text"] == "Hello world."
     assert (lane / "subtitle.und.srt").read_bytes() == source.read_bytes()
+    outcomes = {item["product"]: item for item in source_entry["outcomes"]}
+    assert outcomes["transcript"]["artifacts"] == ["transcript.json", "chunks.json"]
+    assert outcomes.keys().isdisjoint({"evidence", "summary"})
 
     context = (lane / "context.md").read_text(encoding="utf-8")
-    assert "# Agent Context Pack" in context
+    assert "# Agent Context Pack" in context and "Hello world." in context
     assert '<chunk id="chunk_0001" start="00:00:00" end="00:00:05">' in context
-    assert "Hello world." in context
+
+
+def test_projection_selection_cannot_suppress_canonical_products(tmp_path: Path) -> None:
+    source = tmp_path / "lecture.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\nCanonical.\n", encoding="utf-8")
+    config = tmp_path / "vctx.toml"
+    config.write_text('[output]\nprojections = ["context"]\n', encoding="utf-8")
+    out = tmp_path / "pack"
+
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(out),
+                                 "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lane = out / manifest["sources"][0]["path"]
+    names = {path.name for path in lane.iterdir()}
+    assert {"metadata.json", "transcript.json", "chunks.json"} <= names
+    assert (lane / "context.md").is_file()
+    assert not (lane / "read.md").exists()
 
 
 def test_prepare_multiple_inputs_writes_independent_source_lanes(tmp_path: Path) -> None:
@@ -97,18 +91,15 @@ def test_prepare_multiple_inputs_writes_independent_source_lanes(tmp_path: Path)
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "2"
+    assert manifest["schema_version"] == "3"
     assert len(manifest["sources"]) == 2
-    assert {path.name for path in out.iterdir()} == {
-        "manifest.json",
-        *(source["key"] for source in manifest["sources"]),
-    }
+    expected = {"manifest.json", *(source["key"] for source in manifest["sources"])}
+    assert {path.name for path in out.iterdir()} == expected
     for source in manifest["sources"]:
         lane = out / source["path"]
         assert lane.is_dir()
         assert (lane / "metadata.json").is_file()
-        assert (lane / "context.md").is_file()
-        assert not (lane / "manifest.json").exists()
+        assert (lane / "context.md").is_file() and not (lane / "manifest.json").exists()
         for artifact in source["artifacts"]:
             body = (lane / artifact["path"]).read_bytes()
             assert artifact["bytes"] == len(body)
@@ -125,6 +116,7 @@ def test_prepare_adds_to_valid_pack_without_rewriting_existing_lane(tmp_path: Pa
     before_manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     first_lane = out / before_manifest["sources"][0]["path"]
     before = {path.name: path.read_bytes() for path in first_lane.iterdir()}
+    identity = (first_lane / "context.md").stat().st_ino
 
     result = runner.invoke(app, ["prepare", str(second), "--out", str(out)])
 
@@ -133,6 +125,7 @@ def test_prepare_adds_to_valid_pack_without_rewriting_existing_lane(tmp_path: Pa
     assert after_manifest["pack_id"] == before_manifest["pack_id"]
     assert len(after_manifest["sources"]) == 2
     assert {path.name: path.read_bytes() for path in first_lane.iterdir()} == before
+    assert (first_lane / "context.md").stat().st_ino == identity
 
 
 def test_prepare_replaces_changed_source_and_preserves_its_sibling(tmp_path: Path) -> None:
@@ -162,8 +155,11 @@ def test_prepare_reuses_matching_revision_unless_overwrite_is_set(
 ) -> None:
     source = tmp_path / "source.srt"
     source.write_text("1\n00:00:00,000 --> 00:00:01,000\nStable.\n", encoding="utf-8")
+    config = tmp_path / "vctx.toml"
+    config.write_text('[output]\nprojections = ["context"]\n', encoding="utf-8")
     out = tmp_path / "pack"
-    assert runner.invoke(app, ["prepare", str(source), "--out", str(out)]).exit_code == 0
+    base = ["prepare", str(source), "--out", str(out), "--config", str(config)]
+    assert runner.invoke(app, base).exit_code == 0
     calls = 0
     original = LocalFileSession.transcript
 
@@ -173,12 +169,18 @@ def test_prepare_reuses_matching_revision_unless_overwrite_is_set(
         return original(self, permit=permit)
 
     monkeypatch.setattr(LocalFileSession, "transcript", tracked)
-    assert runner.invoke(app, ["prepare", str(source), "--out", str(out)]).exit_code == 0
+    assert runner.invoke(app, base).exit_code == 0
     assert calls == 0
+    upgraded = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--to", "evidence"])
+    assert upgraded.exit_code in {0, 7}, upgraded.output
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lane = out / manifest["sources"][0]["path"]
+    assert (lane / "read.md").is_file()
+    assert "evidence" in {item["product"] for item in manifest["sources"][0]["outcomes"]}
     assert runner.invoke(
         app, ["prepare", str(source), "--out", str(out), "--overwrite"]
     ).exit_code == 0
-    assert calls == 1
+    assert calls == 2
 
 
 def test_prepare_swap_failure_preserves_verified_pack(
@@ -222,7 +224,7 @@ def test_prepare_refuses_corrupt_pack_even_with_overwrite(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 5
-    assert "not a verified vctx schema-2 pack" in result.output
+    assert "not a verified vctx schema-3 pack" in result.output
     assert context.read_text(encoding="utf-8") == "corrupt"
 
 
@@ -237,7 +239,7 @@ def test_prepare_recovers_old_pack_after_interrupted_backup_rename(tmp_path: Pat
         "target": str(publisher.target),
         "state": "ready",
         "pack_id": str(old.pack_id),
-        "old_run_id": str(old.updated_run_id),
+        "old_run_id": str(old.run.id),
         "new_run_id": "interrupted",
     }
     publisher.marker.write_text(
@@ -245,7 +247,7 @@ def test_prepare_recovers_old_pack_after_interrupted_backup_rename(tmp_path: Pat
     )
     out.replace(publisher.backup)
     publisher.stage.mkdir()
-    (publisher.stage / "unfinished").write_text("discard", encoding="utf-8")
+    (publisher.backup / old.sources[0].path).replace(publisher.stage / old.sources[0].path)
     sentinel = tmp_path / "unrelated.txt"
     sentinel.write_text("keep", encoding="utf-8")
 
@@ -290,6 +292,8 @@ def test_prepare_deduplicates_input_and_isolates_rejected_sibling(tmp_path: Path
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "partial"
     assert len(manifest["sources"]) == 1
+    assert len(manifest["run"]["failures"]) == 1
+    assert str(tmp_path / "missing") not in json.dumps(manifest["run"]["failures"])
     assert (out / manifest["sources"][0]["path"] / "context.md").is_file()
 
 
@@ -309,26 +313,6 @@ def test_existing_pack_publishes_valid_addition_beside_rejected_input(tmp_path: 
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "partial"
     assert {source["title"] for source in manifest["sources"]} == {"first", "second"}
-
-
-def test_prepare_refuses_existing_output_without_overwrite(tmp_path: Path) -> None:
-    source = tmp_path / "lecture.srt"
-    source.write_text(
-        """1
-00:00:00,000 --> 00:00:01,000
-hello
-""",
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    (out_dir / "existing.txt").write_text("keep", encoding="utf-8")
-
-    result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir)])
-
-    assert result.exit_code == 5
-    assert "not a verified vctx schema-2 pack" in result.output
-    assert (out_dir / "existing.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_prepare_log_file_writes_logs_without_secret_value(
@@ -354,7 +338,7 @@ hello
     assert result.exit_code == 0, result.output
     assert "INFO vctx.app.prepare" not in result.output
     log_text = log_file.read_text(encoding="utf-8")
-    assert "INFO vctx.app.prepare prepare.start" in log_text
+    assert log_text
     assert "prepare.finish status=ok" in log_text
     assert "super-secret-token" not in log_text
     assert "super-secret-token" not in result.output

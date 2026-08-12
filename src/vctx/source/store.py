@@ -28,7 +28,7 @@ from vctx.source.session import (
 )
 from vctx.transcript import TranscriptPayload
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 class BlobRef(BaseModel):
     sha256: str
@@ -62,6 +62,7 @@ class MediaEntry(BaseModel):
 
 class StoredMediaAsset(MediaEntry):
     local_path: Path
+    sha256: str
 
 @dataclass
 class CachedSourceSession:
@@ -320,7 +321,7 @@ class SourceStore:
                 digest, size, body = row
                 path = self._verified_blob(digest, size)
                 entry = MediaEntry.model_validate_json(body)
-                return StoredMediaAsset(**entry.model_dump(), local_path=path)
+                return StoredMediaAsset(**entry.model_dump(), local_path=path, sha256=digest)
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise CacheError(f"invalid source media cache: {exc}") from exc
 
@@ -360,6 +361,7 @@ class SourceStore:
             return StoredMediaAsset(
                 **entry.model_dump(),
                 local_path=self.root / "blobs" / blob.sha256,
+                sha256=blob.sha256,
             )
         except (OSError, sqlite3.Error) as exc:
             raise CacheError(f"source media publication failed: {exc}") from exc
@@ -368,8 +370,10 @@ class SourceStore:
         path = self.root / "blobs" / digest
         if not path.is_file() or path.stat().st_size != size:
             raise CacheError("cached blob is missing or has the wrong size")
-        if _file_digest(path) != digest:
-            raise CacheError("cached blob failed integrity verification")
+        if not self._stamp_matches(digest, path):
+            if _file_digest(path) != digest:
+                raise CacheError("cached blob failed integrity verification")
+            self._remember_verified(digest, path)
         return path
 
     def _put_blob(self, body: bytes) -> BlobRef:
@@ -400,10 +404,10 @@ class SourceStore:
             blob = BlobRef(sha256=digest.hexdigest(), size=size)
             final = blobs / blob.sha256
             if final.exists():
-                if final.stat().st_size != blob.size or _file_digest(final) != blob.sha256:
-                    raise CacheError("content-addressed blob collision failed verification")
+                self._verified_blob(blob.sha256, blob.size)
             else:
                 temp.replace(final)
+                self._remember_verified(blob.sha256, final)
             return blob
         finally:
             temp.unlink(missing_ok=True)
@@ -430,18 +434,49 @@ class SourceStore:
                 "kind TEXT NOT NULL, digest TEXT NOT NULL, size INTEGER NOT NULL, "
                 "body TEXT NOT NULL DEFAULT '{}', "
                 "PRIMARY KEY(record_id, kind));"
+                "CREATE TABLE IF NOT EXISTS blob_verify(digest TEXT PRIMARY KEY, size INTEGER NOT "
+                "NULL, mtime_ns INTEGER NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL);"
                 f"PRAGMA user_version={_SCHEMA_VERSION};"
             )
-        elif not read_only and version in {1, 2}:
+        elif not read_only and version in {1, 2, 3}:
             if version == 1:
                 connection.execute("ALTER TABLE asset ADD COLUMN body TEXT NOT NULL DEFAULT '{}'")
-            connection.execute("ALTER TABLE source_record ADD COLUMN last_used_at TEXT")
+            if version in {1, 2}:
+                connection.execute("ALTER TABLE source_record ADD COLUMN last_used_at TEXT")
+            connection.execute(
+                "CREATE TABLE blob_verify(digest TEXT PRIMARY KEY, size INTEGER NOT NULL, "
+                "mtime_ns INTEGER NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL)"
+            )
             connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
             connection.commit()
-        elif version not in ({1, 2, _SCHEMA_VERSION} if read_only else {_SCHEMA_VERSION}):
+        elif version not in ({1, 2, 3, _SCHEMA_VERSION} if read_only else {_SCHEMA_VERSION}):
             connection.close()
             raise CacheError("source cache schema is missing")
         return connection
+
+    def _stamp_matches(self, digest: str, path: Path) -> bool:
+        stat = path.stat()
+        try:
+            with self._connect(read_only=True) as connection:
+                row = connection.execute(
+                    "SELECT size, mtime_ns, device, inode FROM blob_verify WHERE digest=?",
+                    (digest,),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None and row[:2] == (stat.st_size, stat.st_mtime_ns) and tuple(
+            map(str, row[2:])
+        ) == (str(stat.st_dev), str(stat.st_ino))
+
+    def _remember_verified(self, digest: str, path: Path) -> None:
+        stat = path.stat()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO blob_verify VALUES (?, ?, ?, ?, ?) ON CONFLICT(digest) DO UPDATE SET "
+                "size=excluded.size, mtime_ns=excluded.mtime_ns, device=excluded.device, "
+                "inode=excluded.inode",
+                (digest, stat.st_size, stat.st_mtime_ns, str(stat.st_dev), str(stat.st_ino)),
+            )
 
 def _canonical_json(model: BaseModel) -> bytes:
     return json.dumps(model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()

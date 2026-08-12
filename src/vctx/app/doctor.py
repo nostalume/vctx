@@ -6,14 +6,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from vctx.ai import AiTask, CredentialRef, read_credential, select_ai_route
+from vctx.ai import AiTask, Keyring, admit_ai_binding
 from vctx.app.auth import AuthError, system_keyring
 from vctx.app.models import model_status, select_asr_model_id
 from vctx.config import (
     CapabilityPolicy,
     PrepareRequest,
+    PrepareTarget,
     ResolvedConfig,
-    WorkflowProfile,
     load_resolved_config,
 )
 
@@ -22,7 +22,7 @@ def doctor_report(
     *,
     config_path: Path | None = None,
     cache_dir: Path | None = None,
-    workflow: WorkflowProfile | None = None,
+    target: PrepareTarget = PrepareTarget.TRANSCRIPT,
     asr: str | None = None,
     ocr: str | None = None,
     vision: str | None = None,
@@ -36,7 +36,7 @@ def doctor_report(
             out_dir=Path("."),
             config_path=config_path,
             cache_dir=cache_dir,
-            workflow=workflow,
+            target=target,
             asr_use=asr,
             ocr_use=ocr,
             vision_use=vision,
@@ -53,19 +53,31 @@ def doctor_report(
             asr_model_id=asr_model_id,
         )
     }
+    try:
+        keyring: Keyring | None = system_keyring()
+    except AuthError:
+        keyring = None
     report: dict[str, Any] = {
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "vctx": _package_version("vctx"),
         "yt-dlp": _package_version("yt-dlp"),
         "profile": _installed_profile(),
-        "workflow": resolved.runtime.workflow.value,
+        "target": resolved.target.value,
         "offline": resolved.runtime.offline,
         "retention": "retain" if resolved.output.retain_media else "omit",
-        "cache": _cache_status(resolved.cache.source_dir),
+        "config": {
+            "origin": resolved.config_file.origin,
+            "path": str(resolved.config_file.path) if resolved.config_file.path else None,
+        },
+        "cache": {
+            "source_dir": str(resolved.cache.source_dir),
+            "model_dir": str(resolved.cache.model_dir),
+            "source_state": _cache_state(resolved.cache.source_dir),
+        },
         "capabilities": {
             "asr": _capability(
-                resolved.transforms.asr,
-                models["asr"].state if resolved.transforms.asr.enabled else "disabled",
+                resolved.asr,
+                models["asr"].state if resolved.asr.enabled else "disabled",
             ),
             "ocr": _capability(
                 resolved.evidence.ocr,
@@ -73,21 +85,25 @@ def doctor_report(
             ),
             "vision": _capability(
                 resolved.evidence.vision,
-                _read_ai_readiness(resolved, "vision_description", resolved.evidence.vision),
+                _read_ai_readiness(
+                    resolved, "vision_description", resolved.evidence.vision, keyring
+                ),
             ),
             "planner": _capability(
                 resolved.evidence.planner,
-                _read_ai_readiness(resolved, "evidence_plan", resolved.evidence.planner),
+                _read_ai_readiness(resolved, "evidence_plan", resolved.evidence.planner, keyring),
             ),
         },
     }
     if json_output:
         return json.dumps(report, indent=2) + "\n"
     lines = [
-        *(f"{key}: {report[key]}" for key in ("python", "vctx", "yt-dlp", "profile", "workflow")),
+        *(f"{key}: {report[key]}" for key in ("python", "vctx", "yt-dlp", "profile", "target")),
         f"offline: {str(report['offline']).lower()}",
         f"retention: {report['retention']}",
-        f"cache: {report['cache']}",
+        _config_line(report["config"]),
+        f"cache.source: {report['cache']['source_state']} ({report['cache']['source_dir']})",
+        f"cache.models: {report['cache']['model_dir']}",
         *(
             f"capability.{name}: {value['selector']} ({value['readiness']})"
             for name, value in report["capabilities"].items()
@@ -111,47 +127,30 @@ def _selector(policy: CapabilityPolicy) -> str:
     return policy.model_ref() or "unknown"
 
 
-def _read_ai_readiness(resolved: ResolvedConfig, task: AiTask, policy: CapabilityPolicy) -> str:
+def _read_ai_readiness(
+    resolved: ResolvedConfig,
+    task: AiTask,
+    policy: CapabilityPolicy,
+    keyring: Keyring | None,
+) -> str:
     if policy.disabled():
         return "disabled"
     if resolved.runtime.offline:
         return "unavailable-offline"
-    try:
-        keyring = system_keyring()
-    except AuthError:
-        keyring = None
-    reference = None
-    if policy.auto():
-        for candidate in (
-            CredentialRef("env:OPENROUTER_API_KEY"),
-            CredentialRef("keyring:openrouter"),
-        ):
-            try:
-                read_credential(candidate, env_files=resolved.runtime.env_files, keyring=keyring)
-            except ValueError:
-                continue
-            reference = candidate
-            break
-    route = select_ai_route(
+    binding = admit_ai_binding(
         task=task,
         instance_name=policy.instance_name(),
         auto=policy.auto(),
         instances=resolved.instances.ai,
-        offline=False,
-        auto_credential=reference,
+        offline=resolved.runtime.offline,
+        env_files=resolved.runtime.env_files,
+        keyring=keyring,
     )
-    if route is None:
+    if binding is None:
         return "unavailable-auth"
-    if route.instance.credential is not None and not policy.auto():
-        try:
-            read_credential(
-                route.instance.credential,
-                env_files=resolved.runtime.env_files,
-                keyring=keyring,
-            )
-        except ValueError:
-            return "unavailable-auth"
-    source = route.credential.partition(":")[0] if route.credential else "none"
+    source = (
+        binding.route.credential.partition(":")[0] if binding.route.credential else "none"
+    )
     return f"configured-{source}"
 
 
@@ -176,9 +175,14 @@ def _package_version(distribution: str) -> str:
         return "missing"
 
 
-def _cache_status(cache_dir: Path) -> str:
+def _config_line(config: dict[str, str | None]) -> str:
+    path = f" ({config['path']})" if config["path"] else ""
+    return f"config: {config['origin']}{path}"
+
+
+def _cache_state(cache_dir: Path) -> str:
     if not cache_dir.exists():
-        return f"missing ({cache_dir})"
+        return "missing"
     if not cache_dir.is_dir():
-        return f"error: not a directory ({cache_dir})"
-    return f"present ({cache_dir})"
+        return "error-not-directory"
+    return "present"

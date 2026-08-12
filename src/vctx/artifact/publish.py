@@ -4,12 +4,20 @@ import hashlib
 import json
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from vctx.artifact.manifest import Manifest, ManifestSource
+from vctx.artifact.manifest import ArtifactRef, Manifest, ManifestSource
 from vctx.errors import OutputExistsError
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    manifest: Manifest
+    unchecked_kinds: tuple[str, ...] = ()
 
 
 class PackPublisher:
@@ -26,16 +34,13 @@ class PackPublisher:
     def __enter__(self) -> PackPublisher:
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self._recover()
-        if self.target.is_symlink() or (self.target.exists() and not self.target.is_dir()):
+        if _linked(self.target) or (self.target.exists() and not self.target.is_dir()):
             raise OutputExistsError(f"output is not a directory: {self.target}")
         if self.target.exists() and any(self.target.iterdir()):
-            self.previous = verify_pack(self.target)
+            self.previous = verify_pack(self.target).manifest
         try:
             self._write_marker(state="building", exclusive=True)
-            if self.previous is None:
-                self.stage.mkdir()
-            else:
-                shutil.copytree(self.target, self.stage, copy_function=shutil.copy2)
+            self.stage.mkdir()
         except BaseException:
             self._discard(self.stage)
             self.marker.unlink(missing_ok=True)
@@ -55,16 +60,8 @@ class PackPublisher:
 
     def rollback_lane(self, key: str) -> None:
         self.reset_lane(key)
-        if self.previous is not None and any(source.key == key for source in self.previous.sources):
-            shutil.copytree(self.target / key, self.stage / key, copy_function=shutil.copy2)
 
     def commit(self, manifest: Manifest) -> None:
-        verified = verify_pack(self.stage)
-        if (
-            verified.pack_id != manifest.pack_id
-            or verified.updated_run_id != manifest.updated_run_id
-        ):
-            raise OutputExistsError("staged manifest identity changed before publication")
         self._write_marker(state="ready", current=manifest)
         had_target = self.target.exists() and any(self.target.iterdir())
         if self.target.exists() and not had_target:
@@ -72,14 +69,17 @@ class PackPublisher:
         try:
             if had_target:
                 os.replace(self.target, self.backup)
+            self._complete_stage(manifest)
+            verified = verify_pack(self.stage).manifest
+            if verified.pack_id != manifest.pack_id or verified.run.id != manifest.run.id:
+                raise OutputExistsError("staged manifest identity changed before publication")
             os.replace(self.stage, self.target)
-            published = verify_pack(self.target)
-            if published.updated_run_id != manifest.updated_run_id:
+            published = verify_pack(self.target).manifest
+            if published.run.id != manifest.run.id:
                 raise OutputExistsError("published manifest identity does not match the run")
         except BaseException:
             if self.backup.exists():
-                self._discard(self.target)
-                os.replace(self.backup, self.target)
+                self._restore_previous(self.target if self.target.exists() else self.stage)
             raise
         self._discard(self.backup)
         self.marker.unlink(missing_ok=True)
@@ -97,19 +97,53 @@ class PackPublisher:
             raise OutputExistsError("invalid pack publication marker") from exc
         if data.get("target") != str(self.target):
             raise OutputExistsError("pack publication marker targets another path")
-        if self.backup.exists() and not self.target.exists():
-            os.replace(self.backup, self.target)
-        elif self.backup.exists():
-            current = verify_pack(self.target)
-            if str(current.updated_run_id) != data.get("new_run_id"):
-                raise OutputExistsError("ambiguous pack publication state")
-            self._discard(self.backup)
+        if self.backup.exists():
+            if self.target.exists():
+                try:
+                    current = verify_pack(self.target).manifest
+                except OutputExistsError:
+                    self._restore_previous(self.target)
+                else:
+                    if str(current.run.id) != data.get("new_run_id"):
+                        self._restore_previous(self.target)
+                    else:
+                        self._discard(self.backup)
+            else:
+                self._restore_previous(self.stage)
         elif data.get("state") == "ready" and self.target.exists():
-            current = verify_pack(self.target)
-            if str(current.updated_run_id) != data.get("new_run_id"):
+            current = verify_pack(self.target).manifest
+            if str(current.run.id) != data.get("new_run_id"):
                 raise OutputExistsError("ambiguous completed publication state")
         self._discard(self.stage)
         self.marker.unlink(missing_ok=True)
+
+    def _complete_stage(self, manifest: Manifest) -> None:
+        for source in manifest.sources:
+            lane = self.stage / source.path
+            if lane.exists():
+                continue
+            previous = self.backup / source.path
+            if not previous.is_dir() or _linked(previous):
+                raise OutputExistsError(f"prior source lane is unavailable: {source.key}")
+            try:
+                os.replace(previous, lane)
+            except OSError:
+                shutil.copytree(previous, lane, copy_function=shutil.copy2)
+
+    def _restore_previous(self, container: Path) -> None:
+        try:
+            previous = Manifest.model_validate_json(
+                (self.backup / "manifest.json").read_text(encoding="utf-8")
+            )
+            for source in previous.sources:
+                destination = self.backup / source.path
+                candidate = container / source.path
+                if not destination.exists() and candidate.is_dir() and not _linked(candidate):
+                    os.replace(candidate, destination)
+            self._discard(container)
+            os.replace(self.backup, self.target)
+        except (OSError, ValidationError, ValueError) as exc:
+            raise OutputExistsError("could not recover the previous pack generation") from exc
 
     def _write_marker(
         self, *, state: str, current: Manifest | None = None, exclusive: bool = False
@@ -120,8 +154,8 @@ class PackPublisher:
             "target": str(self.target),
             "state": state,
             "pack_id": str(identity.pack_id) if identity is not None else None,
-            "old_run_id": str(previous.updated_run_id) if previous else None,
-            "new_run_id": str(current.updated_run_id) if current else None,
+            "old_run_id": str(previous.run.id) if previous else None,
+            "new_run_id": str(current.run.id) if current else None,
         }
         with self.marker.open("x" if exclusive else "w", encoding="utf-8") as stream:
             json.dump(data, stream, sort_keys=True)
@@ -130,39 +164,193 @@ class PackPublisher:
     def _discard(path: Path) -> None:
         if not path.exists():
             return
-        if path.is_dir() and not path.is_symlink():
+        if path.is_dir() and not _linked(path):
             shutil.rmtree(path)
         else:
             path.unlink()
 
 
-def verify_pack(root: Path) -> Manifest:
+def open_pack(root: Path) -> Manifest:
+    """Open a structurally safe schema-3 pack without reading artifact bytes."""
     manifest_path = root / "manifest.json"
     try:
         if _linked(root) or _linked(manifest_path) or not manifest_path.is_file():
             raise ValueError("manifest is missing or linked")
-        manifest = Manifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-        allowed = {"manifest.json", *(source.path for source in manifest.sources)}
-        if {entry.name for entry in root.iterdir()} != allowed:
-            raise ValueError("pack root has unknown or missing entries")
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if raw.get("schema_version") == "2":
+            raise OutputExistsError(
+                "schema-2 pack is read-only; regenerate it with the current vctx prepare command"
+            )
+        manifest = Manifest.model_validate(raw)
         for source in manifest.sources:
-            _verify_lane(root / source.path, source)
+            lane = root / source.path
+            if _linked(lane) or not lane.is_dir():
+                raise ValueError("source lane is missing or linked")
+            for artifact in source.artifacts:
+                path = lane / Path(artifact.path)
+                if _linked(path) or not path.is_file() or path.stat().st_nlink != 1:
+                    raise ValueError("source artifact is missing or linked")
         return manifest
+    except OutputExistsError:
+        raise
     except (OSError, ValueError, ValidationError) as exc:
-        raise OutputExistsError(
-            f"output is not a verified vctx schema-2 pack: {root} ({exc})"
-        ) from exc
+        raise _pack_error(root, exc) from exc
 
 
-def _verify_lane(lane: Path, source: ManifestSource) -> None:
-    refs = [(ref.path, ref.bytes, ref.sha256) for ref in source.artifacts]
-    for asset in source.assets:
-        if asset.retained:
-            assert asset.path is not None and asset.bytes is not None and asset.sha256 is not None
-            refs.append((asset.path, asset.bytes, asset.sha256))
-    expected = {path for path, _, _ in refs}
-    if _linked(lane) or not lane.is_dir():
-        raise ValueError("source lane is missing or linked")
+def verify_required(root: Path, source_key: str, kinds: set[str]) -> dict[str, Any]:
+    """Verify and decode only requested products and their typed dependencies."""
+    manifest = open_pack(root)
+    source = next((item for item in manifest.sources if item.key == source_key), None)
+    if source is None:
+        raise OutputExistsError(f"source lane is not present in pack: {source_key}")
+    refs = {artifact.kind: artifact for artifact in source.artifacts}
+    if len(refs) != len(source.artifacts):
+        repeated = {
+            item.kind
+            for item in source.artifacts
+            if sum(other.kind == item.kind for other in source.artifacts) > 1
+        }
+        if repeated - {"visual_frame"}:
+            raise OutputExistsError("required product kind is ambiguous")
+    loaded: dict[str, Any] = {}
+    visiting: set[str] = set()
+
+    def require(kind: str) -> Any:
+        if kind in loaded:
+            return loaded[kind]
+        if kind in visiting:
+            raise ValueError("product dependency cycle")
+        visiting.add(kind)
+        for dependency in _DEPENDENCIES.get(kind, ()):
+            if dependency in refs:
+                require(dependency)
+        ref = refs.get(kind)
+        if ref is None:
+            raise ValueError(f"required product is missing: {kind}")
+        loaded[kind] = _read_artifact(root / source.path, ref, decode=True)
+        visiting.remove(kind)
+        _validate_relations(kind, loaded, source, root / source.path)
+        return loaded[kind]
+
+    try:
+        for kind in sorted(kinds):
+            require(kind)
+        return loaded
+    except (OSError, ValueError, ValidationError) as exc:
+        raise _pack_error(root, exc) from exc
+
+
+def verify_pack(root: Path) -> VerificationReport:
+    """Verify every listed byte, every known product, and the complete file tree."""
+    try:
+        manifest = open_pack(root)
+        expected_root = {"manifest.json", *(source.path for source in manifest.sources)}
+        if {entry.name for entry in root.iterdir()} != expected_root:
+            raise ValueError("pack root contains unlisted or missing entries")
+        unchecked: set[str] = set()
+        for source in manifest.sources:
+            _verify_complete_lane(root / source.path, source)
+            loaded: dict[str, Any] = {}
+            for artifact in source.artifacts:
+                decoded = _read_artifact(root / source.path, artifact, decode=True)
+                if decoded is _UNCHECKED:
+                    unchecked.add(artifact.kind)
+                else:
+                    loaded[artifact.kind] = decoded
+            for kind in _DEPENDENCIES:
+                if kind in loaded:
+                    _validate_relations(kind, loaded, source, root / source.path)
+        return VerificationReport(manifest, tuple(sorted(unchecked)))
+    except OutputExistsError:
+        raise
+    except (OSError, ValueError, ValidationError) as exc:
+        raise _pack_error(root, exc) from exc
+
+
+_UNCHECKED = object()
+_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "chunks": ("transcript",),
+    "evidence": ("evidence_plan",),
+    "summary": ("transcript", "evidence"),
+}
+
+
+def _read_artifact(lane: Path, ref: ArtifactRef, *, decode: bool) -> Any:
+    path = lane / Path(ref.path)
+    if _linked(path) or not path.is_file() or path.stat().st_nlink != 1:
+        raise ValueError("source artifact is missing or linked")
+    if path.stat().st_size != ref.bytes or _hash_file(path) != ref.sha256:
+        raise ValueError(f"source artifact failed integrity verification: {ref.path}")
+    if not decode:
+        return None
+    if ref.kind in {"context", "read"}:
+        return path.read_text(encoding="utf-8")
+    if ref.kind == "visual_frame":
+        if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("visual frame is not a PNG")
+        return ref.path
+    loaders: dict[str, type[BaseModel]] = _json_loaders()
+    model = loaders.get(ref.kind)
+    if model is None:
+        return _UNCHECKED
+    return model.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _json_loaders() -> dict[str, type[BaseModel]]:
+    from vctx.source.session import VideoMetadata
+    from vctx.summary import Summary
+    from vctx.transcript import ChunkSet, Transcript
+    from vctx.visual.evidence import Evidence
+    from vctx.visual.plan import EvidencePlan
+
+    return {
+        "metadata": VideoMetadata,
+        "transcript": Transcript,
+        "chunks": ChunkSet,
+        "evidence_plan": EvidencePlan,
+        "evidence": Evidence,
+        "summary": Summary,
+    }
+
+
+def _validate_relations(
+    kind: str, loaded: dict[str, Any], source: ManifestSource, lane: Path
+) -> None:
+    if kind == "chunks" and "transcript" in loaded:
+        transcript = loaded["transcript"]
+        chunks = loaded["chunks"]
+        segment_ids = {segment.id for segment in transcript.segments}
+        if chunks.source_id != transcript.source_id or any(
+            not set(chunk.segment_ids) <= segment_ids for chunk in chunks.chunks
+        ):
+            raise ValueError("chunks do not resolve against the transcript")
+    elif kind == "evidence":
+        if "evidence_plan" not in loaded:
+            raise ValueError("evidence plan is missing")
+        evidence = loaded["evidence"]
+        evidence.validate_against(loaded["evidence_plan"])
+        refs = {artifact.path: artifact for artifact in source.artifacts}
+        for capture in evidence.captures:
+            ref = refs.get(capture.artifact_path)
+            if ref is None or ref.kind != "visual_frame":
+                raise ValueError("evidence capture references an unlisted frame")
+            _read_artifact(lane, ref, decode=True)
+    elif kind == "summary" and "transcript" in loaded:
+        summary = loaded["summary"]
+        transcript = loaded["transcript"]
+        if summary.source_id != transcript.source_id:
+            raise ValueError("summary belongs to another transcript")
+        segments = {segment.id for segment in transcript.segments}
+        captures = {
+            capture.id for capture in loaded.get("evidence", ()).captures
+        } if "evidence" in loaded else set()
+        for point in summary.points:
+            if not set(point.segment_ids) <= segments or not set(point.capture_ids) <= captures:
+                raise ValueError("summary citation does not resolve to canonical products")
+
+
+def _verify_complete_lane(lane: Path, source: ManifestSource) -> None:
+    expected = {artifact.path for artifact in source.artifacts}
     expected_dirs = {
         parent.as_posix()
         for name in expected
@@ -181,16 +369,23 @@ def _verify_lane(lane: Path, source: ManifestSource) -> None:
             actual_dirs.add(relative)
         else:
             raise ValueError("source lane contains an unsupported entry")
-    if len(expected) != len(refs) or actual != expected or actual_dirs != expected_dirs:
-        detail = f"expected {sorted(expected)}, found {sorted(actual)}"
-        raise ValueError(f"source lane contents differ: {detail}")
-    for name, size, digest in refs:
-        path = lane / name
-        if _linked(path) or not path.is_file() or path.stat().st_nlink != 1:
-            raise ValueError("source artifact is missing or linked")
-        body = path.read_bytes()
-        if len(body) != size or hashlib.sha256(body).hexdigest() != digest:
-            raise ValueError("source artifact failed integrity verification")
+    if actual != expected or actual_dirs != expected_dirs:
+        raise ValueError(
+            "source lane contains unlisted or missing files: "
+            f"expected {sorted(expected)}, found {sorted(actual)}"
+        )
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _pack_error(root: Path, exc: Exception) -> OutputExistsError:
+    return OutputExistsError(f"output is not a verified vctx schema-3 pack: {root} ({exc})")
 
 
 def _linked(path: Path) -> bool:

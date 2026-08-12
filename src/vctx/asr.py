@@ -11,7 +11,7 @@ from typing import Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vctx.app.models import ModelLifecycleError, require_prepared_model
-from vctx.artifact.manifest import TransformEvidence
+from vctx.artifact.manifest import ManifestEffect
 from vctx.config import AsrInstanceConfig, CapabilityPolicy
 from vctx.source.session import MediaAsset
 from vctx.transcript import (
@@ -37,18 +37,16 @@ class AsrPlan(BaseModel):
     deterministic: bool = False
 
     @property
-    def evidence_seed(self) -> TransformEvidence:
-        return TransformEvidence(
-            capability="asr",
-            selected_route=self.selected,
-            provider_id=self.provider_id,
-            model_id=self.model_id,
-            requires_user_config=False,
+    def effect_seed(self) -> ManifestEffect:
+        return ManifestEffect(
+            operation="asr",
+            status=self.selected,
+            route=self.selected,
+            provider=self.provider_id,
+            model=self.model_id,
             uploaded=False,
             cost_may_apply=False,
-            deterministic=self.deterministic,
-            reason=self.reason,
-            warnings=self.warnings,
+            diagnostic="; ".join([self.reason, *self.warnings])[:500],
         )
 
 
@@ -410,7 +408,7 @@ class FasterWhisperAsrAdapter:
         receipt = self._receipt(info, vad=not confirmation, confirmation=confirmation, batch=batch)
         return AsrReady(
             transcript=Transcript(
-                video_id=media.id,
+                source_id=media.id,
                 provenance=TranscriptProvenance(
                     method="asr",
                     language=language,

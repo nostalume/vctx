@@ -13,6 +13,15 @@ class UnsupportedSourceError(VctxError):
     exit_code = 3
 
 
+class SourceConflictError(VctxError):
+    exit_code = 3
+
+    def __init__(self, source_id: str, key: str) -> None:
+        super().__init__("conflicting revisions were admitted for one source identity")
+        self.source_id = source_id
+        self.key = key
+
+
 class NoTranscriptError(VctxError):
     exit_code = 4
 

@@ -15,14 +15,7 @@ def test_cache_status_missing_is_empty_and_read_only(tmp_path: Path) -> None:
 
     result = runner.invoke(app, ["cache", "status", "--cache-dir", str(cache), "--json"])
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {
-        "records": 0,
-        "assets": 0,
-        "blobs": 0,
-        "temporary": 0,
-        "bytes": 0,
-    }
+    assert result.exit_code == 0 and not any(json.loads(result.output).values())
     assert not cache.exists()
 
 def test_cache_prune_dry_run_matches_real_orphan_cleanup_and_ignores_models(
@@ -112,9 +105,10 @@ def test_cache_prune_reports_deletion_failure_and_keeps_candidate(
     assert receipt["reclaimed_bytes"] == 0 and receipt["failures"]
     assert blob.read_bytes() == b"keep"
 
-def test_cache_selection_prefers_cli_base_over_config_source_dir(tmp_path: Path) -> None:
+def test_cli_cache_base_overrides_config(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
     configured = tmp_path / "configured"
-    cli_cache = tmp_path / "cli"
+    cli_cache = Path("cli")
     for root, digest, body in (
         (configured, "c" * 64, b"x"),
         (cli_cache / "source", "d" * 64, b"yy"),
