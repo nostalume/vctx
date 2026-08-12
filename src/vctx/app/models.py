@@ -232,7 +232,10 @@ def _pull_model(capability: str, model_id: str, cache_root: Path) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     try:
         module = importlib.import_module("rapidocr")
-        template = Path(module.__file__).with_name("config.yaml")
+        module_file = module.__file__
+        if module_file is None:
+            raise ImportError("rapidocr has no filesystem package location")
+        template = Path(module_file).with_name("config.yaml")
         config = template.read_text(encoding="utf-8").replace(
             "model_root_dir: null", f'model_root_dir: "{target.as_posix()}"'
         )

@@ -130,7 +130,7 @@ jobs:
           enable-cache: true
 
       - name: Sync dependencies
-        run: uv sync --locked --dev
+        run: uv sync --locked --dev --extra visual
 
       - name: Check behavior-suite LOC budget
         shell: bash
