@@ -1,0 +1,43 @@
+name: Live test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Public finite video URL with subtitles
+        required: false
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  public-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+      - name: Build and install artifact
+        run: |
+          uv build --wheel
+          wheel=$(find dist -name '*.whl' -print -quit)
+          uv venv integration-env
+          uv pip install --python integration-env/bin/python "$wheel"
+      - name: Prepare and verify public source
+        env:
+          VCTX_LIVE_URL: ${{ inputs.url || 'https://www.ted.com/talks/terry_moore_how_to_tie_your_shoes' }}
+        run: |
+          integration-env/bin/vctx prepare "$VCTX_LIVE_URL" --out pack --cache-dir "$RUNNER_TEMP/vctx-cache"
+          integration-env/bin/vctx verify pack
+          integration-env/bin/python - <<'PY'
+          import json, pathlib
+          root = pathlib.Path("pack")
+          manifest = json.loads((root / "manifest.json").read_text())
+          assert manifest["schema_version"] == "3" and manifest["sources"]
+          lane = root / manifest["sources"][0]["path"]
+          assert all((lane / name).is_file() for name in ("metadata.json", "transcript.json", "chunks.json"))
+          PY

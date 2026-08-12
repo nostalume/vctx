@@ -1,0 +1,29 @@
+[cache]
+source_dir = ".cache/vctx/source"
+model_dir = ".cache/vctx/models"
+
+[source]
+media_quality = "auto"
+
+[transforms.asr]
+use = "instance:local-default"
+
+[instances.asr.local-default]
+type = "local-faster-whisper"
+model = "small"
+device = "auto"
+compute = "auto"
+cache = "persistent"
+
+[evidence]
+planner = "auto"
+ocr = "auto"
+vision = "auto"
+
+[summary]
+use = "auto"
+language = "native"
+
+[output]
+projections = ["context", "read"]
+retain_media = true

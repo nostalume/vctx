@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-vctx = "vctx:main"
+vctx = "vctx.cli:main"
 
 [project.optional-dependencies]
 asr = [
@@ -52,6 +52,7 @@ include = [
     "src/vctx",
     "LICENSE",
     "README.md",
+    "examples",
     "pyproject.toml",
 ]
 
