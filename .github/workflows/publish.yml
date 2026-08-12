@@ -36,7 +36,7 @@ jobs:
           test "v$version" = "$GITHUB_REF_NAME"
 
       - name: Sync dependencies
-        run: uv sync --locked --dev
+        run: uv sync --locked --dev --extra visual
 
       - name: Ruff
         run: uv run ruff check .
