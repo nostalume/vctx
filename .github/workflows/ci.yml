@@ -14,117 +14,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  package-artifact:
-    name: Build distributable artifact
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.14"
-          enable-cache: true
-
-      - name: Build wheel and sdist
-        run: uv build
-
-      - name: Inspect package contents
-        shell: bash
-        run: |
-          wheel=$(find dist -name '*.whl' -print -quit)
-          sdist=$(find dist -name '*.tar.gz' -print -quit)
-          python -m zipfile -l "$wheel" > wheel-files.txt
-          tar -tzf "$sdist" > sdist-files.txt
-          if grep -E '(^|/)(tests|\.agents|scripts|\.github)/|models/|transforms/' wheel-files.txt sdist-files.txt; then
-            echo "development residue or obsolete owners found in distributions" >&2
-            exit 1
-          fi
-
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
-        with:
-          name: distributions
-          path: dist/*
-
-  support-profile:
-    name: ${{ matrix.os }} / Python ${{ matrix.python }} / ${{ matrix.profile }}
-    runs-on: ${{ matrix.os }}
-    needs: package-artifact
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-14]
-        python: ["3.12", "3.13", "3.14"]
-        profile: [core, asr, visual, full]
-        exclude:
-          - {python: "3.12", profile: asr}
-          - {python: "3.12", profile: visual}
-          - {python: "3.12", profile: full}
-          - {python: "3.13", profile: asr}
-          - {python: "3.13", profile: visual}
-          - {python: "3.13", profile: full}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: ${{ matrix.python }}
-          enable-cache: true
-
-      - name: Download distributions
-        uses: actions/download-artifact@v4
-        with:
-          name: distributions
-          path: dist
-
-      - name: Smoke installed profile
-        shell: bash
-        run: |
-          wheel=$(find dist -name '*.whl' -print -quit)
-          profile="${{ matrix.profile }}"
-          requirement="$wheel"
-          if [ "$profile" != core ]; then
-            requirement="$wheel[$profile]"
-          fi
-          uv run --isolated --no-project --with "$requirement" python -c "import vctx"
-          uv run --isolated --no-project --with "$requirement" vctx --help >/dev/null
-          uv run --isolated --no-project --with "$requirement" vctx prompt > prompt.md
-          uv run --isolated --no-project --with "$requirement" vctx doctor --json > doctor.json
-          printf '1\n00:00:00,000 --> 00:00:01,000\ninstalled artifact\n' > sample.srt
-          uv run --isolated --no-project --with "$requirement" vctx prepare sample.srt --out pack
-          uv run --isolated --no-project --with "$requirement" vctx verify pack
-          uv run --isolated --no-project --with "$requirement" vctx render pack --format context > context.md
-          uv run --isolated --no-project --with "$requirement" vctx render pack --format read > read.md
-          test -s prompt.md && test -s context.md && test -s read.md
-          if [ "$profile" = asr ] || [ "$profile" = full ]; then
-            uv run --isolated --no-project --with "$requirement" python -c "import faster_whisper"
-          fi
-          if [ "$profile" = visual ] || [ "$profile" = full ]; then
-            uv run --isolated --no-project --with "$requirement" python -c "import av, onnxruntime, rapidocr; container = av.open('tests/fixtures/frame.mp4'); assert next(container.decode(video=0))"
-          fi
-          if [ "$profile" = core ]; then
-            uv run --isolated --no-project --with "$requirement" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') is None else 1)"
-          fi
-          if [ "$profile" = core ] || [ "$profile" = visual ]; then
-            uv run --isolated --no-project --with "$requirement" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('faster_whisper') is None else 1)"
-          fi
-
   quality:
-    name: Lint, type-check, test
+    name: Quality and package
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.14"
           enable-cache: true
@@ -163,3 +62,79 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Inspect package contents
+        shell: bash
+        run: |
+          wheel=$(find dist -name '*.whl' -print -quit)
+          sdist=$(find dist -name '*.tar.gz' -print -quit)
+          python -m zipfile -l "$wheel" > wheel-files.txt
+          tar -tzf "$sdist" > sdist-files.txt
+          if grep -E '(^|/)(tests|\.agents|scripts|\.github)/|models/|transforms/' wheel-files.txt sdist-files.txt; then
+            echo "development residue or obsolete owners found in distributions" >&2
+            exit 1
+          fi
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributions
+          path: dist/*
+
+  support-profile:
+    name: ${{ matrix.os }} / Python 3.14 / ${{ matrix.profile }}
+    runs-on: ${{ matrix.os }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+        profile: [core, asr, visual, full]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: distributions
+          path: dist
+
+      - name: Smoke installed profile
+        shell: bash
+        run: |
+          wheel=$(find dist -name '*.whl' -print -quit)
+          profile="${{ matrix.profile }}"
+          requirement="$wheel"
+          if [ "$profile" != core ]; then
+            requirement="$wheel[$profile]"
+          fi
+          uv run --isolated --no-project --with "$requirement" python -c "import vctx"
+          uv run --isolated --no-project --with "$requirement" vctx --help >/dev/null
+          uv run --isolated --no-project --with "$requirement" vctx prompt > prompt.md
+          uv run --isolated --no-project --with "$requirement" vctx doctor --json > doctor.json
+          printf '1\n00:00:00,000 --> 00:00:01,000\ninstalled artifact\n' > sample.srt
+          uv run --isolated --no-project --with "$requirement" vctx prepare sample.srt --out pack
+          uv run --isolated --no-project --with "$requirement" vctx verify pack
+          uv run --isolated --no-project --with "$requirement" vctx render pack --format context > context.md
+          uv run --isolated --no-project --with "$requirement" vctx render pack --format read > read.md
+          test -s prompt.md && test -s context.md && test -s read.md
+          if [ "$profile" = asr ] || [ "$profile" = full ]; then
+            uv run --isolated --no-project --with "$requirement" python -c "import faster_whisper"
+          fi
+          if [ "$profile" = visual ] || [ "$profile" = full ]; then
+            uv run --isolated --no-project --with "$requirement" python -c "import av, onnxruntime, rapidocr; container = av.open('tests/fixtures/frame.mp4'); assert next(container.decode(video=0))"
+          fi
+          if [ "$profile" = core ]; then
+            uv run --isolated --no-project --with "$requirement" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') is None else 1)"
+          fi
+          if [ "$profile" = core ] || [ "$profile" = visual ]; then
+            uv run --isolated --no-project --with "$requirement" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('faster_whisper') is None else 1)"
+          fi
