@@ -1,12 +1,13 @@
 [project]
 name = "vctx"
-version = "0.2.1"
+version = "0.3.0"
 description = "Video to context pack CLI for AI agents and automation."
+readme = "README.md"
 license = "MIT"
 authors = [
     { name = "nostalgia", email = "nostalucent@gmail.com" }
 ]
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28.1",
     "keyring>=25.7.0",
@@ -53,7 +54,6 @@ exclude = [
     "/.agents",
     "/.github",
     "/dist",
-    "/docs",
     "/scripts",
     "/tests",
 ]
@@ -63,7 +63,8 @@ include = [
     "src/vctx",
     "LICENSE",
     "README.md",
-    "examples",
+    "docs/api.md",
+    "docs/examples",
     "pyproject.toml",
 ]
 
@@ -76,7 +77,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
