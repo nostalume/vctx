@@ -1,0 +1,10 @@
+[transforms.asr]
+use = "none"
+
+[evidence]
+planner = "none"
+ocr = "none"
+vision = "none"
+
+[summary]
+use = "none"

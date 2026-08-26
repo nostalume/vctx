@@ -1,0 +1,8 @@
+[evidence]
+planner = "auto"
+ocr = "auto"
+vision = "auto"
+
+[summary]
+use = "auto"
+language = "native"

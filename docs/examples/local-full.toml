@@ -1,0 +1,18 @@
+[transforms.asr]
+use = "instance:local"
+
+[instances.asr.local]
+type = "local-faster-whisper"
+model = "small"
+device = "auto"
+compute = "auto"
+cache = "persistent"
+
+[evidence]
+planner = "auto"
+ocr = "auto"
+vision = "auto"
+
+[summary]
+use = "auto"
+language = "native"

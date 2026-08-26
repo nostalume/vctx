@@ -17,6 +17,13 @@ source admission -> transcript -> evidence -> summary
 warnings, omissions, and artifacts in `manifest.json`. Rendering reads verified
 canonical products and never acquires sources or calls providers.
 
+The built-in configuration is zero-TOML, not anonymous AI access. It can prepare
+a subtitle-backed transcript without credentials. Evidence planning and summary
+with `auto` require `OPENROUTER_API_KEY`, a prior `auth openrouter login`, or an
+explicit OpenAI-compatible instance. Missing AI authentication produces no AI
+request; the manifest records unavailable downstream products and preserves safe
+earlier products.
+
 ## Installation profiles
 
 ```console
@@ -39,6 +46,12 @@ PyAV decodes video in-process. No host FFmpeg executable is required. Normal
 ## Commands
 
 Use command-specific `--help` for the exact option grammar.
+
+Closed CLI string values are complete here: `--to` accepts `transcript`,
+`evidence`, or `summary`; `--media-quality` accepts `auto`, `fast`, `balanced`,
+or `high`; `render --format` accepts `context`, `read`, or `transcript`; and model
+capabilities are `asr` and `ocr`. Capability selectors have their own complete
+grammar under [Selectors](#selectors).
 
 ### Prepare
 
@@ -66,7 +79,7 @@ Examples:
 ```console
 vctx prepare captions.srt --out pack
 vctx prepare lecture.mp4 --out pack --to evidence
-vctx prepare URL --out pack --to summary --config examples/vctx.toml
+vctx prepare URL --out pack --to summary --config docs/examples/local-full.toml
 vctx prepare part-1.vtt part-2.vtt --out course
 ```
 
@@ -157,6 +170,13 @@ This owns the reserved `keyring:openrouter` credential for the automatic
 OpenRouter recipe. A named compatible endpoint uses its own `env:NAME` or
 `keyring:NAME`; a credential reference never selects an endpoint.
 
+The automatic route checks `OPENROUTER_API_KEY` first and then
+`keyring:openrouter`. When admitted, it selects OpenRouter's free route with the
+zero-data-retention and required-parameter policy. Login is therefore one-time
+authentication for zero-TOML AI use, not a credential-free service. `logout`
+removes only the reserved OpenRouter keyring entry; it does not alter environment
+variables or named endpoint credentials.
+
 ## Configuration
 
 Exactly one file is selected; files are never merged and parent directories are
@@ -185,71 +205,127 @@ supported.
 `--cache-dir CACHE` supplies `CACHE/source` and `CACHE/models`. Without it,
 `cache.source_dir` and `cache.model_dir` independently override their defaults.
 
-### Current TOML surface
+### Field reference
 
-See the strict runnable files under `examples/`. Unknown fields are errors.
+Every section and field is optional. Unknown sections, fields, enum values, and
+references to missing instances are errors. The runnable files under
+[`docs/examples/`](examples/README.md) exercise the same strict loader as the CLI.
+Tables list every closed string value. A field explicitly described as an open
+string is not an enum and is validated by its owning provider or adapter.
+
+#### Runtime, cache, and source
+
+| Field | Type/default | Behavior |
+| --- | --- | --- |
+| `runtime.offline` | boolean, `false` | Denies source and AI network routes. Cached and local work may continue. CLI `--offline` enables it for one invocation. |
+| `runtime.env_files` | path list, `[]` | Loads credential variables from these files. Relative paths use the config directory. Values already present in the process environment take precedence. |
+| `cache.source_dir` | path, platform default | Stores remote-source metadata and content-addressed blobs. |
+| `cache.model_dir` | path, platform default | Stores explicitly pulled ASR/OCR models and integrity receipts. |
+| `source.media_quality` | `auto`, `fast`, `balanced`, or `high`; `auto` | Selects URL video up to 720p, 480p, 720p, or 1080p respectively. It is a preference, not a byte limit; `auto` may fall back to `fast` when cache space is insufficient. |
+| `source.yt_dlp.session` | `none`, `browser:NAME`, or `cookies-file:PATH`; `none` | Selects no credentials, reads cookies from a supported browser, or reads an explicit cookie file. These are all accepted forms. |
+| `source.yt_dlp.network` | `direct` or `proxy:URL`; `direct` | Selects direct source access or routes yt-dlp operations through the given proxy. |
+| `source.yt_dlp.playlist` | `default` or `items:SPEC`; `default` | Uses provider-default playlist behavior or an yt-dlp item selection such as `items:1-3,7`. |
+| `source.yt_dlp.subtitle_languages` | string list, `[]` | Ordered subtitle-language preference. Empty uses provider/default selection. |
+
+`--cache-dir CACHE` overrides both cache fields as `CACHE/source` and
+`CACHE/models`. It does not alter the persistent config.
+
+#### Pipeline policy and output
+
+| Field | Type/default | Behavior |
+| --- | --- | --- |
+| `transforms.asr.use` | selector, `auto` | Chooses speech recognition when a usable native subtitle is unavailable. ASR is eligible for every target. |
+| `transforms.asr.enabled` | strict boolean, inferred | Advanced explicit gate. `false` forces `use = "none"`; `true` cannot be combined with `none`. |
+| `evidence.planner.use` | selector, `auto` | Chooses the AI transcript-to-frame-request planner. Eligible for evidence and summary targets. |
+| `evidence.planner.enabled` | strict boolean, inferred | Explicitly gates the planner. |
+| `evidence.ocr.use` | selector, `auto` | Chooses frame OCR. Eligible for evidence and summary targets. |
+| `evidence.ocr.enabled` | strict boolean, inferred | Explicitly gates OCR. |
+| `evidence.vision.use` | selector, `auto` | Chooses AI visual description. Eligible for evidence and summary targets. |
+| `evidence.vision.enabled` | strict boolean, inferred | Explicitly gates vision description. |
+| `summary.use` | selector, `auto` | Chooses the AI summarizer. Eligible only for the summary target. |
+| `summary.language` | string, `native` | Requested summary language. `native` means the dominant transcript language. |
+| `output.projections` | set of `context`, `read`; both | Markdown projections published in every source lane. Canonical JSON remains authoritative. |
+| `output.chunk_max_chars` | integer, `6000` | Maximum transcript characters per canonical chunk. |
+| `output.chunk_max_seconds` | integer or omitted | Optional maximum time span per chunk. Omission disables the time limit. |
+| `output.retain_media` | strict boolean, `true` | Copies admitted media into its source lane for a portable, recognition-friendly pack. CLI `--no-retain-media` disables it once. |
+
+Each evidence policy accepts a terse string, for example `ocr = "none"`, or an
+explicit table exposing its `enabled` and `use` fields:
 
 ```toml
-[runtime]
-offline = false
-env_files = [".env"]
+[evidence.vision]
+enabled = true
+use = "instance:compatible"
+```
 
-[cache]
-source_dir = ".cache/vctx/source"
-model_dir = ".cache/vctx/models"
+The target is the upper pipeline boundary: `transcript` disables evidence and
+summary, `evidence` enables the three evidence policies, and `summary` enables
+all stages. A specific `none` remains disabled even when its target is enabled.
 
-[source]
-media_quality = "auto"
+#### Selectors
 
-[source.yt_dlp]
-session = "none"              # browser:NAME or cookies-file:PATH
-network = "direct"            # or proxy:URL
-playlist = "default"          # or items:SPEC
-subtitle_languages = ["en"]
+| Selector | Meaning |
+| --- | --- |
+| `auto` | Resolve an admitted route from installed/local state and configured authentication. It never pulls a model. |
+| `none` | Explicitly disable the capability and record the resulting omission. |
+| `instance:NAME` | Use `[instances.asr.NAME]` for ASR or `[instances.ai.NAME]` for planner, vision, and summary. |
+| `local:ID` | Select a named local faster-whisper model; `models pull asr` manages this form. |
+| `path:PATH` | Select an existing local ASR model path. Relative paths in config use the config directory. |
+| `hf:REPO` | Pass an explicit Hugging Face ASR model reference; it is not managed by `models pull`. |
 
-[transforms.asr]
-use = "instance:local-default"
+`--asr`, `--ocr`, and `--vision` use the same selector grammar and override the
+selected file. Planner and summary remain config-controlled.
 
-[evidence]
-planner = "auto"
-ocr = "auto"
-vision = "auto"
+#### ASR instances
 
-[summary]
-use = "auto"
-language = "native"
-
-[output]
-projections = ["context", "read"]
-chunk_max_chars = 6000
-chunk_max_seconds = 900
-retain_media = true
-
-[instances.asr.local-default]
+```toml
+[instances.asr.local]
 type = "local-faster-whisper"
 model = "small"
 device = "auto"
 compute = "auto"
 cache = "persistent"
+```
 
+| Field | Type/default | Behavior |
+| --- | --- | --- |
+| `type` | required; `local-faster-whisper` | Adapter implementation. No other instance type is currently admitted. |
+| `model` | open string, `small` | faster-whisper model ID or `path:PATH`. It is not an enum; `path:...` is resolved from the config directory. |
+| `device` | `auto`, `cpu`, or `cuda`; `auto` | Inference device selection. |
+| `compute` | open string, `auto` | faster-whisper/CTranslate2 compute type forwarded to the adapter; accepted values depend on the installed runtime and device. |
+| `cache` | `persistent` or `disabled`; `persistent` | Uses managed model storage. `disabled` requires `model` to resolve to an existing local model directory. |
+
+#### OpenAI-compatible AI instances
+
+```toml
 [instances.ai.compatible]
 base_url = "https://provider.example/v1"
 model = "model-name"
 credential = "env:VCTX_AI_API_KEY"
 format = "auto"
 timeout_s = 120
+insecure = false
 ```
 
-Selectors are `auto`, `none`, `instance:NAME`, or capability-supported model
-references such as `path:...`, `local:...`, and `hf:...`. Named AI endpoints are
-OpenAI-compatible `/v1` roots; vctx calls `/chat/completions`. Remote HTTP is
-rejected unless explicitly admitted as insecure. Secret values never belong in
-TOML, logs, manifests, doctor, or prompt output.
+| Field | Type/default | Behavior |
+| --- | --- | --- |
+| `base_url` | required URL | Absolute OpenAI-compatible `/v1` root without query or fragment. vctx calls `/chat/completions`. |
+| `model` | required open string | Provider-defined model identifier sent unchanged with every request; it is not a vctx enum. |
+| `credential` | `env:NAME` or `keyring:NAME` | Resolves a secret at call time. Required for non-loopback endpoints; never selects the endpoint itself. |
+| `format` | `auto`, `schema`, `json`, or `prompt`; `auto` | Structured-output strategy. `auto` negotiates/falls back; fixed modes require that provider behavior. |
+| `timeout_s` | integer `1..900`, `120` | Request timeout. Vision calls allow at least 180 seconds. |
+| `insecure` | boolean, `false` | Must be true to admit cleartext HTTP away from loopback. HTTPS and loopback HTTP need no exception. |
 
-`language = "native"` means the dominant transcript language. Evidence planning
-preserves source language, treats transcript text as untrusted data, anchors all
-claims to supplied segment IDs, and requests frames only for materially useful
-visible evidence.
+The built-in OpenRouter recipe is separate from named instances. `vctx auth
+openrouter login` stores the reserved `keyring:openrouter` secret; `auto` first
+considers `OPENROUTER_API_KEY`, then that keyring entry, and applies the free,
+zero-data-retention route policy. Use a separately named credential for any
+other base URL, even when the underlying account is also OpenRouter.
+
+Secret values never belong in TOML, logs, manifests, doctor, or prompt output.
+Evidence planning preserves source language, treats transcript text as untrusted
+data, anchors claims to supplied segment IDs, and requests frames only when they
+provide materially useful visible evidence.
 
 ## Storage
 
@@ -297,6 +373,21 @@ one source. Repeated prepares aggregate independent lanes, not their content.
 `summary.json` are canonical typed products. Markdown is reproducible projection.
 Summary citations resolve to transcript segments and evidence captures; captures
 resolve to admitted plan requests and listed frame files.
+
+Closed manifest string values are:
+
+| Field | Values |
+| --- | --- |
+| `schema_version` | `3` |
+| `tool` | `vctx` |
+| manifest/source `status` | `ok`, `partial`, `error` |
+| source `kind` | `url`, `file` |
+| source `freshness` | `immutable`, `observed-online`, `unverified-offline` |
+| outcome `status` | `ready`, `partial`, `unavailable` |
+
+Artifact `kind`, product name, requested target, effect operation/status, model,
+route, and provider are bounded open strings rather than enums. Their observed
+values remain inspectable without making provider extensions a schema change.
 
 ## Failure and effect policy
 

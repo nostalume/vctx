@@ -1,0 +1,8 @@
+[source]
+media_quality = "balanced"
+
+[source.yt_dlp]
+session = "browser:firefox"
+network = "proxy:http://127.0.0.1:8080"
+playlist = "items:1-3,7"
+subtitle_languages = ["en-US", "en", "zh-Hans"]

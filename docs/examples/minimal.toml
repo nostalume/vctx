@@ -1,0 +1,2 @@
+# The built-in defaults need no TOML for subtitle-backed transcripts.
+# Evidence and summary still require OpenRouter auth or a configured AI endpoint.

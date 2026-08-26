@@ -1,10 +1,3 @@
-[runtime]
-env_files = [".env"]
-
-[cache]
-source_dir = ".cache/vctx/source"
-model_dir = ".cache/vctx/models"
-
 [evidence]
 planner = "instance:ai"
 ocr = "auto"
@@ -19,7 +12,5 @@ base_url = "https://provider.example/v1"
 model = "multimodal-model"
 credential = "env:VCTX_AI_API_KEY"
 format = "auto"
-
-[output]
-projections = ["context", "read"]
-retain_media = true
+timeout_s = 120
+insecure = false
