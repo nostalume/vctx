@@ -65,9 +65,7 @@ def test_prune_does_not_signal_live_windows_process(
     assert workspace.is_dir()
 
 
-def test_dead_model_lease_is_reclaimed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_dead_model_lease_is_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     stage = model_store.incomplete_dir("asr", "small", tmp_path)
     stage.parent.mkdir(parents=True)
     lock = stage.parent / f"{stage.name}.lock"

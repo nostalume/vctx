@@ -51,6 +51,9 @@ jobs:
           test "$max_app" -le 400
           test "$max_test" -le 300
 
+      - name: Ruff format
+        run: uv run ruff format --check src tests
+
       - name: Ruff
         run: uv run ruff check .
 
