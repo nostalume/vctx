@@ -88,7 +88,8 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
         def __init__(self, **kwargs: JsonValue) -> None:
             del kwargs
 
-        def transcribe(self, media_asset: MediaAsset) -> object:
+        def transcribe(self, media_asset: MediaAsset, *, progress: bool = False) -> object:
+            assert progress is False
             assert media_asset.local_path.read_bytes() == b"fake downloaded audio"
             assert media_asset.local_path.parent == tmp_path / "cache" / "source" / "blobs"
             return asr_ready(media_asset.id, "URL ASR text.", model="tiny")
@@ -109,15 +110,15 @@ model = "tiny"
     out_dir = tmp_path / "out"
 
     args = [
-            "prepare",
-            "https://video.example/watch?v=no-captions",
-            "--out",
-            str(out_dir),
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--config",
-            str(config_path),
-        ]
+        "prepare",
+        "https://video.example/watch?v=no-captions",
+        "--out",
+        str(out_dir),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--config",
+        str(config_path),
+    ]
     if not retain_media:
         args.append("--no-retain-media")
     result = runner.invoke(app, args)

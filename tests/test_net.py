@@ -59,3 +59,16 @@ def test_ambiguous_post_timeout_is_not_retried() -> None:
     assert raised.value.attempts == 1
     assert isinstance(raised.value.cause, httpx.ReadTimeout)
     assert calls == 1
+
+
+def test_runtime_rejects_response_beyond_declared_byte_budget() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, content=b"four")
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    request = _request("GET", RetryPolicy()).model_copy(update={"max_response_bytes": 3})
+    with HttpxNetRuntime(client=client) as net:
+        with pytest.raises(NetError, match="byte limit"):
+            net.request(request)
+        with pytest.raises(NetError, match="byte limit"):
+            list(net.iter_request(request, block_size=2))

@@ -16,8 +16,15 @@ def test_prepare_retains_relocatable_local_media_once(monkeypatch, tmp_path: Pat
     source.write_bytes(b"self-contained-media")
     out = tmp_path / "pack"
     read_bytes = Path.read_bytes
-    monkeypatch.setattr(Path, "read_bytes", lambda path: (_ for _ in ()).throw(
-        AssertionError("media was buffered")) if path == source else read_bytes(path))
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda path: (
+            (_ for _ in ()).throw(AssertionError("media was buffered"))
+            if path == source
+            else read_bytes(path)
+        ),
+    )
 
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out)])
 
@@ -25,9 +32,10 @@ def test_prepare_retains_relocatable_local_media_once(monkeypatch, tmp_path: Pat
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     entry = manifest["sources"][0]
     retained = next(item for item in entry["artifacts"] if item["kind"] == "media")
-    assert retained["path"] == "media.mp4" and [
-        item["path"] for item in entry["artifacts"]
-    ].count(retained["path"]) == 1
+    assert (
+        retained["path"] == "media.mp4"
+        and [item["path"] for item in entry["artifacts"]].count(retained["path"]) == 1
+    )
     assert str(source) not in json.dumps(manifest)
     source.unlink()
     relocated = tmp_path / "relocated-pack"
@@ -40,9 +48,7 @@ def test_prepare_can_explicitly_omit_local_media(tmp_path: Path) -> None:
     source.write_bytes(b"size-sensitive-media")
     out = tmp_path / "pack"
 
-    result = runner.invoke(
-        app, ["prepare", str(source), "--out", str(out), "--no-retain-media"]
-    )
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--no-retain-media"])
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -52,9 +58,7 @@ def test_prepare_can_explicitly_omit_local_media(tmp_path: Path) -> None:
     assert not any(item["kind"] == "media" for item in entry["artifacts"])
 
 
-def test_retention_integrity_failure_publishes_no_mixed_lane(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_retention_integrity_failure_publishes_no_mixed_lane(monkeypatch, tmp_path: Path) -> None:
     import vctx.artifact.bundle as retention
     from vctx.errors import CacheError
 

@@ -6,15 +6,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
-
 from vctx.config import YtDlpSourceOptions
 from vctx.errors import NoTranscriptError
 from vctx.source.session import (
     EffectReceipt,
     MediaAsset,
     MediaPermit,
-    MediaProfile,
     MediaRequest,
     ObservePermit,
     Revision,
@@ -23,7 +20,13 @@ from vctx.source.session import (
     SubtitlePermit,
     VideoMetadata,
 )
-from vctx.transcript import TranscriptPayload, TranscriptProvenance, UnknownLanguage
+from vctx.transcript import (
+    MAX_SUBTITLE_BYTES,
+    TranscriptPayload,
+    TranscriptProvenance,
+    UnknownLanguage,
+    decode_subtitle,
+)
 
 SUPPORTED_TRANSCRIPT_SUFFIXES: dict[str, Literal["srt", "vtt"]] = {".srt": "srt", ".vtt": "vtt"}
 SUPPORTED_MEDIA_SUFFIXES = {".wav", ".mp3", ".m4a", ".mp4", ".webm"}
@@ -39,17 +42,7 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-class LocalMediaAsset(BaseModel):
-    id: str
-    source: SourceRef
-    local_path: Path
-    container: str = "unknown"
-    duration_seconds: float | None = None
-    media_type: Literal["audio", "video", "unknown"] = "unknown"
-    purpose: Literal["input", "asr", "visual"] = "input"
-    profile: MediaProfile | None = None
-    format_id: str = "local"
-    provider: str = "local-file"
+LocalMediaAsset = MediaAsset
 
 
 @dataclass
@@ -67,9 +60,10 @@ class LocalFileSession:
                 EffectReceipt(operation="subtitle", status="failed", purpose="transcript")
             )
             raise NoTranscriptError("no transcript found for media input")
-        original = self.path.read_bytes()
+        with self.path.open("rb") as stream:
+            original = stream.read(MAX_SUBTITLE_BYTES + 1)
         payload = TranscriptPayload(
-            text=original.decode("utf-8"),
+            text=decode_subtitle(original),
             original_bytes=original,
             format=fmt,
             provenance=TranscriptProvenance(
@@ -106,6 +100,11 @@ class LocalFileSession:
             local_path=self.path,
             media_type=media_type,
             container=suffix.removeprefix("."),
+            purpose="input",
+            profile=None,
+            format_id="local",
+            provider="local-file",
+            capabilities={"audio"} if media_type == "audio" else {"audio", "video"},
         )
         self.receipts.append(
             EffectReceipt(

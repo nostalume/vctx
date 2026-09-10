@@ -117,13 +117,9 @@ def retain_source_files(
     try:
         if subtitle is not None:
             language = _token(subtitle.provenance.language or "und")
-            extension = {"plain": "txt", "unknown": "txt"}.get(
-                subtitle.format, subtitle.format
-            )
+            extension = {"plain": "txt", "unknown": "txt"}.get(subtitle.format, subtitle.format)
             body = subtitle.original_bytes or subtitle.text.encode("utf-8")
-            artifact = Artifact(
-                f"subtitle.{language}.{extension}", "subtitle", "text/plain", body
-            )
+            artifact = Artifact(f"subtitle.{language}.{extension}", "subtitle", "text/plain", body)
             written.append(write_artifact(lane, artifact))
             paths.append(lane / artifact.name)
         if media is not None:
@@ -144,9 +140,7 @@ def retain_source_files(
     return written, []
 
 
-def _copy_file(
-    source: Path, final: Path, name: str, *, expected: str | None = None
-) -> ArtifactRef:
+def _copy_file(source: Path, final: Path, name: str, *, expected: str | None = None) -> ArtifactRef:
     final.parent.mkdir(parents=True, exist_ok=True)
     temporary = final.with_name(f".{final.name}.tmp")
     digest = hashlib.sha256()
@@ -169,5 +163,7 @@ def _copy_file(
         bytes=final.stat().st_size,
         sha256=digest.hexdigest(),
     )
+
+
 def _token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-_").lower() or "unknown"

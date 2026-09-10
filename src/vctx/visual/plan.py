@@ -4,7 +4,6 @@ import json
 import unicodedata
 from collections import deque
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -77,12 +76,8 @@ class PlannerWindow(ClosedModel):
         left = segment.model_copy(update={"text": segment.text[:middle]})
         right = segment.model_copy(update={"text": segment.text[middle:]})
         return (
-            self.model_copy(
-                update={"id": f"{self.id}~1", "core": [left], "split_depth": depth}
-            ),
-            self.model_copy(
-                update={"id": f"{self.id}~2", "core": [right], "split_depth": depth}
-            ),
+            self.model_copy(update={"id": f"{self.id}~1", "core": [left], "split_depth": depth}),
+            self.model_copy(update={"id": f"{self.id}~2", "core": [right], "split_depth": depth}),
         )
 
 
@@ -237,8 +232,7 @@ class TranscriptIndex:
         for segment in self.transcript.segments:
             candidate = [*current, segment]
             if current and (
-                _segments_bytes(candidate) > _CORE_BYTES
-                or _span(candidate) > _CORE_SECONDS
+                _segments_bytes(candidate) > _CORE_BYTES or _span(candidate) > _CORE_SECONDS
             ):
                 cores.append(current)
                 current = [segment]
@@ -291,9 +285,7 @@ class EvidencePlanner:
             if outcome.kind == "ok":
                 result = outcome.value
                 status = (
-                    "empty"
-                    if not (result.claims or result.relations or result.frames)
-                    else "ok"
+                    "empty" if not (result.claims or result.relations or result.frames) else "ok"
                 )
                 drafts.append(WindowDraft(window=window, result=result))
                 receipts.append(
@@ -352,16 +344,14 @@ class PlanLinearizer:
         claims, refs = self.claims()
         relations = self.relations(claims, refs)
         intents, omissions = self.frame_intents(claims, refs)
-        selection = FrameSchedule.from_intents(intents).coalesce(_COALESCE_SECONDS).limit(
-            _CAPTURE_BUDGET
-        )
-        omissions.extend(selection.omissions())
+        frames, scheduling_omissions = _schedule_frames(intents)
+        omissions.extend(scheduling_omissions)
         return EvidencePlan(
             source_id=self.index.transcript.source_id,
             claims=claims,
             relations=relations,
             intents=intents,
-            frames=selection.linearize(),
+            frames=frames,
             omissions=omissions,
             receipts=list(receipts),
         )
@@ -406,9 +396,7 @@ class PlanLinearizer:
                 source = ids.get(source_key) if source_key is not None else None
                 target = ids.get(target_key) if target_key is not None else None
                 if source and target and source != target:
-                    admitted.add(
-                        (relation.kind, source, target, _optional_text(relation.text))
-                    )
+                    admitted.add((relation.kind, source, target, _optional_text(relation.text)))
         return [
             EvidenceRelation(
                 id=f"relation-{position:04d}",
@@ -479,124 +467,62 @@ class PlanLinearizer:
         return intents, omissions
 
 
-@dataclass(frozen=True)
-class ExpandedTarget:
-    seconds: float
-    intent: FrameIntent
+type _Target = tuple[float, FrameIntent]
 
 
-@dataclass(frozen=True)
-class FrameGroup:
-    targets: tuple[ExpandedTarget, ...]
+def _representative(group: Sequence[_Target]) -> _Target:
+    return max(group, key=lambda target: (target[1].priority, -target[0], target[1].id))
 
-    @property
-    def representative(self) -> ExpandedTarget:
-        return max(
-            self.targets,
-            key=lambda target: (
-                target.intent.priority,
-                -target.seconds,
-                target.intent.id,
-            ),
+
+def _schedule_frames(
+    intents: Iterable[FrameIntent],
+) -> tuple[list[PlannedFrame], list[PlanOmission]]:
+    targets = sorted(
+        ((seconds, intent) for intent in intents for seconds in intent.targets),
+        key=lambda target: (target[0], -target[1].priority, target[1].id),
+    )
+    groups: list[list[_Target]] = []
+    for target in targets:
+        if groups and target[0] - groups[-1][0][0] <= _COALESCE_SECONDS:
+            groups[-1].append(target)
+        else:
+            groups.append([target])
+    ranked = sorted(
+        groups,
+        key=lambda group: (
+            -_representative(group)[1].priority,
+            _representative(group)[0],
+            _representative(group)[1].id,
+        ),
+    )
+    selected = sorted(
+        ranked[:_CAPTURE_BUDGET],
+        key=lambda group: (_representative(group)[0], _representative(group)[1].id),
+    )
+    frames = [_planned_frame(position, group) for position, group in enumerate(selected, 1)]
+    omissions = [
+        PlanOmission(
+            request_id=intent.id,
+            reason="budget_exhausted",
+            detail=f"capture target {seconds:.3f}s exceeded source budget",
         )
-
-    @property
-    def priority(self) -> float:
-        return self.representative.intent.priority
-
-
-@dataclass(frozen=True)
-class FrameSchedule:
-    targets: tuple[ExpandedTarget, ...]
-
-    @classmethod
-    def from_intents(cls, intents: Iterable[FrameIntent]) -> FrameSchedule:
-        return cls(
-            tuple(
-                ExpandedTarget(seconds=target, intent=intent)
-                for intent in intents
-                for target in intent.targets
-            )
-        )
-
-    def coalesce(self, tolerance: float) -> GroupedFrames:
-        groups: list[list[ExpandedTarget]] = []
-        ordered = sorted(
-            self.targets,
-            key=lambda target: (
-                target.seconds,
-                -target.intent.priority,
-                target.intent.id,
-            ),
-        )
-        for target in ordered:
-            if groups and target.seconds - groups[-1][0].seconds <= tolerance:
-                groups[-1].append(target)
-            else:
-                groups.append([target])
-        return GroupedFrames(tuple(FrameGroup(tuple(group)) for group in groups))
+        for group in ranked[_CAPTURE_BUDGET:]
+        for seconds, intent in group
+    ]
+    return frames, omissions
 
 
-@dataclass(frozen=True)
-class GroupedFrames:
-    groups: tuple[FrameGroup, ...]
-
-    def limit(self, budget: int) -> FrameSelection:
-        ranked = sorted(
-            self.groups,
-            key=lambda group: (
-                -group.priority,
-                group.representative.seconds,
-                group.representative.intent.id,
-            ),
-        )
-        return FrameSelection(tuple(ranked[:budget]), tuple(ranked[budget:]))
-
-
-@dataclass(frozen=True)
-class FrameSelection:
-    selected: tuple[FrameGroup, ...]
-    omitted: tuple[FrameGroup, ...]
-
-    def linearize(self) -> list[PlannedFrame]:
-        ordered = sorted(
-            self.selected,
-            key=lambda group: (
-                group.representative.seconds,
-                group.representative.intent.id,
-            ),
-        )
-        return [
-            PlannedFrame(
-                id=f"frame-{position:04d}",
-                target_seconds=round(group.representative.seconds, 3),
-                segment_ids=sorted(
-                    {target.intent.anchor_segment_id for target in group.targets}
-                ),
-                processors=_processors(
-                    processor
-                    for target in group.targets
-                    for processor in target.intent.processors
-                ),
-                request_ids=sorted({target.intent.id for target in group.targets}),
-                claim_ids=sorted(
-                    {claim for target in group.targets for claim in target.intent.claim_ids}
-                ),
-                priority=group.priority,
-            )
-            for position, group in enumerate(ordered, 1)
-        ]
-
-    def omissions(self) -> list[PlanOmission]:
-        return [
-            PlanOmission(
-                request_id=target.intent.id,
-                reason="budget_exhausted",
-                detail=f"capture target {target.seconds:.3f}s exceeded source budget",
-            )
-            for group in self.omitted
-            for target in group.targets
-        ]
+def _planned_frame(position: int, group: Sequence[_Target]) -> PlannedFrame:
+    seconds, intent = _representative(group)
+    return PlannedFrame(
+        id=f"frame-{position:04d}",
+        target_seconds=round(seconds, 3),
+        segment_ids=sorted({item.anchor_segment_id for _, item in group}),
+        processors=_processors(p for _, item in group for p in item.processors),
+        request_ids=sorted({item.id for _, item in group}),
+        claim_ids=sorted({claim for _, item in group for claim in item.claim_ids}),
+        priority=intent.priority,
+    )
 
 
 def _window_prompt(window: PlannerWindow) -> str:

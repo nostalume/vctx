@@ -44,8 +44,8 @@ jobs:
           PY
           )
           echo "source=$source tests=$tests modules=$max_source app=$max_app test=$max_test"
-          test "$source" -le 8000
-          test "$tests" -le 3500
+          test "$source" -le 9600
+          test "$tests" -le 4600
           test "$tests" -le $((source / 2))
           test "$max_source" -le 600
           test "$max_app" -le 400

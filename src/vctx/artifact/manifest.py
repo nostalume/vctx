@@ -228,12 +228,8 @@ class ManifestBuilder:
         self, name: str, status: StepStatus, detail: str | None = None, receipt: object = None
     ) -> None:
         del receipt
-        mapped = {"ok": "succeeded", "warning": "warning", "error": "failed"}.get(
-            status, status
-        )
-        self.effects.append(
-            ManifestEffect(operation=name, status=mapped, diagnostic=detail)
-        )
+        mapped = {"ok": "succeeded", "warning": "warning", "error": "failed"}.get(status, status)
+        self.effects.append(ManifestEffect(operation=name, status=mapped, diagnostic=detail))
 
     def warn(self, message: str) -> None:
         self.omissions.append(message[:500])

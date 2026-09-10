@@ -279,14 +279,15 @@ def _read_artifact(lane: Path, ref: ArtifactRef, *, decode: bool) -> Any:
     path = lane / Path(ref.path)
     if _linked(path) or not path.is_file() or path.stat().st_nlink != 1:
         raise ValueError("source artifact is missing or linked")
-    if path.stat().st_size != ref.bytes or _hash_file(path) != ref.sha256:
+    digest, prefix = _hash_file(path)
+    if path.stat().st_size != ref.bytes or digest != ref.sha256:
         raise ValueError(f"source artifact failed integrity verification: {ref.path}")
     if not decode:
         return None
     if ref.kind in {"context", "read"}:
         return path.read_text(encoding="utf-8")
     if ref.kind == "visual_frame":
-        if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+        if prefix != b"\x89PNG\r\n\x1a\n":
             raise ValueError("visual frame is not a PNG")
         return ref.path
     loaders: dict[str, type[BaseModel]] = _json_loaders()
@@ -341,9 +342,11 @@ def _validate_relations(
         if summary.source_id != transcript.source_id:
             raise ValueError("summary belongs to another transcript")
         segments = {segment.id for segment in transcript.segments}
-        captures = {
-            capture.id for capture in loaded.get("evidence", ()).captures
-        } if "evidence" in loaded else set()
+        captures = (
+            {capture.id for capture in loaded.get("evidence", ()).captures}
+            if "evidence" in loaded
+            else set()
+        )
         for point in summary.points:
             if not set(point.segment_ids) <= segments or not set(point.capture_ids) <= captures:
                 raise ValueError("summary citation does not resolve to canonical products")
@@ -376,12 +379,15 @@ def _verify_complete_lane(lane: Path, source: ManifestSource) -> None:
         )
 
 
-def _hash_file(path: Path) -> str:
+def _hash_file(path: Path) -> tuple[str, bytes]:
     digest = hashlib.sha256()
+    prefix = b""
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if not prefix:
+                prefix = block[:8]
             digest.update(block)
-    return digest.hexdigest()
+    return digest.hexdigest(), prefix
 
 
 def _pack_error(root: Path, exc: Exception) -> OutputExistsError:

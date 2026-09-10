@@ -61,8 +61,11 @@ def test_metadata_applies_source_policy_once_and_redacts_locator(
     result = runner.invoke(
         app,
         [
-            "metadata", "https://video.example/watch?v=abc&token=secret",
-            "--json", "--config", str(config),
+            "metadata",
+            "https://video.example/watch?v=abc&token=secret",
+            "--json",
+            "--config",
+            str(config),
         ],
     )
 
@@ -94,8 +97,11 @@ def test_metadata_can_inspect_live_but_prepare_rejects_it_before_pack(
 
         def extract_info(self, value: str, download: bool = False) -> dict[str, object]:
             return {
-                "id": "live", "extractor": "example", "webpage_url": value,
-                "live_status": "is_live", "is_live": True,
+                "id": "live",
+                "extractor": "example",
+                "webpage_url": value,
+                "live_status": "is_live",
+                "is_live": True,
             }
 
     monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", FakeYoutubeDL)

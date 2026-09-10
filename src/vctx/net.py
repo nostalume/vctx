@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, Field
-from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt
 
 if TYPE_CHECKING:
     import httpx
@@ -20,6 +20,8 @@ NetPurpose = Literal[
     "evidence_plan",
     "summary",
     "openrouter_auth",
+    "source_observe",
+    "source_media",
 ]
 NetMethod = Literal["GET", "POST"]
 
@@ -43,6 +45,7 @@ class NetRequest(BaseModel):
     connect_timeout_s: float | None = None
     purpose: NetPurpose
     provider_id: str | None = None
+    max_response_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
 
 
@@ -68,6 +71,11 @@ class NetRuntime(Protocol):
 @runtime_checkable
 class BatchNetRuntime(NetRuntime, Protocol):
     def request_many(self, requests: Sequence[NetRequest]) -> list[NetResponse]: ...
+
+
+@runtime_checkable
+class StreamingNetRuntime(NetRuntime, Protocol):
+    def iter_request(self, request: NetRequest, *, block_size: int) -> Iterator[NetResponse]: ...
 
 
 class HttpxNetRuntime:
@@ -108,7 +116,7 @@ class HttpxNetRuntime:
         return _request_with_retry(request, lambda: self._request_once(request))
 
     def _request_once(self, request: NetRequest) -> NetResponse:
-        response = self._client.request(
+        with self._client.stream(
             request.method,
             request.url,
             headers=request.headers,
@@ -117,13 +125,18 @@ class HttpxNetRuntime:
                 request.timeout_s,
                 connect=request.connect_timeout_s or request.timeout_s,
             ),
-        )
-        return NetResponse(
-            url=str(response.url),
-            status_code=response.status_code,
-            headers={key: value for key, value in response.headers.items()},
-            body=response.content,
-        )
+        ) as response:
+            body = bytearray()
+            for block in response.iter_bytes(64 * 1024):
+                if len(body) + len(block) > request.max_response_bytes:
+                    raise ValueError("response exceeds declared byte limit")
+                body.extend(block)
+            return NetResponse(
+                url=str(response.url),
+                status_code=response.status_code,
+                headers={key: value for key, value in response.headers.items()},
+                body=bytes(body),
+            )
 
     def request_many(self, requests: Sequence[NetRequest]) -> list[NetResponse]:
         if not requests:
@@ -132,51 +145,74 @@ class HttpxNetRuntime:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return list(executor.map(self.request, requests))
 
-
-class _RetrySignal(RuntimeError):
-    def __init__(
-        self,
-        *,
-        cause: Exception | None = None,
-        response: NetResponse | None = None,
-    ) -> None:
-        super().__init__(str(cause) if cause is not None else "retryable HTTP response")
-        self.cause = cause
-        self.response = response
+    def iter_request(self, request: NetRequest, *, block_size: int) -> Iterator[NetResponse]:
+        attempts = request.retry.max_attempts
+        for attempt in range(1, attempts + 1):
+            emitted = False
+            received = 0
+            try:
+                with self._client.stream(
+                    request.method,
+                    request.url,
+                    headers=request.headers,
+                    content=request.body,
+                    timeout=self._httpx.Timeout(
+                        request.timeout_s,
+                        connect=request.connect_timeout_s or request.timeout_s,
+                    ),
+                ) as response:
+                    if response.status_code in request.retry.statuses and attempt < attempts:
+                        _wait(request.retry, attempt, _headers(response))
+                        continue
+                    headers = {key: value for key, value in response.headers.items()}
+                    for block in response.iter_bytes(block_size):
+                        if received + len(block) > request.max_response_bytes:
+                            raise ValueError("response exceeds declared byte limit")
+                        received += len(block)
+                        emitted = True
+                        yield NetResponse(
+                            url=str(response.url),
+                            status_code=response.status_code,
+                            headers=headers,
+                            body=block,
+                            attempts=attempt,
+                        )
+                    if not emitted:
+                        yield NetResponse(
+                            url=str(response.url),
+                            status_code=response.status_code,
+                            headers=headers,
+                            body=b"",
+                            attempts=attempt,
+                        )
+                    return
+            except Exception as exc:
+                if emitted or attempt == attempts or not _retryable_exception(exc, request.retry):
+                    raise NetError(attempts=attempt, cause=exc) from exc
+                _wait(request.retry, attempt)
 
 
 def _request_with_retry(
     request: NetRequest,
     request_once: Callable[[], NetResponse],
 ) -> NetResponse:
-    attempts = 0
-
-    def attempt() -> NetResponse:
-        nonlocal attempts
-        attempts += 1
+    for attempt in range(1, request.retry.max_attempts + 1):
         try:
             response = request_once()
         except Exception as exc:
-            if _retryable_exception(exc, request.retry):
-                raise _RetrySignal(cause=exc) from exc
-            raise NetError(attempts=attempts, cause=exc) from exc
-        if response.status_code in request.retry.statuses:
-            raise _RetrySignal(response=response)
-        return response.model_copy(update={"attempts": attempts})
-
-    retrying = Retrying(
-        stop=stop_after_attempt(request.retry.max_attempts),
-        wait=lambda state: _retry_delay(state, request.retry),
-        retry=retry_if_exception_type(_RetrySignal),
-        reraise=True,
-    )
-    try:
-        return retrying(attempt)
-    except _RetrySignal as signal:
-        if signal.response is not None:
-            return signal.response.model_copy(update={"attempts": attempts})
-        assert signal.cause is not None
-        raise NetError(attempts=attempts, cause=signal.cause) from signal.cause
+            if attempt == request.retry.max_attempts or not _retryable_exception(
+                exc, request.retry
+            ):
+                raise NetError(attempts=attempt, cause=exc) from exc
+            _wait(request.retry, attempt)
+            continue
+        if (
+            response.status_code not in request.retry.statuses
+            or attempt == request.retry.max_attempts
+        ):
+            return response.model_copy(update={"attempts": attempt})
+        _wait(request.retry, attempt, response.headers)
+    raise AssertionError("unreachable retry state")
 
 
 def _retryable_exception(exc: Exception, policy: RetryPolicy) -> bool:
@@ -185,27 +221,23 @@ def _retryable_exception(exc: Exception, policy: RetryPolicy) -> bool:
         return policy.retry_connect
     if isinstance(exc, httpx.TimeoutException | TimeoutError):
         return policy.retry_timeouts
-    return policy.retry_connect and isinstance(
-        exc, httpx.ConnectError | ConnectionError | OSError
-    )
+    return policy.retry_connect and isinstance(exc, httpx.ConnectError | ConnectionError | OSError)
 
 
 def _httpx() -> Any:
     return importlib.import_module("httpx")
 
 
-def _retry_delay(state: RetryCallState, policy: RetryPolicy) -> float:
-    if policy.honor_retry_after and state.outcome is not None:
-        signal = state.outcome.exception()
-        if isinstance(signal, _RetrySignal) and signal.response is not None:
-            value = signal.response.headers.get("Retry-After")
-            if value is not None:
-                try:
-                    parsed = float(value)
-                except ValueError:
-                    pass
-                else:
-                    if 0 <= parsed <= 60:
-                        return parsed
-    delay = policy.backoff_s * (2 ** max(0, state.attempt_number - 1))
-    return min(delay, policy.max_backoff_s)
+def _wait(policy: RetryPolicy, attempt: int, headers: dict[str, str] | None = None) -> None:
+    value = headers.get("Retry-After") if policy.honor_retry_after and headers else None
+    try:
+        delay = float(value) if value is not None else -1
+    except ValueError:
+        delay = -1
+    if not 0 <= delay <= 60:
+        delay = min(policy.backoff_s * 2 ** (attempt - 1), policy.max_backoff_s)
+    time.sleep(delay)
+
+
+def _headers(response: Any) -> dict[str, str]:
+    return {key: value for key, value in response.headers.items()}

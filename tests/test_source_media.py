@@ -11,7 +11,10 @@ from vctx.config import YtDlpSourceOptions
 from vctx.errors import OperationCancelledError, ProviderError
 from vctx.net import NetRuntime
 from vctx.source.session import (
+    AsrAudioRequest,
+    MediaAsset,
     MediaPermit,
+    MediaRegistry,
     Revision,
     SourceRecord,
     SourceRef,
@@ -105,4 +108,36 @@ def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_r
             permit=permit,
         )
     assert cancelled.value.exit_code == 130
-    assert not list((tmp_path / "cache").glob("*.part"))
+    partials = list((tmp_path / "cache").glob("*.part"))
+    assert len(partials) == 1 and partials[0].read_bytes() == b"partial"
+
+
+def test_media_registry_keeps_audio_and_video_assets_by_capability(tmp_path: Path) -> None:
+    source = SourceRef(kind="url", value="https://video.example/lecture")
+    audio = MediaAsset(
+        id="audio",
+        source=source,
+        local_path=tmp_path / "a.m4s",
+        media_type="audio",
+        purpose="asr",
+        format_id="a",
+        provider="fixture",
+        capabilities={"audio"},
+    )
+    video = MediaAsset(
+        id="video",
+        source=source,
+        local_path=tmp_path / "v.m4s",
+        media_type="video",
+        purpose="visual",
+        format_id="v",
+        provider="fixture",
+        capabilities={"video"},
+    )
+    registry = MediaRegistry()
+
+    registry.adopt(audio)
+    registry.adopt(video)
+
+    assert registry.find(AsrAudioRequest()) is audio
+    assert registry.find(VisualVideoRequest(profile="high")) is video

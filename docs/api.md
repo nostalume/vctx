@@ -42,6 +42,8 @@ uv tool install "vctx[full]"
 
 PyAV decodes video in-process. No host FFmpeg executable is required. Normal
 `prepare` never downloads models; use `models pull` explicitly.
+Use the `asr-cuda` extra on Windows for project-local CUDA 12/cuDNN 9 libraries. The
+runtime discovers them without mutating `PATH`; `doctor --json` reports their state.
 
 ## Commands
 
@@ -67,6 +69,9 @@ Important options:
 | `--asr`, `--ocr`, `--vision` | Override one capability selector |
 | `--media-quality auto|fast|balanced|high` | URL visual media policy |
 | `--no-retain-media` | Make output depend on external/cache media |
+| `--max-runtime SECONDS` | Hard 1..86400 second wall-clock limit; expiry exits 124 |
+| `--profile-json FILE` | Stream bounded JSONL phase events to a diagnostic file |
+| `--start SECONDS`, `--end SECONDS` | Transcribe only the selected absolute interval |
 | `--offline` | Deny network routes |
 | `--overwrite` | Refresh/rebuild rather than reuse admitted work |
 | `--cache-dir DIR` | One-run base for `source/` and `models/` |
@@ -79,7 +84,7 @@ Examples:
 ```console
 vctx prepare captions.srt --out pack
 vctx prepare lecture.mp4 --out pack --to evidence
-vctx prepare URL --out pack --to summary --config docs/examples/local-full.toml
+vctx prepare URL --out pack --to summary --max-runtime 1800 --config docs/examples/local-full.toml
 vctx prepare part-1.vtt part-2.vtt --out course
 ```
 
@@ -88,6 +93,10 @@ independent lanes and are never combined into one summary. Updating a verified
 pack adds new lanes, reuses satisfied matching revisions, and replaces only
 changed/upgraded lanes. Publication swaps one complete filesystem generation.
 Unknown or corrupt existing output is refused, including with `--overwrite`.
+
+When `--max-runtime` expires, vctx terminates the worker process tree and prints
+the stable `deadline_exceeded` category. A prior complete pack is preserved; an
+interrupted private stage is never published.
 
 Expected negative outcomes may still publish useful partial products. The
 manifest status and per-product outcomes distinguish ready, partial, unavailable,
@@ -139,13 +148,18 @@ in `--help`; observed run facts stay in `manifest.json`.
 ### Models
 
 ```console
-vctx models pull [asr] [ocr] [--json]
+vctx models pull [asr] [ocr] [--refresh] [--max-runtime SECONDS] [--json]
 vctx models status [asr] [ocr] [--json]
 vctx models verify [asr] [ocr] [--json]
+vctx models prune [--incomplete] [--unreferenced] [--dry-run] [--json]
 ```
 
-All accept `--config`, `--cache-dir`, and `--asr`. Pull is the only normal model
-download path. Status reads receipts; verify hashes prepared model contents.
+All accept `--config`, `--cache-dir`, and `--asr`. Pull reuses an exact ready
+model without network or content reads; `--refresh` explicitly downloads again,
+and `--max-runtime` bounds the Hub child. Status reads per-model receipts; verify
+streams model contents and refreshes trusted file facts. Prune removes only
+inactive incomplete workspaces or immutable generations not referenced by any
+valid receipt; `--dry-run` reports the same admitted targets without deletion.
 
 ### Source cache
 
@@ -157,6 +171,9 @@ vctx cache prune [--dry-run] [--age 30d | --all] [--json]
 Both accept `--config` and `--cache-dir`. Plain prune removes orphan blobs and
 temporary files. `--age` retires old records; `--all` retires every record.
 Source-cache commands never touch model storage.
+
+Local, cached, and remote subtitle inputs are limited to 8 MiB of encoded text;
+the source boundary refuses larger input before decoding it.
 
 ### OpenRouter authentication
 

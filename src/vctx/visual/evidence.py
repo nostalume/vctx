@@ -198,7 +198,6 @@ def _same_links(actual: CaptureEvidence | EvidenceMiss, expected: PlannedFrame) 
 
 
 def _observation_links(actual: CaptureEvidence, expected: PlannedFrame) -> bool:
-    return (
-        (actual.ocr.status != "not_requested") == ("ocr" in expected.processors)
-        and (actual.vision.status != "not_requested") == ("describe" in expected.processors)
-    )
+    return (actual.ocr.status != "not_requested") == ("ocr" in expected.processors) and (
+        actual.vision.status != "not_requested"
+    ) == ("describe" in expected.processors)

@@ -41,9 +41,9 @@ def evidence_products(run: PrepareRun, prepared: TranscriptProducts) -> Evidence
     processors = _enabled_processors(run)
     try:
         with phase(logger, "evidence.plan"):
-            plan = EvidencePlanner(
-                run.ai_client(planner), processors=processors
-            ).plan(prepared.transcript)
+            plan = EvidencePlanner(run.ai_client(planner), processors=processors).plan(
+                prepared.transcript
+            )
     except ValueError as exc:
         return _unavailable(run, str(exc))
     run.manifest.add_effect(planner.effect("evidence_plan"))
@@ -89,9 +89,10 @@ def evidence_products(run: PrepareRun, prepared: TranscriptProducts) -> Evidence
     else:
         run.manifest.add_step("transform.visual_plan", "ok", assessment.rationale)
     try:
-        assert run.media is not None
+        media = run.media.find(run.visual_media_request())
+        assert media is not None
         with phase(logger, "visual.capture"):
-            batch = capture(run.media, assessment.frames, run.request.out_dir)
+            batch = capture(media, assessment.frames, run.request.out_dir)
     except FrameError as exc:
         run.manifest.add_step("transform.visual_capture", "warning", str(exc))
         run.manifest.warn(str(exc))
@@ -187,15 +188,11 @@ def _unavailable(run: PrepareRun, detail: str) -> EvidenceOutcome:
 
 
 def _video_media(run: PrepareRun) -> bool:
-    if run.media is None:
-        try:
-            run.media = run.source.media(
-                request=run.visual_media_request(), permit=run.media_permit
-            )
-        except NoTranscriptError as exc:
-            run.manifest.add_step("source.media", "warning", str(exc))
-            return False
-    return run.media.media_type == "video"
+    try:
+        return "video" in run.ensure_media(run.visual_media_request()).capabilities
+    except NoTranscriptError as exc:
+        run.manifest.add_step("source.media", "warning", str(exc))
+        return False
 
 
 def _visual_frame_refs(batch: FrameBatch, out_dir: Path) -> list[ArtifactRef]:

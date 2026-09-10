@@ -3,16 +3,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from vctx.ai import Keyring
+from vctx.ai import CredentialRef, Keyring
 from vctx.net import NetRequest, NetRuntime, RetryPolicy
 
 _SERVICE = "vctx"
@@ -36,6 +38,44 @@ class AuthStatus(BaseModel):
     authenticated: bool
     provider: str = "openrouter"
     storage: str = "system-keyring"
+
+
+class CredentialPresence(BaseModel):
+    kind: str
+    status: str
+
+
+def probe_credential_presence(
+    reference: CredentialRef,
+    *,
+    env_files: list[Path] | None = None,
+    environ: Mapping[str, str] | None = None,
+    keyring: Keyring | None = None,
+) -> CredentialPresence:
+    if reference.kind == "env":
+        env = environ if environ is not None else os.environ
+        present = bool(env.get(reference.name)) or _dotenv_has(reference.name, env_files or [])
+        return CredentialPresence(kind="env", status="present" if present else "missing")
+    if keyring is None or keyring.priority <= 0:
+        return CredentialPresence(kind="keyring", status="inaccessible")
+    try:
+        present = bool(keyring.get_password("vctx", reference.name))
+    except Exception:
+        return CredentialPresence(kind="keyring", status="inaccessible")
+    return CredentialPresence(kind="keyring", status="present" if present else "missing")
+
+
+def _dotenv_has(name: str, paths: list[Path]) -> bool:
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, separator, value = line.strip().partition("=")
+            if separator and key.strip() == name and value.strip().strip("'\""):
+                return True
+    return False
 
 
 class _Exchange(BaseModel):

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from vctx.app.models import ModelLifecycleError, rapidocr_config_path, require_prepared_model
+from vctx.model_store import ModelLifecycleError, rapidocr_config_path, require_prepared_model
 from vctx.visual.evidence import Observation
 from vctx.visual.frame import Frame
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tomllib
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -19,21 +18,9 @@ from pydantic import (
 
 from vctx.ai import AiInstanceConfig
 from vctx.errors import ConfigError
+from vctx.options import MediaQuality, PrepareTarget
 
 type Projection = Literal["context", "read"]
-
-
-class PrepareTarget(StrEnum):
-    TRANSCRIPT = "transcript"
-    EVIDENCE = "evidence"
-    SUMMARY = "summary"
-
-
-class MediaQuality(StrEnum):
-    AUTO = "auto"
-    FAST = "fast"
-    BALANCED = "balanced"
-    HIGH = "high"
 
 
 class NoSourceSession(BaseModel):
@@ -150,6 +137,7 @@ class SourceInput(BaseModel):
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
     media_quality: MediaQuality = MediaQuality.AUTO
 
+
 class AutoUse(BaseModel):
     kind: Literal["auto"] = "auto"
 
@@ -213,6 +201,16 @@ class PrepareRequest(BaseModel):
     subtitle_languages: list[str] = Field(default_factory=list)
     retain_media: bool | None = None
     media_quality: MediaQuality | None = None
+    start_seconds: float | None = Field(default=None, ge=0)
+    end_seconds: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def valid_interval(self) -> PrepareRequest:
+        if self.end_seconds is not None and self.start_seconds is None:
+            self.start_seconds = 0
+        if self.end_seconds is not None and self.end_seconds <= (self.start_seconds or 0):
+            raise ValueError("--end must be greater than --start")
+        return self
 
 
 class RuntimeConfig(BaseModel):
@@ -326,6 +324,8 @@ class AsrInstanceConfig(BaseModel):
     model: str | None = None
     device: Literal["auto", "cpu", "cuda"] = "auto"
     compute: str = "auto"
+    cpu_threads: Literal["auto"] | Annotated[int, Field(ge=1, le=256)] = "auto"
+    batch_size: Literal["auto"] | Annotated[int, Field(ge=1, le=256)] = "auto"
     cache: InstanceCachePolicy = "persistent"
 
 

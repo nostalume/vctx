@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import shutil
 from collections.abc import Mapping
 from copy import deepcopy
@@ -11,8 +12,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
-
-from pydantic import BaseModel
 
 from vctx.config import (
     BrowserSourceSession,
@@ -41,7 +40,12 @@ from vctx.source.session import (
     SubtitlePermit,
     VideoMetadata,
 )
-from vctx.transcript import TranscriptPayload, TranscriptProvenance, detected_language
+from vctx.transcript import (
+    TranscriptPayload,
+    TranscriptProvenance,
+    decode_subtitle,
+    detected_language,
+)
 
 SubtitleKind = Literal["official_subtitles", "automatic_subtitles"]
 YtDlpScalar: TypeAlias = str | int | float | bool | None  # noqa: UP040
@@ -57,19 +61,10 @@ _VISUAL_HEIGHT_CAPS: dict[MediaProfile, int] = {
     "balanced": 720,
     "high": 1080,
 }
+logger = logging.getLogger(__name__)
 
 
-class DownloadedMediaAsset(BaseModel):
-    id: str
-    source: SourceRef
-    local_path: Path
-    container: str = "unknown"
-    duration_seconds: float | None = None
-    media_type: Literal["audio", "video", "unknown"]
-    purpose: Literal["input", "asr", "visual"]
-    profile: MediaProfile | None = None
-    format_id: str
-    provider: str = "yt-dlp"
+DownloadedMediaAsset = MediaAsset
 
 
 @dataclass(frozen=True)
@@ -155,11 +150,9 @@ class YtDlpSession:
             with yt_dlp.YoutubeDL(params) as ydl:
                 raw_info = ydl.process_ie_result(deepcopy(self.info), download=True)
         except yt_dlp.utils.DownloadError as exc:
-            _cleanup_parts(planned.temp_dir)
             self.receipts.append(_media_receipt(request, status="failed", attempts=1))
             raise ProviderError(f"yt-dlp media fetch failed: {exc}") from exc
         except KeyboardInterrupt:
-            _cleanup_parts(planned.temp_dir)
             self.receipts.append(_media_receipt(request, status="failed", attempts=1))
             raise OperationCancelledError("media fetch cancelled") from None
         info = _info_dict(raw_info)
@@ -224,6 +217,8 @@ def _download_params(request: MediaRequest, options: YtDlpSourceOptions) -> YtDl
         "continuedl": True,
         "part": True,
         "overwrites": False,
+        "concurrent_fragment_downloads": 8,
+        "progress_hooks": [_progress_hook],
     }
     _apply_source_options(params, options)
     if request.kind == "asr_audio":
@@ -298,11 +293,14 @@ def _has_space(path: Path, estimate: int) -> bool:
     return estimate <= max(0, usage.free - reserve)
 
 
-def _cleanup_parts(temp_dir: Path | None) -> None:
-    if temp_dir is None or not temp_dir.is_dir():
-        return
-    for part in temp_dir.glob("*.part"):
-        part.unlink(missing_ok=True)
+def _progress_hook(event: dict[str, object]) -> None:
+    status = event.get("status")
+    downloaded = event.get("downloaded_bytes")
+    total = event.get("total_bytes") or event.get("total_bytes_estimate")
+    if status == "downloading" and isinstance(downloaded, int) and isinstance(total, int):
+        logger.info("source.media progress=%s/%s", downloaded, total)
+    elif status == "finished":
+        logger.info("source.media progress=finished")
 
 
 def _media_receipt(
@@ -347,6 +345,8 @@ def _downloaded_asset(
             media_type="audio",
             purpose="asr",
             format_id=format_id,
+            provider="yt-dlp",
+            capabilities={"audio"},
         )
     return DownloadedMediaAsset(
         id=_media_id(info),
@@ -358,6 +358,8 @@ def _downloaded_asset(
         purpose="visual",
         profile=request.profile,
         format_id=format_id,
+        provider="yt-dlp",
+        capabilities={"video"},
     )
 
 
@@ -582,7 +584,7 @@ def _fetch_text(url: str, *, net: NetRuntime) -> str:
     )
     if response.status_code < 200 or response.status_code >= 300:
         raise NoTranscriptError(f"subtitle fetch failed: HTTP {response.status_code}")
-    return response.body.decode("utf-8-sig")
+    return decode_subtitle(response.body, "utf-8-sig")
 
 
 def _is_hls_playlist(text: str) -> bool:

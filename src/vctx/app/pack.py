@@ -30,9 +30,7 @@ class PrepareResult:
     def render_cli(self) -> str:
         label = "partial context pack" if self.manifest.status == "partial" else "context pack"
         config = (
-            str(self.config_path)
-            if self.config_path is not None
-            else "built-in defaults + CLI"
+            str(self.config_path) if self.config_path is not None else "built-in defaults + CLI"
         )
         lines = [
             f"Wrote {label}: {self.out_dir}",

@@ -50,5 +50,9 @@ class OperationCancelledError(VctxError):
     exit_code = 130
 
 
+class DeadlineExceededError(VctxError):
+    exit_code = 124
+
+
 class EmptyChunksError(VctxError):
     exit_code = 1

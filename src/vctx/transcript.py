@@ -11,6 +11,14 @@ from vctx.errors import EmptyChunksError, InvalidTranscriptError
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+MAX_SUBTITLE_BYTES = 8 * 1024 * 1024
+
+
+def decode_subtitle(data: bytes, encoding: str = "utf-8") -> str:
+    if len(data) > MAX_SUBTITLE_BYTES:
+        raise InvalidTranscriptError("subtitle exceeds 8 MiB encoded-size limit")
+    return data.decode(encoding)
+
 
 LanguageEvidenceSource = Literal["asr", "subtitle", "metadata", "media", "ocr", "vlm"]
 
@@ -66,6 +74,9 @@ class AsrProvenance(BaseModel):
     revision: str | None = None
     device: str
     compute_type: str
+    attempted_devices: list[str] = Field(default_factory=list)
+    fallback_reason: str | None = None
+    cpu_threads: int | None = None
     batch_size: int | None = None
     vad: bool
     confirmation: bool = False
@@ -108,6 +119,13 @@ class TranscriptPayload(BaseModel):
     original_bytes: bytes | None = None
     format: Literal["vtt", "srt", "json", "plain", "unknown"]
     provenance: TranscriptProvenance
+
+    @model_validator(mode="after")
+    def admit_encoded_size(self) -> TranscriptPayload:
+        size = len(self.original_bytes or self.text.encode())
+        if size > MAX_SUBTITLE_BYTES:
+            raise ValueError("subtitle exceeds 8 MiB encoded-size limit")
+        return self
 
     def provenance_label(self) -> str:
         parts: list[str] = []

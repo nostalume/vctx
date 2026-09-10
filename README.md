@@ -42,10 +42,13 @@ then render the view needed by a person or agent:
 ```console
 vctx auth openrouter login
 vctx models pull asr ocr
-vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary
+vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary --max-runtime 1800
 vctx verify ./lecture-pack
 vctx render ./lecture-pack --format read --out ./lecture.md
 ```
+
+On Windows with an NVIDIA GPU, install `vctx[asr-cuda]`; vctx loads its environment-local
+CUDA 12/cuDNN 9 libraries automatically without requiring browser cookies or `PATH` edits.
 
 `prepare` defaults to `--to transcript`. `--to evidence` adds transcript-anchored
 frame planning and observations; `--to summary` adds a citation-constrained

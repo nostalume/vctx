@@ -27,9 +27,7 @@ class Cache:
     def prune(
         self, *, age: str | None = None, all_records: bool = False, dry_run: bool = False
     ) -> PruneReceipt:
-        return prune_cache(
-            self.root, age=age, all_records=all_records, dry_run=dry_run
-        )
+        return prune_cache(self.root, age=age, all_records=all_records, dry_run=dry_run)
 
 
 def cache_status(root: Path) -> CacheInventory:

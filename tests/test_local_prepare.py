@@ -20,10 +20,21 @@ runner = CliRunner()
 
 def _tree_bytes(root: Path) -> dict[str, bytes]:
     return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
+        str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
+
+
+def test_local_subtitle_is_bounded_before_decode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "large.srt"
+    source.write_bytes(b"xxx")
+    monkeypatch.setattr("vctx.source.local.MAX_SUBTITLE_BYTES", 2)
+    monkeypatch.setattr("vctx.transcript.MAX_SUBTITLE_BYTES", 2)
+
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(tmp_path / "out")])
+
+    assert result.exit_code == 4 and "8 MiB encoded-size limit" in result.output
 
 
 def test_prepare_local_srt_writes_context_pack(tmp_path: Path) -> None:
@@ -66,8 +77,9 @@ def test_projection_selection_cannot_suppress_canonical_products(tmp_path: Path)
     config.write_text('[output]\nprojections = ["context"]\n', encoding="utf-8")
     out = tmp_path / "pack"
 
-    result = runner.invoke(app, ["prepare", str(source), "--out", str(out),
-                                 "--config", str(config)])
+    result = runner.invoke(
+        app, ["prepare", str(source), "--out", str(out), "--config", str(config)]
+    )
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -177,9 +189,10 @@ def test_prepare_reuses_matching_revision_unless_overwrite_is_set(
     lane = out / manifest["sources"][0]["path"]
     assert (lane / "read.md").is_file()
     assert "evidence" in {item["product"] for item in manifest["sources"][0]["outcomes"]}
-    assert runner.invoke(
-        app, ["prepare", str(source), "--out", str(out), "--overwrite"]
-    ).exit_code == 0
+    assert (
+        runner.invoke(app, ["prepare", str(source), "--out", str(out), "--overwrite"]).exit_code
+        == 0
+    )
     assert calls == 2
 
 
@@ -219,9 +232,7 @@ def test_prepare_refuses_corrupt_pack_even_with_overwrite(tmp_path: Path) -> Non
     context = out / manifest["sources"][0]["path"] / "context.md"
     context.write_text("corrupt", encoding="utf-8")
 
-    result = runner.invoke(
-        app, ["prepare", str(source), "--out", str(out), "--overwrite"]
-    )
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--overwrite"])
 
     assert result.exit_code == 5
     assert "not a verified vctx schema-3 pack" in result.output
@@ -242,9 +253,7 @@ def test_prepare_recovers_old_pack_after_interrupted_backup_rename(tmp_path: Pat
         "old_run_id": str(old.run.id),
         "new_run_id": "interrupted",
     }
-    publisher.marker.write_text(
-        json.dumps(marker), encoding="utf-8"
-    )
+    publisher.marker.write_text(json.dumps(marker), encoding="utf-8")
     out.replace(publisher.backup)
     publisher.stage.mkdir()
     (publisher.backup / old.sources[0].path).replace(publisher.stage / old.sources[0].path)
@@ -271,9 +280,7 @@ def test_prepare_cancelled_refresh_preserves_prior_pack(
         raise OperationCancelledError("cancelled")
 
     monkeypatch.setattr(LocalFileSession, "transcript", cancel)
-    result = runner.invoke(
-        app, ["prepare", str(source), "--out", str(out), "--overwrite"]
-    )
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--overwrite"])
 
     assert result.exit_code == 130
     assert _tree_bytes(out) == before

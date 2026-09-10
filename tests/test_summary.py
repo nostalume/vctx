@@ -12,8 +12,14 @@ from vctx.visual.plan import EvidencePlan
 
 def _r(request: str) -> AiReceipt:
     return AiReceipt(
-        task="summary", request_id=request, provider="fixture", configured_model="m",
-        format="json", attempts=1, latency_ms=0, privacy="standard",
+        task="summary",
+        request_id=request,
+        provider="fixture",
+        configured_model="m",
+        format="json",
+        attempts=1,
+        latency_ms=0,
+        privacy="standard",
     )
 
 
@@ -71,14 +77,16 @@ def test_context_overflow_keeps_valid_groups_when_reduction_fails(group_failure:
     two = DraftPoint(text="二", basis="transcript", segment_ids=["seg_000002"])
     tail = (
         [_fail("g2", "http"), _ok("reduce", two)]
-        if group_failure else [_ok("g2", two), _fail("reduce", "http")]
+        if group_failure
+        else [_ok("g2", two), _fail("reduce", "http")]
     )
     client = _Client([_fail("all"), _ok("g1", one), *tail])
     outcome = SummaryWriter(cast(AiClient, client)).write(_packet())
     assert client.calls == 4 and outcome.status == "partial"
     assert outcome.summary is not None and outcome.summary.overview is None
     assert [point.segment_ids for point in outcome.summary.points] == [
-        ["seg_000001"], *([] if group_failure else [["seg_000002"]])
+        ["seg_000001"],
+        *([] if group_failure else [["seg_000002"]]),
     ]
 
 

@@ -23,9 +23,7 @@ def _pack(tmp_path: Path, *names: str) -> Path:
     inputs: list[str] = []
     for name in names or ("lecture",):
         source = tmp_path / f"{name}.srt"
-        source.write_text(
-            f"1\n00:00:00,000 --> 00:00:01,000\n{name} words\n", encoding="utf-8"
-        )
+        source.write_text(f"1\n00:00:00,000 --> 00:00:01,000\n{name} words\n", encoding="utf-8")
         inputs.append(str(source))
     result = runner.invoke(app, ["prepare", *inputs, "--out", str(pack)])
     assert result.exit_code == 0, result.output
@@ -93,9 +91,7 @@ def _add_evidence(pack: Path) -> Path:
     ("format", "marker"),
     [("context", "# Agent Context Pack"), ("read", "# lecture"), ("transcript", "# Transcript")],
 )
-def test_render_single_source_pack_to_stdout(
-    tmp_path: Path, format: str, marker: str
-) -> None:
+def test_render_single_source_pack_to_stdout(tmp_path: Path, format: str, marker: str) -> None:
     pack = _pack(tmp_path)
     before = _tree(pack)
 
@@ -117,9 +113,7 @@ def test_render_external_file_ignores_stored_projection_bytes(tmp_path: Path) ->
     before = _tree(pack)
     out = tmp_path / "views" / "context.md"
 
-    result = runner.invoke(
-        app, ["render", str(pack), "--format", "context", "--out", str(out)]
-    )
+    result = runner.invoke(app, ["render", str(pack), "--format", "context", "--out", str(out)])
 
     assert result.exit_code == 0, result.output
     assert "# Agent Context Pack" in out.read_text(encoding="utf-8")
@@ -132,9 +126,7 @@ def test_rendered_frame_link_is_relative_to_external_destination(tmp_path: Path)
     frame = _add_evidence(pack)
     out = tmp_path / "export with spaces" / "read.md"
 
-    result = runner.invoke(
-        app, ["render", str(pack), "--format", "read", "--out", str(out)]
-    )
+    result = runner.invoke(app, ["render", str(pack), "--format", "read", "--out", str(out)])
 
     assert result.exit_code == 0, result.output
     match = re.search(r"!\[[^]]*\]\(([^)]+)\)", out.read_text(encoding="utf-8"))
@@ -206,9 +198,7 @@ def test_render_reports_unrepresentable_cross_volume_link(
 
     monkeypatch.setattr(render_module.os.path, "relpath", fail_relpath)
 
-    result = runner.invoke(
-        app, ["render", str(pack), "--format", "read", "--out", str(out)]
-    )
+    result = runner.invoke(app, ["render", str(pack), "--format", "read", "--out", str(out)])
 
     assert result.exit_code == 1
     assert "relative links" in result.stderr
