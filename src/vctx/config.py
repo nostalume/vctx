@@ -21,6 +21,7 @@ from vctx.errors import ConfigError
 from vctx.options import MediaQuality, PrepareTarget
 
 type Projection = Literal["context", "read"]
+type AsrQuality = Literal["fast", "balanced", "accurate"]
 
 
 class NoSourceSession(BaseModel):
@@ -194,6 +195,7 @@ class PrepareRequest(BaseModel):
     projections: set[Projection] | None = None
     target: PrepareTarget = PrepareTarget.TRANSCRIPT
     asr_use: TransformUse | str | None = None
+    asr_quality: AsrQuality | None = None
     ocr_use: TransformUse | str | None = None
     vision_use: TransformUse | str | None = None
     offline: bool | None = None
@@ -262,17 +264,22 @@ class CapabilityInput(BaseModel):
     use: TransformUse = Field(default_factory=AutoUse)
 
 
+class AsrInput(CapabilityInput):
+    quality: AsrQuality = "balanced"
+
+
 def _capability_input(value: object) -> object:
     return {"use": value} if isinstance(value, str) else value
 
 
 CapabilitySelection = Annotated[CapabilityInput, BeforeValidator(_capability_input)]
+AsrSelection = Annotated[AsrInput, BeforeValidator(_capability_input)]
 
 
 class TransformInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asr: CapabilityInput = Field(default_factory=CapabilityInput)
+    asr: AsrSelection = Field(default_factory=AsrInput)
 
 
 class EvidenceInput(BaseModel):
@@ -287,6 +294,10 @@ class EvidenceConfig(BaseModel):
     planner: CapabilityPolicy
     vision: CapabilityPolicy
     ocr: CapabilityPolicy
+
+
+class AsrPolicy(CapabilityPolicy):
+    quality: AsrQuality = "balanced"
 
 
 class SummaryInput(BaseModel):
@@ -371,7 +382,7 @@ class ResolvedConfig(BaseModel):
     runtime: RuntimeConfig
     cache: CacheConfig
     source: SourceConfig
-    asr: CapabilityPolicy
+    asr: AsrPolicy
     evidence: EvidenceConfig
     summary: SummaryConfig
     output: OutputConfig
@@ -509,6 +520,11 @@ def _resolve_policy(
     return CapabilityPolicy(enabled=enabled, use=raw.use)
 
 
+def _resolve_asr_policy(raw: AsrInput, enabled: bool) -> AsrPolicy:
+    policy = _resolve_policy(raw, enabled)
+    return AsrPolicy(enabled=policy.enabled, use=policy.use, quality=raw.quality)
+
+
 def _resolve_use(use: TransformUse, enabled: bool) -> CapabilityPolicy:
     return CapabilityPolicy(
         enabled=enabled and not isinstance(use, DisabledUse),
@@ -584,7 +600,10 @@ def _resolve_config(
             update={"subtitle_languages": request.subtitle_languages}
         )
 
-    asr = _resolve_policy(_request_policy(config.transforms.asr, request.asr_use), True)
+    requested_asr = _request_policy(config.transforms.asr, request.asr_use)
+    if request.asr_quality is not None:
+        requested_asr = requested_asr.model_copy(update={"quality": request.asr_quality})
+    asr = _resolve_asr_policy(AsrInput.model_validate(requested_asr), True)
     evidence = EvidenceConfig(
         ocr=_resolve_policy(
             _request_policy(config.evidence.ocr, request.ocr_use),

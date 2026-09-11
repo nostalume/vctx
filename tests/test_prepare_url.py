@@ -131,11 +131,11 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     }
     assert "manifest-secret" not in json.dumps(manifest)
     assert manifest["status"] == "ok"
-    assert manifest["schema_version"] == "3"
+    assert manifest["schema_version"] == "4"
 
     subtitle_asset = next(item for item in source_entry["artifacts"] if item["kind"] == "subtitle")
     assert subtitle_asset["kind"] == "subtitle"
-    assert subtitle_asset["path"] == "subtitle.en.vtt"
+    assert subtitle_asset["path"] == "assets/subtitle.en.vtt"
     assert (lane / subtitle_asset["path"]).read_text(encoding="utf-8") == (
         FakeSubtitleRuntime.response_text
     )

@@ -64,7 +64,7 @@ def _satisfies(source: ManifestSource, resolved: ResolvedConfig) -> bool:
     return (
         outcomes.get(resolved.target.value) == "ready"
         and resolved.output.projections <= kinds
-        and (not resolved.output.retain_media or outcomes.get("retained-media") == "ready")
+        and (not resolved.output.retain_media or outcomes.get("source-assets") == "ready")
     )
 
 
@@ -195,6 +195,7 @@ class PreparePipeline:
                 cache_root=self.run.model_root,
                 progress=logger.isEnabledFor(logging.INFO),
                 interval=interval,
+                temp_root=self.run.source_cache.root / "tmp" / "asr",
             )
         if outcome.kind == "ready" and key is not None:
             try:

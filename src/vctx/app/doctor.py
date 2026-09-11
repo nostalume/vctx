@@ -11,6 +11,7 @@ from vctx.asr import AsrReadinessFacts, decide_asr_readiness
 from vctx.asr.faster_whisper import bundled_cuda_state
 from vctx.config import (
     AsrInstanceConfig,
+    AsrQuality,
     CapabilityPolicy,
     PrepareRequest,
     PrepareTarget,
@@ -26,6 +27,7 @@ def doctor_report(
     cache_dir: Path | None = None,
     target: PrepareTarget = PrepareTarget.TRANSCRIPT,
     asr: str | None = None,
+    asr_quality: AsrQuality | None = None,
     ocr: str | None = None,
     vision: str | None = None,
     offline: bool | None = None,
@@ -40,6 +42,7 @@ def doctor_report(
             cache_dir=cache_dir,
             target=target,
             asr_use=asr,
+            asr_quality=asr_quality,
             ocr_use=ocr,
             vision_use=vision,
             offline=offline,
@@ -98,6 +101,7 @@ def doctor_report(
             ),
         },
     }
+    report["capabilities"]["asr"]["quality"] = resolved.asr.quality
     if json_output:
         return json.dumps(report, indent=2) + "\n"
     lines = [

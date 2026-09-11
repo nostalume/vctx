@@ -1091,6 +1091,8 @@ asr-cuda = [
 full = [
     { name = "av" },
     { name = "faster-whisper" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'win32'" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32'" },
     { name = "onnxruntime" },
     { name = "pillow" },
     { name = "rapidocr" },
@@ -1119,7 +1121,9 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "keyring", specifier = ">=25.7.0" },
     { name = "nvidia-cublas-cu12", marker = "sys_platform == 'win32' and extra == 'asr-cuda'", specifier = ">=12.9.2.10" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'win32' and extra == 'full'", specifier = ">=12.9.2.10" },
     { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32' and extra == 'asr-cuda'", specifier = ">=9.25.1.1" },
+    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32' and extra == 'full'", specifier = ">=9.25.1.1" },
     { name = "onnxruntime", marker = "extra == 'full'", specifier = ">=1.20.0" },
     { name = "onnxruntime", marker = "extra == 'visual'", specifier = ">=1.20.0" },
     { name = "pillow", marker = "extra == 'full'", specifier = ">=12.0.0" },

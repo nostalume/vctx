@@ -6,6 +6,8 @@ from pathlib import Path
 from vctx.config import ResolvedConfig
 from vctx.model.store import ModelLifecycleError, ModelReceipt
 
+ASR_QUALITY_MODELS = {"fast": "tiny", "balanced": "small", "accurate": "large-v3-turbo"}
+
 
 def select_asr_model_id(resolved: ResolvedConfig) -> str:
     policy = resolved.asr
@@ -16,7 +18,7 @@ def select_asr_model_id(resolved: ResolvedConfig) -> str:
         raise ModelLifecycleError("models pull manages named local ASR models, not path/HF refs")
     instance_name = policy.instance_name()
     if instance_name is None:
-        return "small"
+        return ASR_QUALITY_MODELS[policy.quality]
     instance = resolved.instances.asr[instance_name]
     if instance.type != "local-faster-whisper":
         raise ModelLifecycleError("selected ASR instance is online and has no local model to pull")

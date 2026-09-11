@@ -108,7 +108,7 @@ def test_render_single_source_pack_to_stdout(tmp_path: Path, format: str, marker
 def test_render_external_file_ignores_stored_projection_bytes(tmp_path: Path) -> None:
     pack = _pack(tmp_path)
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
-    lane = pack / manifest["sources"][0]["key"]
+    lane = pack / manifest["sources"][0]["path"]
     (lane / "context.md").write_text("corrupt stored projection", encoding="utf-8")
     before = _tree(pack)
     out = tmp_path / "views" / "context.md"
@@ -172,8 +172,8 @@ def test_render_rejects_corrupt_required_product_but_ignores_unrelated_asset(
 ) -> None:
     pack = _pack(tmp_path)
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
-    lane = pack / manifest["sources"][0]["key"]
-    (lane / "subtitle.und.srt").write_text("corrupt retained input", encoding="utf-8")
+    lane = pack / manifest["sources"][0]["path"]
+    (lane / "assets" / "subtitle.und.srt").write_text("corrupt retained input", encoding="utf-8")
 
     unrelated = runner.invoke(app, ["render", str(pack), "--format", "transcript"])
     (lane / "transcript.json").write_text("{}", encoding="utf-8")

@@ -1,7 +1,7 @@
 # vctx CLI and artifact contract
 
 `vctx` is a one-shot context compiler. Its stable integration surfaces are the
-installed CLI and schema-3 output pack. Python modules are internal.
+installed CLI and schema-4 output pack. Python modules are internal.
 
 ## Workflow
 
@@ -38,7 +38,7 @@ uv tool install "vctx[full]"
 | core | Local/URL subtitles, source cache, compatible AI routes |
 | asr | Core plus local faster-whisper |
 | visual | Core plus PyAV frames and RapidOCR |
-| full | Normalized union of ASR and visual |
+| full | ASR (including Windows CUDA libraries) and visual capabilities |
 
 PyAV decodes video in-process. No host FFmpeg executable is required. Normal
 `prepare` never downloads models; use `models pull` explicitly.
@@ -50,7 +50,8 @@ runtime discovers them without mutating `PATH`; `doctor --json` reports their st
 Use command-specific `--help` for the exact option grammar.
 
 Closed CLI string values are complete here: `--to` accepts `transcript`,
-`evidence`, or `summary`; `--media-quality` accepts `auto`, `fast`, `balanced`,
+`evidence`, or `summary`; `--asr-quality` accepts `fast`, `balanced`, or `accurate`;
+`--media-quality` accepts `auto`, `fast`, `balanced`,
 or `high`; `render --format` accepts `context`, `read`, or `transcript`; and model
 capabilities are `asr` and `ocr`. Capability selectors have their own complete
 grammar under [Selectors](#selectors).
@@ -67,8 +68,8 @@ Important options:
 | --- | --- |
 | `--to transcript|evidence|summary` | Highest requested product; transcript is default |
 | `--asr`, `--ocr`, `--vision` | Override one capability selector |
+| `--asr-quality fast|balanced|accurate` | Transcript speed/quality intent; balanced is default |
 | `--media-quality auto|fast|balanced|high` | URL visual media policy |
-| `--no-retain-media` | Make output depend on external/cache media |
 | `--max-runtime SECONDS` | Hard 1..86400 second wall-clock limit; expiry exits 124 |
 | `--profile-json FILE` | Stream bounded JSONL phase events to a diagnostic file |
 | `--start SECONDS`, `--end SECONDS` | Transcribe only the selected absolute interval |
@@ -252,6 +253,7 @@ string is not an enum and is validated by its owning provider or adapter.
 | Field | Type/default | Behavior |
 | --- | --- | --- |
 | `transforms.asr.use` | selector, `auto` | Chooses speech recognition when a usable native subtitle is unavailable. ASR is eligible for every target. |
+| `transforms.asr.quality` | `fast`, `balanced`, or `accurate`; `balanced` | Chooses an already prepared managed model. It never downloads one. |
 | `transforms.asr.enabled` | strict boolean, inferred | Advanced explicit gate. `false` forces `use = "none"`; `true` cannot be combined with `none`. |
 | `evidence.planner.use` | selector, `auto` | Chooses the AI transcript-to-frame-request planner. Eligible for evidence and summary targets. |
 | `evidence.planner.enabled` | strict boolean, inferred | Explicitly gates the planner. |
@@ -264,7 +266,6 @@ string is not an enum and is validated by its owning provider or adapter.
 | `output.projections` | set of `context`, `read`; both | Markdown projections published in every source lane. Canonical JSON remains authoritative. |
 | `output.chunk_max_chars` | integer, `6000` | Maximum transcript characters per canonical chunk. |
 | `output.chunk_max_seconds` | integer or omitted | Optional maximum time span per chunk. Omission disables the time limit. |
-| `output.retain_media` | strict boolean, `true` | Copies admitted media into its source lane for a portable, recognition-friendly pack. CLI `--no-retain-media` disables it once. |
 
 Each evidence policy accepts a terse string, for example `ocr = "none"`, or an
 explicit table exposing its `enabled` and `use` fields:
@@ -293,24 +294,18 @@ all stages. A specific `none` remains disabled even when its target is enabled.
 `--asr`, `--ocr`, and `--vision` use the same selector grammar and override the
 selected file. Planner and summary remain config-controlled.
 
-#### ASR instances
+#### Expert ASR compatibility
 
 ```toml
-[instances.asr.local]
-type = "local-faster-whisper"
-model = "small"
-device = "auto"
-compute = "auto"
-cache = "persistent"
+[transforms.asr]
+use = "path:C:/models/faster-whisper-custom"
 ```
 
-| Field | Type/default | Behavior |
-| --- | --- | --- |
-| `type` | required; `local-faster-whisper` | Adapter implementation. No other instance type is currently admitted. |
-| `model` | open string, `small` | faster-whisper model ID or `path:PATH`. It is not an enum; `path:...` is resolved from the config directory. |
-| `device` | `auto`, `cpu`, or `cuda`; `auto` | Inference device selection. |
-| `compute` | open string, `auto` | faster-whisper/CTranslate2 compute type forwarded to the adapter; accepted values depend on the installed runtime and device. |
-| `cache` | `persistent` or `disabled`; `persistent` | Uses managed model storage. `disabled` requires `model` to resolve to an existing local model directory. |
+Named instances and explicit model references remain an expert compatibility path.
+Legacy instance runtime-tuning keys remain readable for this release, preserve
+their strict behavior, and emit a deprecation diagnostic; normal configuration
+uses `quality`, while execution device, compute mode, threading, and batching are
+selected internally and recorded in transcript provenance.
 
 #### OpenAI-compatible AI instances
 
@@ -354,6 +349,7 @@ cache base/
     index.sqlite3
     blobs/<sha256>
     tmp/
+      asr/                    # disposable bounded interval inputs
   models/
 ```
 
@@ -367,7 +363,12 @@ output never share mutable file identity. No silent eviction occurs.
 ```text
 PACK/
   manifest.json
-  <source-key>/
+  sources/<source-key>/
+    assets/
+      audio.<ext>            # acquired audio-only representation
+      video.<ext>            # acquired video-only representation
+      media.<ext>            # one combined audio/video representation
+      subtitle.<lang>.<ext>  # acquired native subtitle
     metadata.json
     transcript.json
     chunks.json
@@ -376,13 +377,11 @@ PACK/
     summary.json             # when produced
     context.md               # selected projection
     read.md                  # selected projection
-    subtitle.<lang>.<ext>    # retained when available
-    media.<ext>              # retained when available
-    frames/
-      frame-0001.png         # when captured
+    frames/frame-0001.png    # when captured
 ```
 
-Only `manifest.json` is at the pack root. Each source lane is a direct child.
+Only `manifest.json` and `sources/` are at the pack root. `manifest.json` is the
+sole source index; each source path is exactly `sources/<stable-key>`.
 Every artifact reference is relative, portable, size/digest indexed, and owned by
 one source. Repeated prepares aggregate independent lanes, not their content.
 
@@ -395,7 +394,7 @@ Closed manifest string values are:
 
 | Field | Values |
 | --- | --- |
-| `schema_version` | `3` |
+| `schema_version` | `4` for new packs; immutable schema `3` remains readable |
 | `tool` | `vctx` |
 | manifest/source `status` | `ok`, `partial`, `error` |
 | source `kind` | `url`, `file` |
@@ -426,6 +425,6 @@ uses manifest/run identity rather than directory naming hints.
 
 ## Stability
 
-Stable surfaces are command behavior, config grammar/precedence, schema-3 pack
+Stable surfaces are command behavior, config grammar/precedence, schema-3/4 pack
 layout, canonical product schemas, relative artifact references, and exit
 categories. Internal Python ownership and human-readable prose may evolve.

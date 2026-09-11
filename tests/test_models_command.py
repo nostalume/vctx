@@ -25,6 +25,15 @@ def test_models_status_is_network_free_and_machine_readable(tmp_path: Path) -> N
     assert all(not Path(item["cache_path"]).is_absolute() for item in records)
 
 
+def test_models_status_maps_quality_intent_to_managed_model(tmp_path: Path) -> None:
+    config = tmp_path / "vctx.toml"
+    config.write_text('[transforms.asr]\nquality = "fast"\n', encoding="utf-8")
+    result = runner.invoke(app, ["models", "status", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)[0]["model_id"] == "tiny"
+
+
 def test_models_pull_maps_options_and_renders_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

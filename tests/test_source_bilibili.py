@@ -12,6 +12,7 @@ from vctx.source.session import (
     AsrAudioRequest,
     MediaPermit,
     ObservePermit,
+    SubtitlePermit,
     VisualVideoRequest,
 )
 
@@ -80,6 +81,8 @@ class BilibiliNet:
                     },
                 },
             )
+        if "player/v2" in request.url:
+            return _json_response(request.url, {"code": 0, "data": {"subtitle": {"subtitles": []}}})
         body = self.media[request.url]
         value = request.headers.get("Range")
         assert value is not None and value.startswith("bytes=")
@@ -135,6 +138,65 @@ def test_bilibili_rejects_provider_error_without_raw_payload() -> None:
 
     with pytest.raises(Exception, match="Bilibili metadata unavailable"):
         BilibiliSourceAdapter(net=FailedNet()).observe(
+            "https://www.bilibili.com/video/BV1Tpbj6eEDZ",
+            permit=ObservePermit(operation="prepare", network="allowed"),
+            options=YtDlpSourceOptions(),
+        )
+
+
+def test_bilibili_prefers_typed_anonymous_official_subtitle() -> None:
+    class SubtitleNet(BilibiliNet):
+        def request(self, request: NetRequest) -> NetResponse:
+            if "player/v2" in request.url:
+                return _json_response(
+                    request.url,
+                    {
+                        "code": 0,
+                        "data": {
+                            "subtitle": {
+                                "subtitles": [
+                                    {
+                                        "id": 7,
+                                        "lan": "zh-CN",
+                                        "subtitle_url": "//aisubtitle.hdslb.com/example.json",
+                                        "ai_type": 0,
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                )
+            if "aisubtitle.hdslb.com" in request.url:
+                return _json_response(
+                    request.url,
+                    {"body": [{"from": 1.25, "to": 2.5, "content": "字幕文本"}]},
+                )
+            return super().request(request)
+
+    session = BilibiliSourceAdapter(net=SubtitleNet()).observe(
+        "https://www.bilibili.com/video/BV1Tpbj6eEDZ",
+        permit=ObservePermit(operation="prepare", network="allowed"),
+        options=YtDlpSourceOptions(),
+    )
+    payload = session.transcript(permit=SubtitlePermit(network="allowed"))
+
+    assert session.record.has_subtitles
+    assert payload.provenance.method == "official_subtitles"
+    assert "00:00:01,250 --> 00:00:02,500" in payload.text
+
+
+def test_bilibili_rejects_malformed_subtitle_index() -> None:
+    class MalformedNet(BilibiliNet):
+        def request(self, request: NetRequest) -> NetResponse:
+            if "player/v2" in request.url:
+                return _json_response(
+                    request.url,
+                    {"code": 0, "data": {"subtitle": {"subtitles": [{"id": "bad"}]}}},
+                )
+            return super().request(request)
+
+    with pytest.raises(Exception, match="subtitle index returned an invalid response"):
+        BilibiliSourceAdapter(net=MalformedNet()).observe(
             "https://www.bilibili.com/video/BV1Tpbj6eEDZ",
             permit=ObservePermit(operation="prepare", network="allowed"),
             options=YtDlpSourceOptions(),

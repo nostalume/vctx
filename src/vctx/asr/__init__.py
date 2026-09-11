@@ -20,10 +20,12 @@ from vctx.asr.faster_whisper import (
     admit_model,
     admit_pass,
     admit_transcriber,
+    bundled_cuda_state,
     import_api,
     is_oom,
     load_bundled_cuda,
 )
+from vctx.asr.input import AsrInput, open_asr_input
 from vctx.config import AsrInstanceConfig, CapabilityPolicy
 from vctx.model.store import ModelLifecycleError, ModelStore
 from vctx.source.session import MediaAsset
@@ -69,8 +71,6 @@ class AsrEnvironment(BaseModel):
 
 
 class AsrRuntimeReadiness(BaseModel):
-    requested_device: Literal["auto", "cpu", "cuda"]
-    compute_type: str
     package_state: Literal["ready", "missing"]
     cuda_libraries: Literal["bundled", "missing", "not-applicable"]
 
@@ -107,31 +107,20 @@ def decide_asr_readiness(
     facts: AsrReadinessFacts,
 ) -> AsrReadiness:
     runtime = AsrRuntimeReadiness(
-        requested_device=instance.device,
-        compute_type=instance.compute,
         package_state=facts.package_state,
         cuda_libraries=facts.cuda_libraries,
     )
     if policy.disabled():
         return AsrReadiness(state="disabled", runtime=runtime)
-    if facts.model_kind == "unsupported":
+    kind, model_state = facts.model_kind, facts.model_state or "missing"
+    if kind == "unsupported":
         state = "unsupported-reference"
-    elif facts.model_kind == "explicit":
-        state = {
-            "ready": "explicit-ready",
-            "missing": "explicit-missing",
-            "incomplete": "corrupt",
-            "changed": "corrupt",
-            "corrupt": "corrupt",
-        }[facts.model_state or "missing"]
+    elif model_state in {"changed", "corrupt"} or (
+        kind == "explicit" and model_state == "incomplete"
+    ):
+        state = "corrupt"
     else:
-        state = {
-            "ready": "managed-ready",
-            "missing": "managed-missing",
-            "incomplete": "managed-incomplete",
-            "changed": "corrupt",
-            "corrupt": "corrupt",
-        }[facts.model_state or "missing"]
+        state = f"{kind}-{model_state}"
     return AsrReadiness(
         state=cast(AsrReadinessState, state),
         model=facts.model_reference,
@@ -176,7 +165,6 @@ AsrFailureCode = Literal[
     "missing_package",
     "missing_model",
     "corrupt_model",
-    "unwritable_cache",
     "unsupported_hardware",
     "inference_failed",
     "confirmation_failed",
@@ -240,7 +228,6 @@ class FasterWhisperAsrAdapter:
         media: MediaAsset,
         *,
         progress: bool = False,
-        interval: tuple[float, float | None] | None = None,
     ) -> AsrOutcome:
         model_id, failure = self._local_model()
         if failure is not None:
@@ -250,7 +237,7 @@ class FasterWhisperAsrAdapter:
         if isinstance(loaded, AsrUnavailable):
             return loaded
         with self._lock:
-            outcome = self._transcribe_loaded(media, progress=progress, interval=interval)
+            outcome = self._transcribe_loaded(media, progress=progress)
             if (
                 isinstance(outcome, AsrUnavailable)
                 and outcome.receipt.failure == "inference_failed"
@@ -259,10 +246,10 @@ class FasterWhisperAsrAdapter:
             ):
                 self._fallback_reason = outcome.reason
                 self._model = None
-                loaded = self._load_device(model_id, device="cpu", compute="auto")
+                loaded = self._load_device(model_id, device="cpu", compute="int8")
                 if isinstance(loaded, AsrUnavailable):
                     return loaded
-                return self._transcribe_loaded(media, progress=progress, interval=interval)
+                return self._transcribe_loaded(media, progress=progress)
             return outcome
 
     def _transcribe_loaded(
@@ -270,12 +257,11 @@ class FasterWhisperAsrAdapter:
         media: MediaAsset,
         *,
         progress: bool,
-        interval: tuple[float, float | None] | None,
     ) -> AsrOutcome:
-        first = self._pass(media, vad=True, progress=progress, interval=interval)
+        first = self._pass(media, vad=True, progress=progress)
         if isinstance(first, AsrUnavailable) or first.segments:
             return self._finish(media, first, confirmation=False)
-        second = self._pass(media, vad=False, progress=progress, interval=interval)
+        second = self._pass(media, vad=False, progress=progress)
         if isinstance(second, AsrUnavailable):
             return second.model_copy(
                 update={
@@ -321,15 +307,17 @@ class FasterWhisperAsrAdapter:
             return self._unavailable("missing_package", "install vctx[asr]")
         except InvalidVendorResponse as exc:
             return self._unavailable("invalid_response", str(exc))
-        loaded = self._load_device(
-            model_id, device=self.instance.device, compute=self.instance.compute
-        )
+        device, compute = self.instance.device, self.instance.compute
+        if device == "auto":
+            device = "cuda" if bundled_cuda_state() == "bundled" else "cpu"
+            compute = "float16" if device == "cuda" else "int8"
+        loaded = self._load_device(model_id, device=device, compute=compute)
         if not isinstance(loaded, AsrUnavailable):
             return loaded
         if self.instance.device != "auto":
             return loaded
         self._fallback_reason = loaded.reason
-        return self._load_device(model_id, device="cpu", compute="auto")
+        return self._load_device(model_id, device="cpu", compute="int8")
 
     def _load_device(
         self, model_id: str, *, device: str, compute: str
@@ -360,7 +348,6 @@ class FasterWhisperAsrAdapter:
         *,
         vad: bool,
         progress: bool,
-        interval: tuple[float, float | None] | None,
     ) -> WhisperPass | AsrUnavailable:
         assert self._model is not None
         vad_parameters = (
@@ -372,21 +359,19 @@ class FasterWhisperAsrAdapter:
             if vad
             else None
         )
-        use_pipeline = isinstance(self.instance.batch_size, int) or self._device != "cpu"
+        use_pipeline = isinstance(self.instance.batch_size, int) or self.instance.device == "cuda"
         if self._api is not None and self._api.pipeline is not None and use_pipeline:
             return self._batched_pass(
                 media,
                 vad=vad,
                 vad_parameters=vad_parameters,
                 progress=progress,
-                interval=interval,
             )
         try:
             options = _transcribe_options(
                 vad=vad,
                 vad_parameters=vad_parameters,
                 progress=progress,
-                interval=interval,
             )
             raw = self._model.transcribe(str(media.local_path), **options)
             return admit_pass(raw)
@@ -406,7 +391,6 @@ class FasterWhisperAsrAdapter:
         vad: bool,
         vad_parameters: dict[str, float | int] | None,
         progress: bool,
-        interval: tuple[float, float | None] | None,
     ) -> WhisperPass | AsrUnavailable:
         assert self._api is not None and self._model is not None
         if self._api.pipeline is None:
@@ -428,7 +412,6 @@ class FasterWhisperAsrAdapter:
                     vad=vad,
                     vad_parameters=vad_parameters,
                     progress=progress,
-                    interval=interval,
                     batch_size=batch_size,
                 )
                 raw = pipeline.transcribe(str(media.local_path), **options)
@@ -554,13 +537,16 @@ class AsrRuntimePool:
         cache_root: Path,
         progress: bool = False,
         interval: tuple[float, float | None] | None = None,
+        temp_root: Path | None = None,
     ) -> AsrOutcome:
         if plan.selected != "local" or instance.type != "local-faster-whisper":
             raise ValueError(f"ASR plan is not executable: {plan.selected}")
         adapter = self.faster_whisper(
             instance=instance, model_id=plan.model_id, cache_root=cache_root
         )
-        return adapter.transcribe(media, progress=progress, interval=interval)
+        with open_asr_input(media, interval, temp_root or cache_root / "tmp" / "asr") as item:
+            outcome = adapter.transcribe(item.media, progress=progress)
+            return _restore_timeline(outcome, item)
 
     def close(self) -> None:
         for adapter in self.local.values():
@@ -570,9 +556,31 @@ class AsrRuntimePool:
         self.local.clear()
 
 
-def _clip_timestamps(interval: tuple[float, float | None]) -> str:
-    start, end = interval
-    return str(start) if end is None else f"{start},{end}"
+def _restore_timeline(outcome: AsrOutcome, item: AsrInput) -> AsrOutcome:
+    receipt = outcome.receipt.model_copy()
+    processed = item.end - item.origin if item.temporary is not None else receipt.source_duration
+    receipt.source_duration = item.source_duration
+    receipt.interval_start = item.origin if item.temporary is not None else None
+    receipt.interval_end = item.end if item.temporary is not None else None
+    receipt.processed_duration = processed
+    if not isinstance(outcome, AsrReady) or item.temporary is None:
+        return outcome.model_copy(update={"receipt": receipt})
+    segments = []
+    previous_end = item.origin
+    for segment in outcome.transcript.segments:
+        start = item.origin + segment.start
+        end = item.origin + (segment.end if segment.end is not None else segment.start)
+        if start < previous_end or start >= item.end or end > item.end + 0.25:
+            return AsrUnavailable(
+                reason="bounded ASR emitted out-of-range or overlapping timestamps",
+                receipt=receipt.model_copy(update={"failure": "invalid_timestamps"}),
+            )
+        shifted = segment.model_copy(update={"start": start, "end": min(end, item.end)})
+        segments.append(shifted)
+        previous_end = shifted.end or shifted.start
+    transcript = outcome.transcript.model_copy(update={"segments": segments})
+    transcript.provenance.asr = receipt.provenance()
+    return outcome.model_copy(update={"receipt": receipt, "transcript": transcript})
 
 
 def _transcribe_options(
@@ -580,7 +588,6 @@ def _transcribe_options(
     vad: bool,
     vad_parameters: dict[str, float | int] | None,
     progress: bool,
-    interval: tuple[float, float | None] | None,
     batch_size: int | None = None,
 ) -> dict[str, object]:
     options: dict[str, object] = {
@@ -593,10 +600,4 @@ def _transcribe_options(
     }
     if batch_size is not None:
         options["batch_size"] = batch_size
-    if interval is not None:
-        options.update(
-            clip_timestamps=_clip_timestamps(interval),
-            vad_filter=False,
-            vad_parameters=None,
-        )
     return options

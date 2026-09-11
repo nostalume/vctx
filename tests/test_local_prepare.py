@@ -60,7 +60,7 @@ This is a second caption.
     lane = out_dir / source_entry["path"]
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["segments"][0]["text"] == "Hello world."
-    assert (lane / "subtitle.und.srt").read_bytes() == source.read_bytes()
+    assert (lane / "assets" / "subtitle.und.srt").read_bytes() == source.read_bytes()
     outcomes = {item["product"]: item for item in source_entry["outcomes"]}
     assert outcomes["transcript"]["artifacts"] == ["transcript.json", "chunks.json"]
     assert outcomes.keys().isdisjoint({"evidence", "summary"})
@@ -103,10 +103,10 @@ def test_prepare_multiple_inputs_writes_independent_source_lanes(tmp_path: Path)
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "3"
+    assert manifest["schema_version"] == "4"
+    assert {path.name for path in out.iterdir()} == {"manifest.json", "sources"}
     assert len(manifest["sources"]) == 2
-    expected = {"manifest.json", *(source["key"] for source in manifest["sources"])}
-    assert {path.name for path in out.iterdir()} == expected
+    assert {path.name for path in out.iterdir()} == {"manifest.json", "sources"}
     for source in manifest["sources"]:
         lane = out / source["path"]
         assert lane.is_dir()
@@ -127,7 +127,11 @@ def test_prepare_adds_to_valid_pack_without_rewriting_existing_lane(tmp_path: Pa
     assert runner.invoke(app, ["prepare", str(first), "--out", str(out)]).exit_code == 0
     before_manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     first_lane = out / before_manifest["sources"][0]["path"]
-    before = {path.name: path.read_bytes() for path in first_lane.iterdir()}
+    before = {
+        path.relative_to(first_lane): path.read_bytes()
+        for path in first_lane.rglob("*")
+        if path.is_file()
+    }
     identity = (first_lane / "context.md").stat().st_ino
 
     result = runner.invoke(app, ["prepare", str(second), "--out", str(out)])
@@ -136,7 +140,11 @@ def test_prepare_adds_to_valid_pack_without_rewriting_existing_lane(tmp_path: Pa
     after_manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert after_manifest["pack_id"] == before_manifest["pack_id"]
     assert len(after_manifest["sources"]) == 2
-    assert {path.name: path.read_bytes() for path in first_lane.iterdir()} == before
+    assert {
+        path.relative_to(first_lane): path.read_bytes()
+        for path in first_lane.rglob("*")
+        if path.is_file()
+    } == before
     assert (first_lane / "context.md").stat().st_ino == identity
 
 
@@ -235,7 +243,7 @@ def test_prepare_refuses_corrupt_pack_even_with_overwrite(tmp_path: Path) -> Non
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--overwrite"])
 
     assert result.exit_code == 5
-    assert "not a verified vctx schema-3 pack" in result.output
+    assert "not a verified vctx schema-3/4 pack" in result.output
     assert context.read_text(encoding="utf-8") == "corrupt"
 
 
@@ -256,6 +264,7 @@ def test_prepare_recovers_old_pack_after_interrupted_backup_rename(tmp_path: Pat
     publisher.marker.write_text(json.dumps(marker), encoding="utf-8")
     out.replace(publisher.backup)
     publisher.stage.mkdir()
+    (publisher.stage / "sources").mkdir()
     (publisher.backup / old.sources[0].path).replace(publisher.stage / old.sources[0].path)
     sentinel = tmp_path / "unrelated.txt"
     sentinel.write_text("keep", encoding="utf-8")

@@ -5,8 +5,10 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from vctx.artifact.bundle import retain_source_files
 from vctx.artifact.manifest import Manifest, source_key
 from vctx.cli import app
+from vctx.source.session import MediaAsset, SourceRef
 
 runner = CliRunner()
 
@@ -31,9 +33,9 @@ def test_prepare_retains_relocatable_local_media_once(monkeypatch, tmp_path: Pat
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     entry = manifest["sources"][0]
-    retained = next(item for item in entry["artifacts"] if item["kind"] == "media")
+    retained = next(item for item in entry["artifacts"] if item["kind"] == "source_media")
     assert (
-        retained["path"] == "media.mp4"
+        retained["path"] == "assets/media.mp4"
         and [item["path"] for item in entry["artifacts"]].count(retained["path"]) == 1
     )
     assert str(source) not in json.dumps(manifest)
@@ -53,9 +55,10 @@ def test_prepare_can_explicitly_omit_local_media(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     entry = manifest["sources"][0]
-    outcome = next(item for item in entry["outcomes"] if item["product"] == "retained-media")
+    outcome = next(item for item in entry["outcomes"] if item["product"] == "source-assets")
     assert outcome["status"] == "unavailable"
-    assert not any(item["kind"] == "media" for item in entry["artifacts"])
+    assert "deprecated" in outcome["omissions"][0]
+    assert not any(item["kind"].startswith("source_") for item in entry["artifacts"])
 
 
 def test_retention_integrity_failure_publishes_no_mixed_lane(monkeypatch, tmp_path: Path) -> None:
@@ -74,7 +77,37 @@ def test_retention_integrity_failure_publishes_no_mixed_lane(monkeypatch, tmp_pa
     assert result.exit_code == 5
     manifest = Manifest.model_validate_json((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest.status == "error"
-    assert not any(item.kind == "media" for item in manifest.sources[0].artifacts)
+    assert not any(item.kind.startswith("source_") for item in manifest.sources[0].artifacts)
+
+
+def test_retention_keeps_distinct_roles_and_deduplicates_combined_media(tmp_path: Path) -> None:
+    source = SourceRef(kind="file", value="fixture")
+    audio, video = tmp_path / "audio.m4s", tmp_path / "video.m4s"
+    audio.write_bytes(b"audio")
+    video.write_bytes(b"video")
+    assets = [
+        MediaAsset(
+            id="audio",
+            source=source,
+            local_path=audio,
+            container="m4s",
+            capabilities={"audio"},
+        ),
+        MediaAsset(
+            id="video",
+            source=source,
+            local_path=video,
+            container="m4s",
+            capabilities={"video"},
+        ),
+    ]
+
+    retained, _ = retain_source_files([*assets, assets[0]], None, tmp_path / "lane", retain=True)
+
+    assert {(item.kind, item.path) for item in retained} == {
+        ("source_audio", "assets/audio.m4s"),
+        ("source_video", "assets/video.m4s"),
+    }
 
 
 def test_source_key_is_portable_and_disambiguates_truncation_collision() -> None:

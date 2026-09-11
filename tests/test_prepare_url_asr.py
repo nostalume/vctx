@@ -89,7 +89,7 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
             del kwargs
 
         def transcribe(self, media_asset: MediaAsset, **options: object) -> object:
-            assert options == {"progress": False, "interval": None}
+            assert options == {"progress": False}
             assert media_asset.local_path.read_bytes() == b"fake downloaded audio"
             assert media_asset.local_path.parent == tmp_path / "cache" / "source" / "blobs"
             return asr_ready(media_asset.id, "URL ASR text.", model="tiny")
@@ -129,13 +129,13 @@ model = "tiny"
     lane = out_dir / cast(str, source_entry["path"])
     assert manifest["status"] == "ok"
     artifacts = cast(list[JsonObject], source_entry["artifacts"])
-    retained = [item for item in artifacts if item["kind"] == "media"]
+    retained = [item for item in artifacts if item["kind"] == "source_audio"]
     if retain_media:
         assert len(retained) == 1
         assert (lane / cast(str, retained[0]["path"])).is_file()
     else:
         assert retained == []
-        assert not any(path.name.startswith("media.") for path in lane.iterdir())
+        assert not (lane / "assets").exists()
     effects = cast(list[JsonObject], source_entry["effects"])
     route = next(item for item in effects if item["operation"] == "asr")
     assert (route["route"], route["provider"], route["model"]) == (

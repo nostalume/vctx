@@ -64,7 +64,7 @@ model = "planner"
 
     def fake_transcribe(self: object, asset: MediaAsset, **options: object) -> object:
         del self
-        assert options == {"progress": False, "interval": None}
+        assert options == {"progress": False}
         return asr_ready_segments(asset.id, [(0, 4, "原生文本")])
 
     def fake_plan(*_args: object) -> EvidencePlan:

@@ -42,7 +42,6 @@ def _run(
     *,
     instance: AsrInstanceConfig | None = None,
     pipeline: object | None = None,
-    interval: tuple[float, float | None] | None = None,
 ) -> AsrOutcome:
     exports: dict[str, object] = {"WhisperModel": model_type}
     if pipeline is not None:
@@ -52,7 +51,7 @@ def _run(
     selected = instance or AsrInstanceConfig(type="local-faster-whisper", model=str(model))
     return FasterWhisperAsrAdapter(
         instance=selected, model_id=str(model), cache_root=tmp_path / "cache"
-    ).transcribe(_media(tmp_path / "audio.wav"), interval=interval)
+    ).transcribe(_media(tmp_path / "audio.wav"))
 
 
 def _media(path: Path) -> LocalMediaAsset:
@@ -166,7 +165,7 @@ def test_asr_auto_device_falls_back_once_to_cpu(
     def load(_self: object, _model_id: str, options: dict[str, object]) -> None:
         device = str(options["device"])
         devices.append(device)
-        if device == "auto":
+        if device == "cuda":
             raise RuntimeError("GPU unavailable")
 
     outcome = _run(
@@ -176,7 +175,7 @@ def test_asr_auto_device_falls_back_once_to_cpu(
     )
     assert outcome.kind == "no_speech"
     assert outcome.receipt.device == "cpu"
-    assert devices == ["auto", "cpu"]
+    assert devices == ["cuda", "cpu"]
 
 
 def test_asr_auto_device_falls_back_after_lazy_runtime_failure(
@@ -189,7 +188,7 @@ def test_asr_auto_device_falls_back_after_lazy_runtime_failure(
         devices.append(str(options["device"]))
 
     def transcribe(model: Any, _path: str, _options: dict[str, object]) -> tuple[object, object]:
-        if model.device == "auto":
+        if model.device == "cuda":
 
             def failed_segments() -> object:
                 raise RuntimeError("Could not load cublas64_12.dll")
@@ -201,8 +200,8 @@ def test_asr_auto_device_falls_back_after_lazy_runtime_failure(
     outcome = _run(monkeypatch, tmp_path, _vendor(init=load, transcribe=transcribe))
     assert outcome.kind == "no_speech"
     assert outcome.receipt.device == "cpu"
-    assert outcome.receipt.attempted_devices == ["auto", "cpu"]
-    assert devices == ["auto", "cpu"]
+    assert outcome.receipt.attempted_devices == ["cuda", "cpu"]
+    assert devices == ["cuda", "cpu"]
 
 
 def test_asr_explicit_cuda_never_falls_back(
@@ -296,26 +295,6 @@ def test_asr_auto_batch_uses_bounded_direct_cpu_execution(
     assert model_options["cpu_threads"] == 2
     assert "batch_size" not in transcribe_options
     assert (outcome.receipt.cpu_threads, outcome.receipt.batch_size) == (2, None)
-
-
-def test_asr_interval_is_forwarded_and_disables_vad(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    calls: list[dict[str, object]] = []
-
-    def transcribe(_model: object, _path: str, options: dict[str, object]) -> tuple[object, object]:
-        calls.append(options)
-        return [types.SimpleNamespace(start=2.0, end=3.0, text="range")], _info()
-
-    outcome = _run(
-        monkeypatch,
-        tmp_path,
-        _vendor(transcribe=transcribe),
-        interval=(2, 5),
-    )
-    assert outcome.kind == "ready"
-    assert calls[0]["clip_timestamps"] == "2,5"
-    assert calls[0]["vad_filter"] is False
 
 
 def test_asr_runtime_pool_keeps_only_one_model_identity(tmp_path: Path) -> None:

@@ -22,6 +22,12 @@ class RenderFormat(StrEnum):
     TRANSCRIPT = "transcript"
 
 
+class AsrQualityOption(StrEnum):
+    FAST = "fast"
+    BALANCED = "balanced"
+    ACCURATE = "accurate"
+
+
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 models_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 cache_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
@@ -220,9 +226,12 @@ def prepare_command(
     media_quality: Annotated[MediaQuality | None, typer.Option("--media-quality")] = None,
     target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
     asr: Annotated[str | None, typer.Option("--asr", help="ASR selector.")] = None,
+    asr_quality: Annotated[
+        AsrQualityOption | None, typer.Option("--asr-quality", help="Transcript quality intent.")
+    ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision", help="Vision selector.")] = None,
-    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     offline: Annotated[bool | None, typer.Option("--offline", help="Deny network routes.")] = None,
     config: Annotated[Path | None, typer.Option("--config", help="TOML config file.")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", help="INFO logs to stderr.")] = False,
@@ -253,6 +262,7 @@ def prepare_command(
         media_quality=media_quality,
         target=target,
         asr_use=asr,
+        asr_quality=asr_quality.value if asr_quality is not None else None,
         ocr_use=ocr,
         vision_use=vision,
         retain_media=False if no_retain_media else None,
@@ -345,7 +355,7 @@ def render_command(
 
 
 @app.command("verify")
-def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3 context pack.")]) -> None:
+def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3/4 context pack.")]) -> None:
     from vctx.app.pack import verify_context_pack
 
     report = _call(lambda: verify_context_pack(pack))
@@ -359,10 +369,13 @@ def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3 context p
 def doctor_command(
     target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
+    asr_quality: Annotated[
+        AsrQualityOption | None, typer.Option("--asr-quality", help="Transcript quality intent.")
+    ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision")] = None,
     offline: Annotated[bool | None, typer.Option("--offline")] = None,
-    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -375,6 +388,7 @@ def doctor_command(
             cache_dir=cache_dir,
             target=target,
             asr=asr,
+            asr_quality=asr_quality.value if asr_quality is not None else None,
             ocr=ocr,
             vision=vision,
             offline=offline,

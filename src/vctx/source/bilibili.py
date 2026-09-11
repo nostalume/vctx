@@ -4,12 +4,13 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlencode, urlparse
 
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+import srt
+from pydantic import AliasChoices, AliasPath, BaseModel, Field, ValidationError
 
 from vctx.config import YtDlpSourceOptions
 from vctx.errors import NoTranscriptError, OfflineSourceError, ProviderError
@@ -28,7 +29,7 @@ from vctx.source.session import (
     VideoMetadata,
 )
 from vctx.source.transfer import LocatorExpired, RangeTransfer
-from vctx.transcript import TranscriptPayload
+from vctx.transcript import TranscriptPayload, TranscriptProvenance
 
 _BV = re.compile(r"BV[0-9A-Za-z]{10}\Z")
 _HEIGHT_CAP: dict[MediaProfile, int] = {
@@ -84,6 +85,32 @@ class _PlayEnvelope(BaseModel):
     data: _PlayData | None = None
 
 
+class _SubtitleTrack(BaseModel):
+    id: int
+    lan: str = Field(min_length=1, max_length=32)
+    subtitle_url: str = Field(min_length=1, max_length=2048)
+    ai_type: int = 0
+
+
+class _PlayerEnvelope(BaseModel):
+    code: int
+    subtitles: list[_SubtitleTrack] = Field(
+        default_factory=list,
+        max_length=128,
+        validation_alias=AliasPath("data", "subtitle", "subtitles"),
+    )
+
+
+class _SubtitleCue(BaseModel):
+    start: float = Field(validation_alias="from", ge=0)
+    end: float = Field(validation_alias="to", ge=0)
+    content: str = Field(min_length=1, max_length=10_000)
+
+
+class _SubtitleBody(BaseModel):
+    body: list[_SubtitleCue] = Field(max_length=100_000)
+
+
 @dataclass
 class BilibiliSession:
     bvid: str
@@ -91,12 +118,48 @@ class BilibiliSession:
     source_url: str
     record: SourceRecord
     net: NetRuntime
+    subtitles: list[_SubtitleTrack] = field(default_factory=list)
     name: str = "bilibili"
     receipts: list[EffectReceipt] = field(default_factory=list)
 
     def transcript(self, *, permit: SubtitlePermit) -> TranscriptPayload:
-        del permit
-        raise NoTranscriptError("Bilibili source has no admitted subtitle track")
+        if not self.subtitles:
+            raise NoTranscriptError("Bilibili source has no admitted anonymous subtitle track")
+        if permit.network == "denied":
+            raise OfflineSourceError("offline Bilibili subtitle cache miss")
+        track = min(self.subtitles, key=lambda item: (bool(item.ai_type), item.id))
+        method = "automatic_subtitles" if track.ai_type else "official_subtitles"
+        url = _subtitle_url(track.subtitle_url)
+        response = self.net.request(
+            _api_request(url).model_copy(
+                update={"purpose": "subtitle_fetch", "max_response_bytes": 8 * 1024 * 1024}
+            )
+        )
+        try:
+            body = _SubtitleBody.model_validate_json(response.body)
+        except ValidationError as exc:
+            raise ProviderError("Bilibili subtitle returned an invalid response") from exc
+        if response.status_code != 200 or not body.body:
+            raise ProviderError("Bilibili subtitle is unavailable")
+        text = srt.compose(
+            srt.Subtitle(
+                index=index,
+                start=timedelta(seconds=cue.start),
+                end=timedelta(seconds=cue.end),
+                content=cue.content,
+            )
+            for index, cue in enumerate(body.body, 1)
+        )
+        return TranscriptPayload(
+            text=text,
+            format="srt",
+            provenance=TranscriptProvenance(
+                method=method,
+                language=track.lan,
+                format="srt",
+                provider="bilibili",
+            ),
+        )
 
     def media(self, *, request: MediaRequest, permit: MediaPermit) -> MediaAsset:
         if permit.network == "denied":
@@ -192,7 +255,8 @@ class BilibiliSourceAdapter:
         if bvid is None:
             raise ProviderError("unsupported Bilibili URL")
         data = self._view(bvid)
-        source_url = urlunparse(("https", "www.bilibili.com", f"/video/{bvid}", "", "", ""))
+        subtitles = self._subtitles(bvid, data.cid)
+        source_url = f"https://www.bilibili.com/video/{bvid}"
         source = SourceRef(kind="url", value=source_url)
         metadata = VideoMetadata(
             id=f"bilibili__{bvid}",
@@ -203,17 +267,17 @@ class BilibiliSourceAdapter:
             extractor="bilibili",
             raw_provider="bilibili",
         )
+        tracks = [(track.id, track.lan, track.ai_type) for track in subtitles]
+        revision = [data.bvid, data.cid, data.title, data.duration, tracks]
         revision_value = hashlib.sha256(
-            json.dumps(
-                [data.bvid, data.cid, data.title, data.duration], separators=(",", ":")
-            ).encode()
+            json.dumps(revision, separators=(",", ":")).encode()
         ).hexdigest()
         record = SourceRecord(
             source_id=metadata.id,
             revision=Revision(kind="observed", value=revision_value),
             observed_at=datetime.now(UTC),
             metadata=metadata,
-            has_subtitles=False,
+            has_subtitles=bool(subtitles),
             has_media=True,
         )
         return BilibiliSession(
@@ -222,6 +286,7 @@ class BilibiliSourceAdapter:
             source_url=source_url,
             record=record,
             net=self.net,
+            subtitles=subtitles,
             receipts=[EffectReceipt(operation="observe", status="succeeded", attempts=1)],
         )
 
@@ -235,6 +300,17 @@ class BilibiliSourceAdapter:
         if response.status_code != 200 or envelope.code != 0 or envelope.data is None:
             raise ProviderError("Bilibili metadata unavailable")
         return envelope.data
+
+    def _subtitles(self, bvid: str, cid: int) -> list[_SubtitleTrack]:
+        url = "https://api.bilibili.com/x/player/v2?" + urlencode({"bvid": bvid, "cid": cid})
+        response = self.net.request(_api_request(url))
+        try:
+            envelope = _PlayerEnvelope.model_validate_json(response.body)
+        except ValidationError as exc:
+            raise ProviderError("Bilibili subtitle index returned an invalid response") from exc
+        if response.status_code != 200 or envelope.code != 0:
+            raise ProviderError("Bilibili subtitle index unavailable")
+        return envelope.subtitles
 
 
 def bilibili_bvid(value: str) -> str | None:
@@ -287,3 +363,15 @@ def _extension(stream: _DashStream) -> str:
     if stream.mime_type == "video/mp4" or stream.mime_type == "audio/mp4":
         return "m4s"
     return Path(urlparse(stream.base_url).path).suffix.lstrip(".") or "m4s"
+
+
+def _subtitle_url(value: str) -> str:
+    url = f"https:{value}" if value.startswith("//") else value
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or not parsed.hostname.endswith(".hdslb.com")
+    ):
+        raise ProviderError("Bilibili subtitle locator is outside the admitted provider host")
+    return url

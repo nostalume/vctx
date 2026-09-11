@@ -165,8 +165,7 @@ class ManifestSource(ClosedModel):
 
     @model_validator(mode="after")
     def source_index_is_consistent(self) -> ManifestSource:
-        if self.path != self.key or PurePosixPath(self.path).parts != (self.key,):
-            raise ValueError("source path must equal its direct-child key")
+        _portable_path(self.path)
         paths = [artifact.path.casefold() for artifact in self.artifacts]
         if len(paths) != len(set(paths)):
             raise ValueError("artifact paths must be unique within a source lane")
@@ -181,7 +180,7 @@ class ManifestSource(ClosedModel):
 
 
 class Manifest(ClosedModel):
-    schema_version: Literal["3"] = "3"
+    schema_version: Literal["3", "4"] = "4"
     tool: Literal["vctx"] = "vctx"
     tool_version: str = Field(min_length=1, max_length=64)
     pack_id: UUID
@@ -193,6 +192,10 @@ class Manifest(ClosedModel):
 
     @model_validator(mode="after")
     def sources_are_unique(self) -> Manifest:
+        for source in self.sources:
+            expected = source.key if self.schema_version == "3" else f"sources/{source.key}"
+            if source.path != expected:
+                raise ValueError(f"schema-{self.schema_version} source path must equal {expected}")
         for field in ("id", "key", "path"):
             values = [str(getattr(source, field)).casefold() for source in self.sources]
             if len(values) != len(set(values)):
@@ -255,7 +258,7 @@ class ManifestBuilder:
         return ManifestSource(
             id=self.source.source_id,
             key=self.key,
-            path=self.key,
+            path=f"sources/{self.key}",
             kind=metadata.source.kind,
             revision=self.source.revision,
             freshness=self.freshness,
@@ -304,6 +307,7 @@ def build_manifest(
         status = "partial"
     else:
         status = "ok"
+    normalized = [source.model_copy(update={"path": f"sources/{source.key}"}) for source in sources]
     return Manifest(
         tool_version=tool_version,
         pack_id=previous.pack_id if previous else uuid4(),
@@ -311,7 +315,7 @@ def build_manifest(
         status=status,
         created_at=previous.created_at if previous else now,
         updated_at=now,
-        sources=sources,
+        sources=normalized,
     )
 
 

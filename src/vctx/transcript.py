@@ -81,6 +81,9 @@ class AsrProvenance(BaseModel):
     vad: bool
     confirmation: bool = False
     source_duration: float | None = None
+    interval_start: float | None = None
+    interval_end: float | None = None
+    processed_duration: float | None = None
     speech_duration: float | None = None
     language: str | None = None
     language_confidence: float | None = None

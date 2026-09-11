@@ -85,8 +85,6 @@ def test_doctor_admits_explicit_asr_model_path_without_writes(tmp_path: Path, mo
     report = json.loads(result.output)
     assert report["capabilities"]["asr"]["readiness"] == "explicit-ready"
     assert report["capabilities"]["asr"]["runtime"] == {
-        "requested_device": "auto",
-        "compute_type": "auto",
         "package_state": "missing",
         "cuda_libraries": "missing",
     }
@@ -107,7 +105,6 @@ def test_asr_readiness_decision_consumes_only_observed_facts() -> None:
 
     assert readiness.state == "managed-incomplete"
     assert readiness.runtime.package_state == "missing"
-    assert readiness.runtime.requested_device == "cuda"
 
 
 def test_doctor_reduces_inaccessible_keyring_to_presence_state(monkeypatch, tmp_path: Path) -> None:

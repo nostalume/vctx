@@ -53,8 +53,8 @@ class PackPublisher:
             self.marker.unlink(missing_ok=True)
 
     def reset_lane(self, key: str) -> None:
-        lane = self.stage / key
-        if lane.parent != self.stage or _linked(lane):
+        lane = self.stage / "sources" / key
+        if lane.parent != self.stage / "sources" or _linked(lane):
             raise OutputExistsError(f"unsafe source lane: {key}")
         self._discard(lane)
 
@@ -118,16 +118,24 @@ class PackPublisher:
         self.marker.unlink(missing_ok=True)
 
     def _complete_stage(self, manifest: Manifest) -> None:
+        previous_by_key = (
+            {source.key: source for source in self.previous.sources}
+            if self.previous is not None
+            else {}
+        )
         for source in manifest.sources:
             lane = self.stage / source.path
             if lane.exists():
                 continue
-            previous = self.backup / source.path
+            prior = previous_by_key.get(source.key)
+            previous = self.backup / (prior.path if prior is not None else source.path)
             if not previous.is_dir() or _linked(previous):
                 raise OutputExistsError(f"prior source lane is unavailable: {source.key}")
             try:
+                lane.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(previous, lane)
             except OSError:
+                lane.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(previous, lane, copy_function=shutil.copy2)
 
     def _restore_previous(self, container: Path) -> None:
@@ -138,6 +146,8 @@ class PackPublisher:
             for source in previous.sources:
                 destination = self.backup / source.path
                 candidate = container / source.path
+                if not candidate.exists():
+                    candidate = container / "sources" / source.key
                 if not destination.exists() and candidate.is_dir() and not _linked(candidate):
                     os.replace(candidate, destination)
             self._discard(container)
@@ -171,7 +181,6 @@ class PackPublisher:
 
 
 def open_pack(root: Path) -> Manifest:
-    """Open a structurally safe schema-3 pack without reading artifact bytes."""
     manifest_path = root / "manifest.json"
     try:
         if _linked(root) or _linked(manifest_path) or not manifest_path.is_file():
@@ -198,7 +207,6 @@ def open_pack(root: Path) -> Manifest:
 
 
 def verify_required(root: Path, source_key: str, kinds: set[str]) -> dict[str, Any]:
-    """Verify and decode only requested products and their typed dependencies."""
     manifest = open_pack(root)
     source = next((item for item in manifest.sources if item.key == source_key), None)
     if source is None:
@@ -241,12 +249,20 @@ def verify_required(root: Path, source_key: str, kinds: set[str]) -> dict[str, A
 
 
 def verify_pack(root: Path) -> VerificationReport:
-    """Verify every listed byte, every known product, and the complete file tree."""
     try:
         manifest = open_pack(root)
-        expected_root = {"manifest.json", *(source.path for source in manifest.sources)}
+        expected_root = (
+            {"manifest.json", "sources"}
+            if manifest.schema_version == "4"
+            else {"manifest.json", *(source.path for source in manifest.sources)}
+        )
         if {entry.name for entry in root.iterdir()} != expected_root:
             raise ValueError("pack root contains unlisted or missing entries")
+        if manifest.schema_version == "4":
+            indexed = {source.key for source in manifest.sources}
+            actual = {entry.name for entry in (root / "sources").iterdir()}
+            if actual != indexed:
+                raise ValueError("pack sources directory contains unlisted or missing lanes")
         unchecked: set[str] = set()
         for source in manifest.sources:
             _verify_complete_lane(root / source.path, source)
@@ -391,7 +407,7 @@ def _hash_file(path: Path) -> tuple[str, bytes]:
 
 
 def _pack_error(root: Path, exc: Exception) -> OutputExistsError:
-    return OutputExistsError(f"output is not a verified vctx schema-3 pack: {root} ({exc})")
+    return OutputExistsError(f"output is not a verified vctx schema-3/4 pack: {root} ({exc})")
 
 
 def _linked(path: Path) -> bool:

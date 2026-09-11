@@ -47,8 +47,9 @@ vctx verify ./lecture-pack
 vctx render ./lecture-pack --format read --out ./lecture.md
 ```
 
-On Windows with an NVIDIA GPU, install `vctx[asr-cuda]`; vctx loads its environment-local
-CUDA 12/cuDNN 9 libraries automatically without requiring browser cookies or `PATH` edits.
+On Windows with an NVIDIA GPU, `vctx[full]` includes acceleration. For an ASR-only
+install, use `vctx[asr-cuda]`. vctx selects admitted acceleration automatically and
+falls back to CPU before output is emitted; it does not require `PATH` edits.
 
 `prepare` defaults to `--to transcript`. `--to evidence` adds transcript-anchored
 frame planning and observations; `--to summary` adds a citation-constrained
@@ -73,14 +74,7 @@ source_dir = ".cache/vctx/source"
 model_dir = ".cache/vctx/models"
 
 [transforms.asr]
-use = "instance:local"
-
-[instances.asr.local]
-type = "local-faster-whisper"
-model = "small"
-device = "auto"
-compute = "auto"
-cache = "persistent"
+quality = "balanced"
 
 [evidence]
 planner = "auto"
@@ -93,7 +87,6 @@ language = "native"
 
 [output]
 projections = ["context", "read"]
-retain_media = true
 ```
 
 For zero-TOML online planning and summaries, authenticate once with `vctx auth
@@ -120,7 +113,7 @@ layout, and exit status are documented in [docs/api.md](docs/api.md).
 INPUT...
   -> admit and acquire each source
   -> transcript -> evidence -> summary
-  -> canonical schema-3 JSON + selected Markdown projections
+  -> canonical schema-4 JSON + selected Markdown projections
   -> atomic PACK publication
   -> verify PACK
   -> render context | read | transcript
