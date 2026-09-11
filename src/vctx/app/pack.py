@@ -92,8 +92,7 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
                         result = PreparePipeline(run).prepare(
                             completed,
                             previous_by_id,
-                            publisher.reset_lane,
-                            publisher.rollback_lane,
+                            publisher,
                         )
                     except OperationCancelledError:
                         raise
@@ -105,7 +104,7 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
                         if disputed is not None:
                             results.remove(disputed)
                             failures.append(_run_failure(disputed.input_value, exc))
-                        publisher.rollback_lane(exc.key)
+                        publisher.reset_lane(exc.key)
                         failures.append(_run_failure(value, exc))
                         continue
                     except VctxError as exc:

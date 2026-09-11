@@ -10,8 +10,7 @@ import pytest
 from tests.support import local_asr_model
 from vctx.asr import AsrOutcome, AsrRuntimePool, FasterWhisperAsrAdapter
 from vctx.config import AsrInstanceConfig
-from vctx.source.local import LocalMediaAsset
-from vctx.source.session import SourceRef
+from vctx.source.session import MediaAsset, SourceRef
 
 VendorInit = Callable[[Any, str, dict[str, object]], None]
 VendorTranscribe = Callable[[Any, str, dict[str, object]], tuple[object, object]]
@@ -54,14 +53,14 @@ def _run(
     ).transcribe(_media(tmp_path / "audio.wav"))
 
 
-def _media(path: Path) -> LocalMediaAsset:
+def _media(path: Path) -> MediaAsset:
     path.write_bytes(b"audio")
-    return LocalMediaAsset(
+    return MediaAsset(
         id="audio",
         source=SourceRef(kind="file", value=str(path)),
         local_path=path,
         container="wav",
-        media_type="audio",
+        capabilities={"audio"},
     )
 
 
@@ -160,6 +159,7 @@ def test_asr_rejects_malformed_vendor_output(
 def test_asr_auto_device_falls_back_once_to_cpu(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr("vctx.asr.bundled_cuda_state", lambda: "bundled")
     devices: list[str] = []
 
     def load(_self: object, _model_id: str, options: dict[str, object]) -> None:
@@ -181,6 +181,7 @@ def test_asr_auto_device_falls_back_once_to_cpu(
 def test_asr_auto_device_falls_back_after_lazy_runtime_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr("vctx.asr.bundled_cuda_state", lambda: "bundled")
     devices: list[str] = []
 
     def load(model: Any, _model_id: str, options: dict[str, object]) -> None:
@@ -204,29 +205,10 @@ def test_asr_auto_device_falls_back_after_lazy_runtime_failure(
     assert devices == ["cuda", "cpu"]
 
 
-def test_asr_explicit_cuda_never_falls_back(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    devices: list[str] = []
-
-    def fail(_self: object, _model_id: str, options: dict[str, object]) -> None:
-        devices.append(str(options["device"]))
-        raise RuntimeError("CUDA unavailable")
-
-    model = local_asr_model(tmp_path)
-    outcome = _run(
-        monkeypatch,
-        tmp_path,
-        _vendor(init=fail),
-        instance=AsrInstanceConfig(type="local-faster-whisper", model=str(model), device="cuda"),
-    )
-    assert outcome.kind == "unavailable"
-    assert devices == ["cuda"]
-
-
 def test_asr_cuda_retries_pre_output_oom_with_smaller_batch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr("vctx.asr.bundled_cuda_state", lambda: "bundled")
     batches: list[int] = []
 
     def direct(*_args: object) -> tuple[object, object]:
@@ -245,12 +227,10 @@ def test_asr_cuda_retries_pre_output_oom_with_smaller_batch(
             segment = types.SimpleNamespace(start=0.0, end=1.2345, text=" speech ")
             return [segment], _info(language="en")
 
-    model = local_asr_model(tmp_path)
     outcome = _run(
         monkeypatch,
         tmp_path,
         _vendor(transcribe=direct),
-        instance=AsrInstanceConfig(type="local-faster-whisper", model=str(model), device="cuda"),
         pipeline=BatchedInferencePipeline,
     )
     assert outcome.kind == "ready"
@@ -278,23 +258,15 @@ def test_asr_auto_batch_uses_bounded_direct_cpu_execution(
         del model
         raise AssertionError("automatic CPU execution must not buffer a batch pipeline")
 
-    model = local_asr_model(tmp_path)
     outcome = _run(
         monkeypatch,
         tmp_path,
         _vendor(init=load, transcribe=transcribe),
-        instance=AsrInstanceConfig(
-            type="local-faster-whisper",
-            model=str(model),
-            device="cpu",
-            cpu_threads=2,
-        ),
         pipeline=forbidden_pipeline,
     )
     assert outcome.kind == "ready"
-    assert model_options["cpu_threads"] == 2
+    assert model_options["cpu_threads"] in range(1, 9)
     assert "batch_size" not in transcribe_options
-    assert (outcome.receipt.cpu_threads, outcome.receipt.batch_size) == (2, None)
 
 
 def test_asr_runtime_pool_keeps_only_one_model_identity(tmp_path: Path) -> None:

@@ -44,7 +44,6 @@ def test_visual_media_auto_falls_back_without_audio_merge_and_explicit_quality_r
         revision=Revision(kind="observed", value="revision"),
         observed_at=datetime(2026, 1, 1, tzinfo=UTC),
         metadata=VideoMetadata(id="example__lecture", source=source),
-        has_media=True,
     )
     captured: list[YtDlpParams] = []
 
@@ -118,7 +117,6 @@ def test_media_registry_keeps_audio_and_video_assets_by_capability(tmp_path: Pat
         id="audio",
         source=source,
         local_path=tmp_path / "a.m4s",
-        media_type="audio",
         purpose="asr",
         format_id="a",
         provider="fixture",
@@ -128,7 +126,6 @@ def test_media_registry_keeps_audio_and_video_assets_by_capability(tmp_path: Pat
         id="video",
         source=source,
         local_path=tmp_path / "v.m4s",
-        media_type="video",
         purpose="visual",
         format_id="v",
         provider="fixture",

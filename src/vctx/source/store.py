@@ -272,7 +272,8 @@ class SourceStore:
             with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO source_record(record_id, body, last_used_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(record_id) DO UPDATE SET last_used_at=excluded.last_used_at",
+                    "ON CONFLICT(record_id) DO UPDATE SET "
+                    "body=excluded.body, last_used_at=excluded.last_used_at",
                     (record_id, body.decode(), datetime.now(UTC).isoformat()),
                 )
                 connection.execute(
@@ -507,13 +508,7 @@ def _media_key(request: MediaRequest) -> str:
 
 
 def _admit_media_asset(asset: MediaAsset) -> MediaAsset:
-    capabilities: set[Literal["audio", "video"]] = set()
-    capabilities.update(value for value in asset.capabilities if value in {"audio", "video"})
-    if not capabilities:
-        if asset.media_type == "audio":
-            capabilities = {"audio"}
-        elif asset.media_type == "video":
-            capabilities = {"video"}
+    capabilities = {value for value in asset.capabilities if value in {"audio", "video"}}
     return asset.model_copy(update={"capabilities": capabilities})
 
 

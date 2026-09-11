@@ -29,6 +29,7 @@ class VideoMetadata(BaseModel):
 
 
 type SourceId = str
+type SourceCapability = Literal["audio", "video", "subtitle"]
 
 
 class Revision(BaseModel):
@@ -42,8 +43,7 @@ class SourceRecord(BaseModel):
     observed_at: datetime
     metadata: VideoMetadata
     lifecycle: Literal["finite", "live", "upcoming"] = "finite"
-    has_subtitles: bool = False
-    has_media: bool = False
+    source_capabilities: set[SourceCapability] | None = None
 
 
 class ObservePermit(BaseModel):
@@ -81,7 +81,6 @@ class MediaAsset(BaseModel):
     local_path: Path
     container: str = "unknown"
     duration_seconds: float | None = None
-    media_type: Literal["audio", "video", "unknown"] = "unknown"
     purpose: Literal["input", "asr", "visual"] = "input"
     profile: MediaProfile | None = None
     format_id: str = "unknown"

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from vctx.artifact.manifest import ArtifactRef, Manifest, ManifestSource
+from vctx.artifact.manifest import ArtifactRef, Manifest, ManifestSource, schema_five_source
 from vctx.errors import OutputExistsError
 
 
@@ -53,13 +53,16 @@ class PackPublisher:
             self.marker.unlink(missing_ok=True)
 
     def reset_lane(self, key: str) -> None:
-        lane = self.stage / "sources" / key
-        if lane.parent != self.stage / "sources" or _linked(lane):
+        lane = self.stage / key
+        if lane.parent != self.stage or _linked(lane):
             raise OutputExistsError(f"unsafe source lane: {key}")
         self._discard(lane)
 
-    def rollback_lane(self, key: str) -> None:
-        self.reset_lane(key)
+    def hydrate_lane(self, source: ManifestSource) -> ManifestSource:
+        projected = schema_five_source(source)
+        self.reset_lane(projected.key)
+        self._copy_lane(self.target / source.path, self.stage / projected.path, source, projected)
+        return projected
 
     def commit(self, manifest: Manifest) -> None:
         self._write_marker(state="ready", current=manifest)
@@ -131,12 +134,36 @@ class PackPublisher:
             previous = self.backup / (prior.path if prior is not None else source.path)
             if not previous.is_dir() or _linked(previous):
                 raise OutputExistsError(f"prior source lane is unavailable: {source.key}")
+            projected = prior is not None and (
+                prior.path != source.path
+                or [item.path for item in prior.artifacts]
+                != [item.path for item in source.artifacts]
+            )
+            if projected:
+                self._copy_lane(previous, lane, prior, source)
+                continue
             try:
                 lane.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(previous, lane)
             except OSError:
                 lane.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(previous, lane, copy_function=shutil.copy2)
+
+    @staticmethod
+    def _copy_lane(origin: Path, lane: Path, old: ManifestSource, new: ManifestSource) -> None:
+        if len(old.artifacts) != len(new.artifacts) or _linked(origin):
+            raise OutputExistsError(f"prior source lane is unavailable: {old.key}")
+        try:
+            lane.mkdir(parents=True)
+            for before, after in zip(old.artifacts, new.artifacts, strict=True):
+                source = origin / before.path
+                target = lane / after.path
+                if _linked(source) or not source.is_file():
+                    raise OutputExistsError(f"prior source artifact is unavailable: {before.path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        except OSError as exc:
+            raise OutputExistsError(f"prior source lane cannot be copied: {old.key}") from exc
 
     def _restore_previous(self, container: Path) -> None:
         try:
@@ -407,7 +434,7 @@ def _hash_file(path: Path) -> tuple[str, bytes]:
 
 
 def _pack_error(root: Path, exc: Exception) -> OutputExistsError:
-    return OutputExistsError(f"output is not a verified vctx schema-3/4 pack: {root} ({exc})")
+    return OutputExistsError(f"output is not a verified vctx schema-3/4/5 pack: {root} ({exc})")
 
 
 def _linked(path: Path) -> bool:

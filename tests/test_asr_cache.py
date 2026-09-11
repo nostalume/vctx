@@ -9,8 +9,7 @@ import vctx.model.store as models
 from tests.support import asr_ready
 from vctx.asr.cache import AsrTransformStore
 from vctx.config import AsrInstanceConfig
-from vctx.source.local import LocalMediaAsset
-from vctx.source.session import SourceRef
+from vctx.source.session import MediaAsset, SourceRef
 
 
 def test_complete_asr_result_reuses_exact_identity_and_rejects_corruption(
@@ -28,11 +27,11 @@ def test_complete_asr_result_reuses_exact_identity_and_rejects_corruption(
 
     monkeypatch.setattr(model_download, "download_model", download)
     models.ModelStore(tmp_path / "models").pull(["asr"], asr_model_id="tiny")
-    media = LocalMediaAsset(
+    media = MediaAsset(
         id="media",
         source=SourceRef(kind="file", value="media.wav"),
         local_path=tmp_path / "media.wav",
-        media_type="audio",
+        capabilities={"audio"},
         sha256="a" * 64,
     )
     instance = AsrInstanceConfig(type="local-faster-whisper", model="tiny")

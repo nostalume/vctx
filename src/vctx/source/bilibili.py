@@ -23,6 +23,7 @@ from vctx.source.session import (
     MediaRequest,
     ObservePermit,
     Revision,
+    SourceCapability,
     SourceRecord,
     SourceRef,
     SubtitlePermit,
@@ -195,7 +196,6 @@ class BilibiliSession:
             local_path=path,
             container=extension,
             duration_seconds=self.record.metadata.duration_seconds,
-            media_type="audio" if request.kind == "asr_audio" else "video",
             purpose=purpose,
             profile=profile,
             format_id=str(stream.id),
@@ -272,13 +272,15 @@ class BilibiliSourceAdapter:
         revision_value = hashlib.sha256(
             json.dumps(revision, separators=(",", ":")).encode()
         ).hexdigest()
+        capabilities: set[SourceCapability] = {"audio", "video"}
+        if subtitles:
+            capabilities.add("subtitle")
         record = SourceRecord(
             source_id=metadata.id,
             revision=Revision(kind="observed", value=revision_value),
             observed_at=datetime.now(UTC),
             metadata=metadata,
-            has_subtitles=bool(subtitles),
-            has_media=True,
+            source_capabilities=capabilities,
         )
         return BilibiliSession(
             bvid=bvid,

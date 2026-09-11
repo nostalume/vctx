@@ -35,6 +35,7 @@ from vctx.source.session import (
     MediaRequest,
     ObservePermit,
     Revision,
+    SourceCapability,
     SourceRecord,
     SourceRef,
     SubtitlePermit,
@@ -62,9 +63,6 @@ _VISUAL_HEIGHT_CAPS: dict[MediaProfile, int] = {
     "high": 1080,
 }
 logger = logging.getLogger(__name__)
-
-
-DownloadedMediaAsset = MediaAsset
 
 
 @dataclass(frozen=True)
@@ -383,25 +381,23 @@ def _downloaded_asset(
     duration = _as_optional_float(info.get("duration"))
     source = SourceRef(kind="url", value=source_url)
     if request.kind == "asr_audio":
-        return DownloadedMediaAsset(
+        return MediaAsset(
             id=_media_id(info),
             source=source,
             local_path=path,
             container=container,
             duration_seconds=duration,
-            media_type="audio",
             purpose="asr",
             format_id=format_id,
             provider="yt-dlp",
             capabilities={"audio"},
         )
-    return DownloadedMediaAsset(
+    return MediaAsset(
         id=_media_id(info),
         source=source,
         local_path=path,
         container=container,
         duration_seconds=duration,
-        media_type="video",
         purpose="visual",
         profile=request.profile,
         format_id=format_id,
@@ -462,9 +458,18 @@ def _source_record(locator: str, info: YtDlpInfo) -> SourceRecord:
         observed_at=datetime.now(UTC),
         metadata=metadata,
         lifecycle=lifecycle,
-        has_subtitles=bool(fingerprint["subtitles"]),
-        has_media=bool(fingerprint["formats"]) or metadata.duration_seconds is not None,
+        source_capabilities=_source_capabilities(info),
     )
+
+
+def _source_capabilities(info: Mapping[str, YtDlpValue]) -> set[SourceCapability] | None:
+    capabilities: set[SourceCapability] = {"subtitle"} if _subtitle_facts(info) else set()
+    formats = [_mapping_value(value) for value in _list_value(info.get("formats"))]
+    if any(item and _as_optional_str(item.get("acodec")) != "none" for item in formats):
+        capabilities.add("audio")
+    if any(item and _as_optional_str(item.get("vcodec")) != "none" for item in formats):
+        capabilities.add("video")
+    return capabilities or None
 
 
 def _sanitize_url(value: str, *, extractor: str | None) -> str:

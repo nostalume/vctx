@@ -28,7 +28,7 @@ from vctx.artifact.manifest import (
 )
 from vctx.asr import AsrEnvironment, AsrRuntimePool
 from vctx.config import AsrInstanceConfig, CapabilityPolicy, PrepareRequest, ResolvedConfig
-from vctx.errors import CacheError, NoTranscriptError
+from vctx.errors import CacheError, NoTranscriptError, ProviderError, SourceAssetsError
 from vctx.model.store import ModelLifecycleError, ModelStore
 from vctx.net import HttpxNetRuntime, NetRuntime
 from vctx.source.admission import open_source, select_source
@@ -38,6 +38,7 @@ from vctx.source.session import (
     MediaPermit,
     MediaRegistry,
     ObservePermit,
+    SourceCapability,
     SourceSession,
     SubtitlePermit,
     VideoMetadata,
@@ -145,9 +146,33 @@ class PrepareRun:
         )
         return self.manifest.finish(status, artifacts, self.source.receipts)
 
-    def retain(self, artifacts: list[ArtifactRef]) -> None:
+    def retain(
+        self, artifacts: list[ArtifactRef], required: set[SourceCapability] | None = None
+    ) -> None:
+        complete = self.resolved.output.source_assets == "complete"
+        if complete:
+            try:
+                capabilities = (
+                    self.source.record.source_capabilities if required is None else required
+                )
+                if capabilities is None:
+                    raise ProviderError("source capabilities are unknown")
+                if "subtitle" in capabilities and self.subtitle is None:
+                    self.subtitle = self.source.transcript(permit=self.subtitle_permit)
+                if "audio" in capabilities:
+                    self.ensure_media(
+                        AsrAudioRequest(temp_dir=self.source_cache.path_for("tmp/retention"))
+                    )
+                if "video" in capabilities:
+                    self.ensure_media(self.visual_media_request())
+            except (CacheError, ProviderError) as exc:
+                raise SourceAssetsError(exc) from exc
         media = list(self.media.assets.values())
-        if not media and Path(self.request.inputs[0]).is_file():
+        if (
+            not media
+            and self.resolved.output.source_assets == "consumed"
+            and Path(self.request.inputs[0]).is_file()
+        ):
             with suppress(NoTranscriptError):
                 self.ensure_media(
                     request=AsrAudioRequest(temp_dir=self.source_cache.path_for("tmp/retention"))
@@ -158,26 +183,18 @@ class PrepareRun:
                 media,
                 self.subtitle,
                 self.request.out_dir,
-                retain=self.resolved.output.retain_media,
+                retain=self.resolved.output.source_assets != "omitted",
             )
-        except CacheError:
+        except CacheError as exc:
             self.manifest.add_step("source.asset_retention", "error", "integrity or copy failure")
+            if complete:
+                raise SourceAssetsError(exc) from exc
             raise
         artifacts.extend(retained)
         if retained:
-            self.manifest.add_outcome(
-                ProductOutcome(
-                    product="source-assets",
-                    status="ready",
-                    artifacts=[artifact.path for artifact in retained],
-                )
-            )
             detail = ", ".join(artifact.path for artifact in retained)
             self.manifest.add_step("source.asset_retention", "ok", detail)
         elif omissions:
-            self.manifest.add_outcome(
-                ProductOutcome(product="source-assets", status="unavailable", omissions=omissions)
-            )
             self.manifest.add_step("source.asset_retention", "skipped", omissions[0])
 
 
@@ -205,8 +222,13 @@ def open_prepare_run(
         )
     key = source_key(source.record.source_id, occupied)
     occupied[key.casefold()] = source.record.source_id
-    lane_request = request.model_copy(update={"out_dir": request.out_dir / "sources" / key})
-    manifest = ManifestBuilder.start(source.record, key, offline=resolved.runtime.offline)
+    lane_request = request.model_copy(update={"out_dir": request.out_dir / key})
+    manifest = ManifestBuilder(
+        source.record,
+        key,
+        offline=resolved.runtime.offline,
+        asset_scope=resolved.output.source_assets,
+    )
     logger.info(
         "prepare.config target=%s cache=%s config=%s offline=%s",
         resolved.target,
@@ -214,32 +236,9 @@ def open_prepare_run(
         resolved.config_file.path or "built-in defaults + CLI",
         resolved.runtime.offline,
     )
-    logger.debug("prepare.output projections=%s", ",".join(resolved.output.projections))
     manifest.add_step("source.detect", "ok", source.name)
-    selected_asr = select_asr_instance(resolved)
-    if (
-        selected_asr is not None
-        and {
-            "device",
-            "compute",
-            "cpu_threads",
-            "batch_size",
-        }
-        & selected_asr.model_fields_set
-    ):
-        manifest.add_step(
-            "config.asr_legacy_runtime",
-            "warning",
-            "deprecated expert ASR runtime controls are active",
-        )
-    logger.info("source.detect adapter=%s", source.name)
     metadata = source.record.metadata
     manifest.add_step("metadata.extract", "ok")
-    logger.info(
-        "metadata.extract status=ok id=%s source_kind=%s",
-        metadata.id,
-        metadata.source.kind,
-    )
     return PrepareRun(
         request=lane_request,
         resolved=resolved,
@@ -292,18 +291,17 @@ def _load_asr_environment(resolved: ResolvedConfig) -> AsrEnvironment:
     instance_name = resolved.asr.instance_name()
     instance = select_asr_instance(resolved)
     if instance is None:
-        return AsrEnvironment(offline=resolved.runtime.offline)
+        return AsrEnvironment()
     if instance.type == "local-faster-whisper":
         model_id = instance.model or select_asr_model_id(resolved)
         prepared = instance_name is not None or _builtin_asr_ready(
             resolved.cache.model_dir, model_id
         )
         return AsrEnvironment(
-            offline=resolved.runtime.offline,
             installed=prepared,
             model_id=model_id,
         )
-    return AsrEnvironment(offline=resolved.runtime.offline)
+    return AsrEnvironment()
 
 
 def select_asr_instance(resolved: ResolvedConfig) -> AsrInstanceConfig | None:

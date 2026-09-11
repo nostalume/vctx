@@ -60,7 +60,7 @@ This is a second caption.
     lane = out_dir / source_entry["path"]
     transcript = json.loads((lane / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["segments"][0]["text"] == "Hello world."
-    assert (lane / "assets" / "subtitle.und.srt").read_bytes() == source.read_bytes()
+    assert (lane / "subtitle.und.srt").read_bytes() == source.read_bytes()
     outcomes = {item["product"]: item for item in source_entry["outcomes"]}
     assert outcomes["transcript"]["artifacts"] == ["transcript.json", "chunks.json"]
     assert outcomes.keys().isdisjoint({"evidence", "summary"})
@@ -103,10 +103,12 @@ def test_prepare_multiple_inputs_writes_independent_source_lanes(tmp_path: Path)
 
     assert result.exit_code == 0, result.output
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "4"
-    assert {path.name for path in out.iterdir()} == {"manifest.json", "sources"}
+    assert manifest["schema_version"] == "5"
+    assert {path.name for path in out.iterdir()} == {
+        "manifest.json",
+        *(source["key"] for source in manifest["sources"]),
+    }
     assert len(manifest["sources"]) == 2
-    assert {path.name for path in out.iterdir()} == {"manifest.json", "sources"}
     for source in manifest["sources"]:
         lane = out / source["path"]
         assert lane.is_dir()
@@ -161,7 +163,9 @@ def test_prepare_replaces_changed_source_and_preserves_its_sibling(tmp_path: Pat
     stable_bytes = _tree_bytes(out / stable["path"])
     first.write_text("1\n00:00:00,000 --> 00:00:01,000\nNew.\n", encoding="utf-8")
 
-    result = runner.invoke(app, ["prepare", str(first), "--out", str(out)])
+    refused = runner.invoke(app, ["prepare", str(first), "--out", str(out)])
+    assert refused.exit_code == 3 and _tree_bytes(out / stable["path"]) == stable_bytes
+    result = runner.invoke(app, ["prepare", str(first), "--out", str(out), "--overwrite"])
 
     assert result.exit_code == 0, result.output
     after = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -204,15 +208,13 @@ def test_prepare_reuses_matching_revision_unless_overwrite_is_set(
     assert calls == 2
 
 
-def test_prepare_swap_failure_preserves_verified_pack(
+def test_complete_extension_swap_failure_preserves_verified_pack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    first = tmp_path / "first.srt"
-    second = tmp_path / "second.srt"
-    first.write_text("1\n00:00:00,000 --> 00:00:01,000\nFirst.\n", encoding="utf-8")
-    second.write_text("1\n00:00:00,000 --> 00:00:01,000\nSecond.\n", encoding="utf-8")
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\nStable.\n", encoding="utf-8")
     out = tmp_path / "pack"
-    assert runner.invoke(app, ["prepare", str(first), "--out", str(out)]).exit_code == 0
+    assert runner.invoke(app, ["prepare", str(source), "--out", str(out)]).exit_code == 0
     before = _tree_bytes(out)
     from vctx.artifact import publish
 
@@ -224,7 +226,9 @@ def test_prepare_swap_failure_preserves_verified_pack(
         replace(source, target)
 
     monkeypatch.setattr(publish.os, "replace", fail_stage_swap)
-    result = runner.invoke(app, ["prepare", str(second), "--out", str(out)])
+    result = runner.invoke(
+        app, ["prepare", str(source), "--out", str(out), "--source-assets", "complete"]
+    )
 
     assert result.exit_code == 1
     assert _tree_bytes(out) == before
@@ -243,7 +247,7 @@ def test_prepare_refuses_corrupt_pack_even_with_overwrite(tmp_path: Path) -> Non
     result = runner.invoke(app, ["prepare", str(source), "--out", str(out), "--overwrite"])
 
     assert result.exit_code == 5
-    assert "not a verified vctx schema-3/4 pack" in result.output
+    assert "not a verified vctx schema-3/4/5 pack" in result.output
     assert context.read_text(encoding="utf-8") == "corrupt"
 
 

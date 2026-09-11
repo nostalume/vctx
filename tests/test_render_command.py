@@ -173,7 +173,7 @@ def test_render_rejects_corrupt_required_product_but_ignores_unrelated_asset(
     pack = _pack(tmp_path)
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     lane = pack / manifest["sources"][0]["path"]
-    (lane / "assets" / "subtitle.und.srt").write_text("corrupt retained input", encoding="utf-8")
+    (lane / "subtitle.und.srt").write_text("corrupt retained input", encoding="utf-8")
 
     unrelated = runner.invoke(app, ["render", str(pack), "--format", "transcript"])
     (lane / "transcript.json").write_text("{}", encoding="utf-8")

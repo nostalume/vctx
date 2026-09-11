@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from vctx.app.evidence import EvidenceOutcome, EvidencePipeline
@@ -15,7 +14,9 @@ from vctx.artifact.manifest import (
     ArtifactRef,
     ManifestSource,
     ProductOutcome,
+    retained_capabilities,
 )
+from vctx.artifact.publish import PackPublisher
 from vctx.asr import (
     AsrEnvironment,
     AsrOutcome,
@@ -24,7 +25,14 @@ from vctx.asr import (
 )
 from vctx.asr.cache import AsrTransformStore
 from vctx.config import PrepareTarget, ResolvedConfig
-from vctx.errors import CacheError, NoTranscriptError, ProviderError, SourceConflictError, VctxError
+from vctx.errors import (
+    CacheError,
+    NoTranscriptError,
+    ProviderError,
+    SourceAssetsError,
+    SourceConflictError,
+    VctxError,
+)
 from vctx.source.session import (
     AsrAudioRequest,
     MediaAsset,
@@ -58,14 +66,10 @@ class SourcePrepared:
     error: VctxError | None = None
 
 
-def _satisfies(source: ManifestSource, resolved: ResolvedConfig) -> bool:
+def _products_ready(source: ManifestSource, resolved: ResolvedConfig) -> bool:
     outcomes = {item.product: item.status for item in source.outcomes}
     kinds = {item.kind for item in source.artifacts}
-    return (
-        outcomes.get(resolved.target.value) == "ready"
-        and resolved.output.projections <= kinds
-        and (not resolved.output.retain_media or outcomes.get("source-assets") == "ready")
-    )
+    return outcomes.get(resolved.target.value) == "ready" and resolved.output.projections <= kinds
 
 
 def _product_outcome(
@@ -87,12 +91,16 @@ class PreparePipeline:
     def prepare(
         self,
         completed: dict[str, Revision | None],
-        previous: dict[str, ManifestSource] | None = None,
-        reset_lane: Callable[[str], None] | None = None,
-        rollback_lane: Callable[[str], None] | None = None,
+        previous: dict[str, ManifestSource],
+        publisher: PackPublisher,
     ) -> SourcePrepared | None:
         source_id = self.run.source.record.source_id
         revision = self.run.source.record.revision
+        if (
+            self.run.resolved.output.source_assets == "complete"
+            and self.run.source.record.source_capabilities is None
+        ):
+            raise SourceAssetsError(ProviderError("source capabilities are unknown"))
         if source_id in completed:
             admitted = completed[source_id]
             if admitted is not None and admitted == revision:
@@ -100,16 +108,28 @@ class PreparePipeline:
             completed[source_id] = None
             raise SourceConflictError(source_id, self.run.manifest.key)
         completed[source_id] = revision
-        prior = (previous or {}).get(self.run.source.record.source_id)
+        prior = previous.get(source_id)
+        if prior is not None and prior.revision != revision and not self.run.request.overwrite:
+            raise SourceConflictError(source_id, self.run.manifest.key)
         if (
             prior is not None
-            and prior.revision == self.run.source.record.revision
+            and prior.revision == revision
             and not self.run.request.overwrite
-            and _satisfies(prior, self.run.resolved)
+            and _products_ready(prior, self.run.resolved)
         ):
-            return SourcePrepared(prior, self.run.request.inputs[0])
-        if reset_lane is not None:
-            reset_lane(self.run.manifest.key)
+            ranks = {"omitted": 0, "consumed": 1, "complete": 2}
+            if (
+                ranks[prior.effective_asset_scope()]
+                >= ranks[self.run.resolved.output.source_assets]
+            ):
+                return SourcePrepared(prior, self.run.request.inputs[0])
+            if self.run.resolved.output.source_assets == "complete":
+                try:
+                    return self._complete_assets(prior, publisher)
+                except VctxError:
+                    publisher.reset_lane(self.run.manifest.key)
+                    raise
+        publisher.reset_lane(self.run.manifest.key)
         try:
             transcript = self._transcript()
             if transcript is None:
@@ -125,9 +145,26 @@ class PreparePipeline:
         except (CacheError, ProviderError) as exc:
             return self._error_result(exc)
         except VctxError:
-            if rollback_lane is not None:
-                rollback_lane(self.run.manifest.key)
+            publisher.reset_lane(self.run.manifest.key)
             raise
+
+    def _complete_assets(
+        self,
+        prior: ManifestSource,
+        publisher: PackPublisher,
+    ) -> SourcePrepared:
+        capabilities = self.run.source.record.source_capabilities
+        assert capabilities is not None
+        projected = publisher.hydrate_lane(prior)
+        artifacts = list(projected.artifacts)
+        for outcome in projected.outcomes:
+            self.run.manifest.add_outcome(outcome)
+        self.run.retain(artifacts, required=capabilities - retained_capabilities(artifacts))
+        source = self.run.manifest.finish(prior.status, artifacts, self.run.source.receipts)
+        return SourcePrepared(
+            source.model_copy(update={"effects": [*projected.effects, *source.effects]}),
+            self.run.request.inputs[0],
+        )
 
     def _transcript(self) -> TranscriptPayload | Transcript | None:
         with phase(logger, "transcript.extract"):
@@ -140,7 +177,7 @@ class PreparePipeline:
         self.run.subtitle = payload
         asr_plan = plan_asr(
             self.run.resolved.asr,
-            AsrEnvironment(offline=self.run.resolved.runtime.offline),
+            AsrEnvironment(),
             has_transcript=True,
             has_media=False,
         )
@@ -220,44 +257,42 @@ class PreparePipeline:
 
     def _asr_source(self, transcript_error: NoTranscriptError) -> AsrPlan | None:
         environment = self.run.load_asr_environment()
-        pre_media_asr_plan = plan_asr(
+        asr_plan = plan_asr(
             self.run.resolved.asr,
             environment,
             has_transcript=False,
             has_media=True,
         )
-        if pre_media_asr_plan.selected != "local":
-            self.run.manifest.add_effect(pre_media_asr_plan.effect_seed)
-            self.run.manifest.add_step(
-                "source.media", "skipped", "no executable ASR route selected"
-            )
-            self.run.manifest.add_step("transform.asr", "warning", pre_media_asr_plan.reason)
-            self.run.manifest.warn(_capitalize_warning(str(transcript_error)))
-            self.run.manifest.warn(_ASR_MISSING_HINT)
-            return None
-
-        try:
-            request = AsrAudioRequest(
-                temp_dir=self.run.source_cache.root / "tmp" / "yt-dlp",
-                refresh=self.run.request.overwrite,
-            )
-            media = self.run.ensure_media(request)
-        except NoTranscriptError as media_exc:
+        media_error: NoTranscriptError | None = None
+        if asr_plan.selected == "local":
+            try:
+                media = self.run.ensure_media(
+                    AsrAudioRequest(
+                        temp_dir=self.run.source_cache.root / "tmp" / "yt-dlp",
+                        refresh=self.run.request.overwrite,
+                    )
+                )
+            except NoTranscriptError as exc:
+                media_error = exc
+            else:
+                self.run.manifest.add_step("source.media", "ok", _media_detail(media))
+                return asr_plan
             asr_plan = plan_asr(
                 self.run.resolved.asr,
                 environment,
                 has_transcript=False,
                 has_media=False,
             )
-            self.run.manifest.add_step("source.media", "warning", str(media_exc))
-            self.run.manifest.add_effect(asr_plan.effect_seed)
-            self.run.manifest.add_step("transform.asr", "warning", asr_plan.reason)
-            self.run.manifest.warn(_capitalize_warning(str(transcript_error)))
-            self.run.manifest.warn(_ASR_MISSING_HINT)
-            return None
-
-        self.run.manifest.add_step("source.media", "ok", _media_detail(media))
-        return pre_media_asr_plan
+        self.run.manifest.add_step(
+            "source.media",
+            "warning" if media_error else "skipped",
+            str(media_error) if media_error else "no executable ASR route selected",
+        )
+        self.run.manifest.add_effect(asr_plan.effect_seed)
+        self.run.manifest.add_step("transform.asr", "warning", asr_plan.reason)
+        self.run.manifest.warn(_capitalize_warning(str(transcript_error)))
+        self.run.manifest.warn(_ASR_MISSING_HINT)
+        return None
 
     def _prepared(self, payload: TranscriptPayload | Transcript) -> TranscriptProducts:
         raw = (
@@ -266,11 +301,9 @@ class PreparePipeline:
             else parse_transcript_payload(payload, source_id=self.run.metadata.id)
         )
         self.run.manifest.add_step("transcript.parse", "ok", raw.provenance.format)
-        logger.info("transcript.parse status=ok format=%s", raw.provenance.format)
 
         clean = normalize_transcript(raw)
         self.run.manifest.add_step("transcript.normalize", "ok", f"{len(clean.segments)} segments")
-        logger.info("transcript.normalize status=ok segments=%s", len(clean.segments))
 
         chunks = chunk_transcript(
             clean,
@@ -280,7 +313,6 @@ class PreparePipeline:
             ),
         )
         self.run.manifest.add_step("chunk", "ok", f"{len(chunks.chunks)} chunks")
-        logger.info("chunk status=ok chunks=%s", len(chunks.chunks))
         return TranscriptProducts(transcript=clean, chunks=chunks)
 
     def _summary_products(
@@ -361,7 +393,6 @@ class PreparePipeline:
         final_manifest = self.run.manifest.finish(
             status="partial", artifacts=artifact_refs, receipts=self.run.source.receipts
         )
-        logger.info("prepare.finish status=partial artifacts=%s", len(artifact_refs))
         return SourcePrepared(final_manifest, self.run.request.inputs[0])
 
     def _error_result(self, exc: CacheError | ProviderError) -> SourcePrepared:
@@ -386,7 +417,7 @@ def _transcript_detail(payload: TranscriptPayload) -> str:
     provenance = payload.provenance
     if provenance.method == "local_file":
         return f"local transcript: {payload.format}"
-    if provenance.method == "official_subtitles" or provenance.method == "automatic_subtitles":
+    if provenance.method in {"official_subtitles", "automatic_subtitles"}:
         language = provenance.language or provenance.language_evidence.kind
         return f"{provenance.provider or 'source'}:{provenance.method}:{language}:{payload.format}"
     return payload.provenance_label()
@@ -394,7 +425,7 @@ def _transcript_detail(payload: TranscriptPayload) -> str:
 
 def _media_detail(media: MediaAsset) -> str:
     origin = "local" if media.source.kind == "file" else "source"
-    return f"{origin} media: {media.media_type}"
+    return f"{origin} media: {'+'.join(sorted(media.capabilities))}"
 
 
 def _capitalize_warning(message: str) -> str:

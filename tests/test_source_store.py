@@ -51,7 +51,7 @@ class _Session:
             id=self.record.source_id,
             source=self.record.metadata.source,
             local_path=self.media_path,
-            media_type="audio" if purpose == "asr" else "video",
+            capabilities={"audio"} if purpose == "asr" else {"video"},
             purpose=purpose,
             profile=request.profile if isinstance(request, VisualVideoRequest) else None,
         )
@@ -65,7 +65,6 @@ def _session() -> _Session:
             revision=Revision(kind="observed", value="revision"),
             observed_at=datetime(2026, 1, 1, tzinfo=UTC),
             metadata=VideoMetadata(id="example__abc", source=source, title="Lecture"),
-            has_subtitles=True,
         ),
         payload=TranscriptPayload(
             text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n",
@@ -160,9 +159,12 @@ def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(
 
     reobserved = _session()
     reobserved.record.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    reobserved.record.source_capabilities = {"audio", "video"}
     online_again = store.wrap(locator, cast(SourceSession, reobserved))
     reused = online_again.media(request=AsrAudioRequest(), permit=permit)
     assert (reused.local_path, reobserved.media_calls) == (audio.local_path, 0)
+    refreshed = store.get(locator)
+    assert refreshed is not None and refreshed.record.source_capabilities == {"audio", "video"}
 
     with pytest.raises(OfflineSourceError, match="offline media cache miss"):
         cached.media(

@@ -18,7 +18,7 @@ from pydantic import (
 
 from vctx.ai import AiInstanceConfig
 from vctx.errors import ConfigError
-from vctx.options import MediaQuality, PrepareTarget
+from vctx.options import MediaQuality, PrepareTarget, SourceAssets, SourceAssetScope
 
 type Projection = Literal["context", "read"]
 type AsrQuality = Literal["fast", "balanced", "accurate"]
@@ -109,32 +109,28 @@ PlaylistSelection = Annotated[
 ]
 
 
-class YtDlpSourceOptions(BaseModel):
+class ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+
+class YtDlpSourceOptions(ConfigModel):
     session: SourceSession = Field(default_factory=NoSourceSession)
     network: SourceNetwork = Field(default_factory=DirectSourceNetwork)
     playlist: PlaylistSelection = Field(default_factory=DefaultPlaylistSelection)
     subtitle_languages: list[str] = Field(default_factory=list)
 
 
-class RuntimeInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class RuntimeInput(ConfigModel):
     offline: bool = False
     env_files: list[Path] = Field(default_factory=list)
 
 
-class CacheInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CacheInput(ConfigModel):
     source_dir: Path | None = None
     model_dir: Path | None = None
 
 
-class SourceInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SourceInput(ConfigModel):
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
     media_quality: MediaQuality = MediaQuality.AUTO
 
@@ -202,6 +198,7 @@ class PrepareRequest(BaseModel):
     config_path: Path | None = None
     subtitle_languages: list[str] = Field(default_factory=list)
     retain_media: bool | None = None
+    source_assets: SourceAssets | None = None
     media_quality: MediaQuality | None = None
     start_seconds: float | None = Field(default=None, ge=0)
     end_seconds: float | None = Field(default=None, gt=0)
@@ -230,9 +227,7 @@ class SourceConfig(BaseModel):
     media_quality: MediaQuality
 
 
-class CapabilityPolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CapabilityPolicy(ConfigModel):
     enabled: bool
     use: TransformUse = Field(default_factory=AutoUse)
 
@@ -257,9 +252,7 @@ class CapabilityPolicy(BaseModel):
         return isinstance(self.use, AutoUse)
 
 
-class CapabilityInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CapabilityInput(ConfigModel):
     enabled: StrictBool | None = None
     use: TransformUse = Field(default_factory=AutoUse)
 
@@ -276,15 +269,11 @@ CapabilitySelection = Annotated[CapabilityInput, BeforeValidator(_capability_inp
 AsrSelection = Annotated[AsrInput, BeforeValidator(_capability_input)]
 
 
-class TransformInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class TransformInput(ConfigModel):
     asr: AsrSelection = Field(default_factory=AsrInput)
 
 
-class EvidenceInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class EvidenceInput(ConfigModel):
     planner: CapabilitySelection = Field(default_factory=CapabilityInput)
     vision: CapabilitySelection = Field(default_factory=CapabilityInput)
     ocr: CapabilitySelection = Field(default_factory=CapabilityInput)
@@ -300,9 +289,7 @@ class AsrPolicy(CapabilityPolicy):
     quality: AsrQuality = "balanced"
 
 
-class SummaryInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SummaryInput(ConfigModel):
     use: TransformUse = Field(default_factory=AutoUse)
     language: str = "native"
 
@@ -316,40 +303,29 @@ class OutputConfig(BaseModel):
     projections: set[Projection]
     chunk_max_chars: int
     chunk_max_seconds: int | None
-    retain_media: bool = True
+    source_assets: SourceAssetScope = "consumed"
 
 
-class OutputInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class OutputInput(ConfigModel):
     projections: set[Projection] | None = None
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
     retain_media: StrictBool | None = None
+    source_assets: SourceAssets | None = None
 
 
-class AsrInstanceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class AsrInstanceConfig(ConfigModel):
     type: AsrInstanceType
     model: str | None = None
-    device: Literal["auto", "cpu", "cuda"] = "auto"
-    compute: str = "auto"
-    cpu_threads: Literal["auto"] | Annotated[int, Field(ge=1, le=256)] = "auto"
-    batch_size: Literal["auto"] | Annotated[int, Field(ge=1, le=256)] = "auto"
     cache: InstanceCachePolicy = "persistent"
 
 
-class InstanceRegistry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class InstanceRegistry(ConfigModel):
     asr: dict[str, AsrInstanceConfig] = Field(default_factory=dict)
     ai: dict[str, AiInstanceConfig] = Field(default_factory=dict)
 
 
-class ConfigInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ConfigInput(ConfigModel):
     runtime: RuntimeInput = Field(default_factory=RuntimeInput)
     cache: CacheInput = Field(default_factory=CacheInput)
     source: SourceInput = Field(default_factory=SourceInput)
@@ -622,6 +598,12 @@ def _resolve_config(
     instances = _resolve_instance_registry(config.instances, path_context)
     _validate_instance_compatibility(evidence, summary, instances)
 
+    retain_media = _coalesce(request.retain_media, config.output.retain_media, default=True)
+    requested_assets = request.source_assets or config.output.source_assets or SourceAssets.CONSUMED
+    if not retain_media and requested_assets == SourceAssets.COMPLETE:
+        raise ValueError("complete source assets conflict with deprecated retention opt-out")
+    asset_scope: SourceAssetScope = requested_assets.value if retain_media else "omitted"
+
     return ResolvedConfig(
         target=target,
         runtime=RuntimeConfig(
@@ -648,11 +630,7 @@ def _resolve_config(
                 config.output.chunk_max_seconds,
                 default=None,
             ),
-            retain_media=_coalesce(
-                request.retain_media,
-                config.output.retain_media,
-                default=True,
-            ),
+            source_assets=asset_scope,
         ),
         instances=instances,
     )

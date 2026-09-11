@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from tests.support import asr_ready
 from vctx.cli import app
+from vctx.errors import ProviderError
 from vctx.source.session import MediaAsset
 from vctx.source.ytdlp import YtDlpInfo, YtDlpParams
 
@@ -81,6 +82,10 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
         "extractor": "example",
         "subtitles": {},
         "automatic_captions": {},
+        "formats": [
+            {"format_id": "audio", "acodec": "aac", "vcodec": "none"},
+            {"format_id": "video", "acodec": "none", "vcodec": "avc1", "height": 480},
+        ],
     }
     monkeypatch.setattr(ytdlp_module._yt_dlp(), "YoutubeDL", FakeYoutubeDLMedia)
 
@@ -160,3 +165,61 @@ model = "tiny"
     assert FakeYoutubeDLMedia.downloaded_path.parent == (
         tmp_path / "cache" / "source" / "tmp" / "yt-dlp"
     )
+    if retain_media:
+        before = (lane / "transcript.json").read_bytes()
+        prior_tree = {
+            path.relative_to(out_dir): path.read_bytes()
+            for path in out_dir.rglob("*")
+            if path.is_file()
+        }
+        process = FakeYoutubeDLMedia.process_ie_result
+        monkeypatch.setattr(
+            FakeYoutubeDLMedia,
+            "process_ie_result",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ProviderError("video failed")),
+        )
+        failed = runner.invoke(app, [*args, "--source-assets", "complete"])
+        assert failed.exit_code == 7
+        assert {
+            path.relative_to(out_dir): path.read_bytes()
+            for path in out_dir.rglob("*")
+            if path.is_file()
+        } == prior_tree
+        monkeypatch.setattr(FakeYoutubeDLMedia, "process_ie_result", process)
+        FakeYoutubeDLMedia.calls = []
+        upgraded = runner.invoke(app, [*args, "--source-assets", "complete"])
+        assert upgraded.exit_code == 0, upgraded.output
+        complete = cast(
+            JsonObject,
+            cast(
+                list[JsonObject],
+                cast(JsonObject, json.loads((out_dir / "manifest.json").read_text()))["sources"],
+            )[0],
+        )
+        assert complete["asset_scope"] == "complete"
+        assert (lane / "transcript.json").read_bytes() == before
+        assert {item["kind"] for item in cast(list[JsonObject], complete["artifacts"])} >= {
+            "source_audio",
+            "source_video",
+        }
+        downloads = [params for download, params in FakeYoutubeDLMedia.calls if download]
+        assert len(downloads) == 1 and "bestvideo" in cast(str, downloads[0]["format"])
+        FakeYoutubeDLMedia.calls = []
+        lower = runner.invoke(app, args)
+        assert lower.exit_code == 0 and not any(
+            download for download, _params in FakeYoutubeDLMedia.calls
+        )
+        preserved = json.loads((out_dir / "manifest.json").read_text())["sources"][0]
+        assert preserved["asset_scope"] == "complete"
+        FakeYoutubeDLMedia.calls = []
+        offline = runner.invoke(app, [*args, "--source-assets", "complete", "--offline"])
+        assert offline.exit_code == 0 and not FakeYoutubeDLMedia.calls
+        FakeYoutubeDLMedia.info = {
+            key: value for key, value in FakeYoutubeDLMedia.info.items() if key != "formats"
+        }
+        FakeYoutubeDLMedia.calls = []
+        unknown_out = tmp_path / "unknown"
+        unknown_args = [str(unknown_out) if item == str(out_dir) else item for item in args]
+        unknown = runner.invoke(app, [*unknown_args, "--source-assets", "complete"])
+        assert unknown.exit_code == 7 and not unknown_out.exists()
+        assert not any(download for download, _params in FakeYoutubeDLMedia.calls)

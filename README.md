@@ -42,7 +42,7 @@ then render the view needed by a person or agent:
 ```console
 vctx auth openrouter login
 vctx models pull asr ocr
-vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary --max-runtime 1800
+vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary --source-assets complete --max-runtime 1800
 vctx verify ./lecture-pack
 vctx render ./lecture-pack --format read --out ./lecture.md
 ```
@@ -56,6 +56,13 @@ frame planning and observations; `--to summary` adds a citation-constrained
 summary. The stages are monotonic, so a later target retains all safe earlier
 products. Multiple inputs become independent source directories and are never
 combined into one summary.
+
+Source files live beside their products inside the output lane. The default
+`--source-assets consumed` retains only assets needed by the requested work;
+`--source-assets complete` retains every audio, video, or native-subtitle role
+reported for the admitted source revision. A later complete request extends the
+same verified output, fetching only missing roles while preserving transcript
+quality and existing products.
 
 For an agent-oriented view:
 
@@ -113,7 +120,7 @@ layout, and exit status are documented in [docs/api.md](docs/api.md).
 INPUT...
   -> admit and acquire each source
   -> transcript -> evidence -> summary
-  -> canonical schema-4 JSON + selected Markdown projections
+  -> canonical schema-5 JSON + selected Markdown projections
   -> atomic PACK publication
   -> verify PACK
   -> render context | read | transcript

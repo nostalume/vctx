@@ -1,7 +1,7 @@
 # vctx CLI and artifact contract
 
 `vctx` is a one-shot context compiler. Its stable integration surfaces are the
-installed CLI and schema-4 output pack. Python modules are internal.
+installed CLI and schema-5 output pack. Python modules are internal.
 
 ## Workflow
 
@@ -70,6 +70,7 @@ Important options:
 | `--asr`, `--ocr`, `--vision` | Override one capability selector |
 | `--asr-quality fast|balanced|accurate` | Transcript speed/quality intent; balanced is default |
 | `--media-quality auto|fast|balanced|high` | URL visual media policy |
+| `--source-assets consumed|complete` | Retain used roles or every reported source role |
 | `--max-runtime SECONDS` | Hard 1..86400 second wall-clock limit; expiry exits 124 |
 | `--profile-json FILE` | Stream bounded JSONL phase events to a diagnostic file |
 | `--start SECONDS`, `--end SECONDS` | Transcribe only the selected absolute interval |
@@ -89,11 +90,15 @@ vctx prepare URL --out pack --to summary --max-runtime 1800 --config docs/exampl
 vctx prepare part-1.vtt part-2.vtt --out course
 ```
 
-The default retains source media/subtitles when available. Multiple inputs get
-independent lanes and are never combined into one summary. Updating a verified
-pack adds new lanes, reuses satisfied matching revisions, and replaces only
-changed/upgraded lanes. Publication swaps one complete filesystem generation.
-Unknown or corrupt existing output is refused, including with `--overwrite`.
+The default `consumed` scope retains source media/subtitles acquired by product
+work. `complete` acquires every audio, video, or native-subtitle capability
+reported for the admitted finite revision; one combined representation covers
+audio and video. Multiple inputs get independent lanes and are never combined
+into one summary. Updating a verified pack adds new lanes, reuses satisfied
+matching revisions, and fetches only missing roles when raising a lane to
+complete. A changed revision conflicts unless `--overwrite` is explicit.
+Publication swaps one complete filesystem generation. Unknown or corrupt
+existing output is refused, including with `--overwrite`.
 
 When `--max-runtime` expires, vctx terminates the worker process tree and prints
 the stable `deadline_exceeded` category. A prior complete pack is preserved; an
@@ -266,6 +271,7 @@ string is not an enum and is validated by its owning provider or adapter.
 | `output.projections` | set of `context`, `read`; both | Markdown projections published in every source lane. Canonical JSON remains authoritative. |
 | `output.chunk_max_chars` | integer, `6000` | Maximum transcript characters per canonical chunk. |
 | `output.chunk_max_seconds` | integer or omitted | Optional maximum time span per chunk. Omission disables the time limit. |
+| `output.source_assets` | `consumed` or `complete`; `consumed` | Retains only assets acquired by requested products, or acquires every source capability reported for the admitted revision. |
 
 Each evidence policy accepts a terse string, for example `ocr = "none"`, or an
 explicit table exposing its `enabled` and `use` fields:
@@ -302,10 +308,8 @@ use = "path:C:/models/faster-whisper-custom"
 ```
 
 Named instances and explicit model references remain an expert compatibility path.
-Legacy instance runtime-tuning keys remain readable for this release, preserve
-their strict behavior, and emit a deprecation diagnostic; normal configuration
-uses `quality`, while execution device, compute mode, threading, and batching are
-selected internally and recorded in transcript provenance.
+Execution device, compute mode, threading, and batching are selected internally
+and recorded in transcript provenance; they are not configuration surfaces.
 
 #### OpenAI-compatible AI instances
 
@@ -363,12 +367,11 @@ output never share mutable file identity. No silent eviction occurs.
 ```text
 PACK/
   manifest.json
-  sources/<source-key>/
-    assets/
-      audio.<ext>            # acquired audio-only representation
-      video.<ext>            # acquired video-only representation
-      media.<ext>            # one combined audio/video representation
-      subtitle.<lang>.<ext>  # acquired native subtitle
+  <source-key>/
+    audio.<ext>            # acquired audio-only representation
+    video.<ext>            # acquired video-only representation
+    media.<ext>            # one combined audio/video representation
+    subtitle.<lang>.<ext>  # acquired native subtitle
     metadata.json
     transcript.json
     chunks.json
@@ -380,8 +383,8 @@ PACK/
     frames/frame-0001.png    # when captured
 ```
 
-Only `manifest.json` and `sources/` are at the pack root. `manifest.json` is the
-sole source index; each source path is exactly `sources/<stable-key>`.
+Only `manifest.json` and its direct source lanes are at the pack root.
+`manifest.json` is the sole source index; each source path is its stable key.
 Every artifact reference is relative, portable, size/digest indexed, and owned by
 one source. Repeated prepares aggregate independent lanes, not their content.
 
@@ -394,11 +397,13 @@ Closed manifest string values are:
 
 | Field | Values |
 | --- | --- |
-| `schema_version` | `4` for new packs; immutable schema `3` remains readable |
+| `schema_version` | `5` for new packs; immutable schemas `3` and `4` remain readable |
 | `tool` | `vctx` |
 | manifest/source `status` | `ok`, `partial`, `error` |
 | source `kind` | `url`, `file` |
 | source `freshness` | `immutable`, `observed-online`, `unverified-offline` |
+| source `asset_scope` | `omitted`, `consumed`, `complete` |
+| source `source_capabilities` | a bounded set of `audio`, `video`, `subtitle`, or unknown |
 | outcome `status` | `ready`, `partial`, `unavailable` |
 
 Artifact `kind`, product name, requested target, effect operation/status, model,
@@ -425,6 +430,6 @@ uses manifest/run identity rather than directory naming hints.
 
 ## Stability
 
-Stable surfaces are command behavior, config grammar/precedence, schema-3/4 pack
+Stable surfaces are command behavior, config grammar/precedence, schema-3/4/5 pack
 layout, canonical product schemas, relative artifact references, and exit
 categories. Internal Python ownership and human-readable prose may evolve.

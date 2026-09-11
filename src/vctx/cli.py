@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import typer
 
 from vctx.errors import VctxError
-from vctx.options import MediaQuality, PrepareTarget
+from vctx.options import MediaQuality, PrepareTarget, SourceAssets
 
 if TYPE_CHECKING:
     from vctx.app.auth import OpenRouterAuth
@@ -231,6 +231,10 @@ def prepare_command(
     ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision", help="Vision selector.")] = None,
+    source_assets: Annotated[
+        SourceAssets | None,
+        typer.Option("--source-assets", help="Retain consumed or complete source assets."),
+    ] = None,
     no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     offline: Annotated[bool | None, typer.Option("--offline", help="Deny network routes.")] = None,
     config: Annotated[Path | None, typer.Option("--config", help="TOML config file.")] = None,
@@ -265,6 +269,7 @@ def prepare_command(
         asr_quality=asr_quality.value if asr_quality is not None else None,
         ocr_use=ocr,
         vision_use=vision,
+        source_assets=source_assets,
         retain_media=False if no_retain_media else None,
         offline=offline,
         config_path=config,
@@ -355,7 +360,9 @@ def render_command(
 
 
 @app.command("verify")
-def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3/4 context pack.")]) -> None:
+def verify_command(
+    pack: Annotated[Path, typer.Argument(help="Schema-3/4/5 context pack.")],
+) -> None:
     from vctx.app.pack import verify_context_pack
 
     report = _call(lambda: verify_context_pack(pack))
@@ -374,6 +381,7 @@ def doctor_command(
     ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision")] = None,
+    source_assets: Annotated[SourceAssets | None, typer.Option("--source-assets")] = None,
     offline: Annotated[bool | None, typer.Option("--offline")] = None,
     no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
@@ -391,6 +399,7 @@ def doctor_command(
             asr_quality=asr_quality.value if asr_quality is not None else None,
             ocr=ocr,
             vision=vision,
+            source_assets=source_assets,
             offline=offline,
             retain_media=False if no_retain_media else None,
             json_output=json_output,

@@ -30,7 +30,6 @@ def _media(tmp_path: Path) -> MediaAsset:
         source=SourceRef(kind="file", value=str(path)),
         local_path=path,
         duration_seconds=duration,
-        media_type="audio",
         capabilities={"audio"},
     )
 

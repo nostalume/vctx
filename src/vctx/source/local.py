@@ -15,6 +15,7 @@ from vctx.source.session import (
     MediaRequest,
     ObservePermit,
     Revision,
+    SourceCapability,
     SourceRecord,
     SourceRef,
     SubtitlePermit,
@@ -40,9 +41,6 @@ def _file_digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-LocalMediaAsset = MediaAsset
 
 
 @dataclass
@@ -89,22 +87,19 @@ class LocalFileSession:
         if suffix not in SUPPORTED_MEDIA_SUFFIXES:
             self.receipts.append(EffectReceipt(operation="media", status="failed", purpose="input"))
             raise NoTranscriptError("no media found for input")
-        media_type: Literal["audio", "video", "unknown"] = "unknown"
-        if suffix in AUDIO_SUFFIXES:
-            media_type = "audio"
-        elif suffix in VIDEO_SUFFIXES:
-            media_type = "video"
-        asset = LocalMediaAsset(
+        capabilities: set[Literal["audio", "video"]] = (
+            {"audio"} if suffix in AUDIO_SUFFIXES else {"audio", "video"}
+        )
+        asset = MediaAsset(
             id=f"local__{self.path.stem}",
             source=SourceRef(kind="file", value=str(self.path)),
             local_path=self.path,
-            media_type=media_type,
             container=suffix.removeprefix("."),
             purpose="input",
             profile=None,
             format_id="local",
             provider="local-file",
-            capabilities={"audio"} if media_type == "audio" else {"audio", "video"},
+            capabilities=capabilities,
         )
         self.receipts.append(
             EffectReceipt(
@@ -137,6 +132,14 @@ class LocalFileSourceAdapter:
             title=path.stem,
             raw_provider="local-file",
         )
+        suffix = path.suffix.lower()
+        capabilities: set[SourceCapability] = (
+            {"subtitle"}
+            if suffix in SUPPORTED_TRANSCRIPT_SUFFIXES
+            else {"audio"}
+            if suffix in AUDIO_SUFFIXES
+            else {"audio", "video"}
+        )
         return LocalFileSession(
             path=path,
             record=SourceRecord(
@@ -144,8 +147,7 @@ class LocalFileSourceAdapter:
                 revision=Revision(kind="immutable", value=_file_digest(path)),
                 observed_at=datetime.now(UTC),
                 metadata=metadata,
-                has_subtitles=path.suffix.lower() in SUPPORTED_TRANSCRIPT_SUFFIXES,
-                has_media=path.suffix.lower() in SUPPORTED_MEDIA_SUFFIXES,
+                source_capabilities=capabilities,
             ),
             receipts=[EffectReceipt(operation="observe", status="succeeded")],
         )

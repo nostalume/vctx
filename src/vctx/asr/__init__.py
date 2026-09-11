@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from vctx.artifact.manifest import ManifestEffect
 from vctx.asr.faster_whisper import (
@@ -46,9 +46,6 @@ class AsrPlan(BaseModel):
     reason: str
     provider_id: str | None = None
     model_id: str | None = None
-    requirements: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    deterministic: bool = False
 
     @property
     def effect_seed(self) -> ManifestEffect:
@@ -60,13 +57,12 @@ class AsrPlan(BaseModel):
             model=self.model_id,
             uploaded=False,
             cost_may_apply=False,
-            diagnostic="; ".join([self.reason, *self.warnings])[:500],
+            diagnostic=self.reason[:500],
         )
 
 
 class AsrEnvironment(BaseModel):
     installed: bool = False
-    offline: bool = False
     model_id: str | None = None
 
 
@@ -136,16 +132,13 @@ def plan_asr(
     has_media: bool,
 ) -> AsrPlan:
     if has_transcript:
-        return AsrPlan(
-            selected="skipped", reason="transcript already available", deterministic=True
-        )
+        return AsrPlan(selected="skipped", reason="transcript already available")
     if policy.disabled():
         return AsrPlan(selected="skipped", reason="ASR disabled by policy")
     if not has_media:
         return AsrPlan(
             selected="unavailable",
             reason=("No transcript found and no media asset is available for ASR."),
-            requirements=["media asset"],
         )
     if environment.installed:
         return AsrPlan(
@@ -157,7 +150,6 @@ def plan_asr(
     return AsrPlan(
         selected="unavailable",
         reason="No transcript found and the prepared local ASR route is unavailable.",
-        requirements=["install ASR extra", "prepare ASR model", "provide transcript file"],
     )
 
 
@@ -205,15 +197,11 @@ class FasterWhisperAsrAdapter:
         self.cache_root = cache_root
         self._model: WhisperTranscriber | None = None
         self._api: WhisperApi | None = None
-        self._device = instance.device
-        self._compute = instance.compute
+        self._device = "auto"
+        self._compute = "auto"
         self._attempted_devices: list[str] = []
         self._fallback_reason: str | None = None
-        self._cpu_threads = (
-            instance.cpu_threads
-            if isinstance(instance.cpu_threads, int)
-            else max(1, min(8, os.process_cpu_count() or 1))
-        )
+        self._cpu_threads = max(1, min(8, os.process_cpu_count() or 1))
         self._lock = threading.Lock()
 
     def close(self) -> None:
@@ -241,7 +229,6 @@ class FasterWhisperAsrAdapter:
             if (
                 isinstance(outcome, AsrUnavailable)
                 and outcome.receipt.failure == "inference_failed"
-                and self.instance.device == "auto"
                 and self._device != "cpu"
             ):
                 self._fallback_reason = outcome.reason
@@ -300,21 +287,16 @@ class FasterWhisperAsrAdapter:
         if self._model is not None:
             return self._model
         try:
-            if self.instance.device != "cpu":
-                load_bundled_cuda()
+            load_bundled_cuda()
             self._api = import_api()
         except ModuleNotFoundError:
             return self._unavailable("missing_package", "install vctx[asr]")
         except InvalidVendorResponse as exc:
             return self._unavailable("invalid_response", str(exc))
-        device, compute = self.instance.device, self.instance.compute
-        if device == "auto":
-            device = "cuda" if bundled_cuda_state() == "bundled" else "cpu"
-            compute = "float16" if device == "cuda" else "int8"
+        device = "cuda" if bundled_cuda_state() == "bundled" else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
         loaded = self._load_device(model_id, device=device, compute=compute)
         if not isinstance(loaded, AsrUnavailable):
-            return loaded
-        if self.instance.device != "auto":
             return loaded
         self._fallback_reason = loaded.reason
         return self._load_device(model_id, device="cpu", compute="int8")
@@ -359,8 +341,7 @@ class FasterWhisperAsrAdapter:
             if vad
             else None
         )
-        use_pipeline = isinstance(self.instance.batch_size, int) or self.instance.device == "cuda"
-        if self._api is not None and self._api.pipeline is not None and use_pipeline:
+        if self._api is not None and self._api.pipeline is not None and self._device == "cuda":
             return self._batched_pass(
                 media,
                 vad=vad,
@@ -401,12 +382,7 @@ class FasterWhisperAsrAdapter:
             return self._unavailable("invalid_response", str(exc), vad=vad)
         except Exception as exc:
             return self._unavailable("inference_failed", str(exc), vad=vad)
-        batch_sizes = (
-            (self.instance.batch_size,)
-            if isinstance(self.instance.batch_size, int)
-            else (8, 4, 2, 1)
-        )
-        for batch_size in batch_sizes:
+        for batch_size in (8, 4, 2, 1):
             try:
                 options = _transcribe_options(
                     vad=vad,

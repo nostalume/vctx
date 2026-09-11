@@ -19,6 +19,7 @@ from vctx.config import (
     load_resolved_config,
 )
 from vctx.model.store import ModelStore, package_version
+from vctx.options import SourceAssets
 
 
 def doctor_report(
@@ -32,6 +33,7 @@ def doctor_report(
     vision: str | None = None,
     offline: bool | None = None,
     retain_media: bool | None = None,
+    source_assets: SourceAssets | None = None,
     json_output: bool = False,
 ) -> str:
     resolved = load_resolved_config(
@@ -47,6 +49,7 @@ def doctor_report(
             vision_use=vision,
             offline=offline,
             retain_media=retain_media,
+            source_assets=source_assets,
         )
     )
     asr_instance = _asr_instance(resolved)
@@ -69,7 +72,7 @@ def doctor_report(
         "profile": _installed_profile(),
         "target": resolved.target.value,
         "offline": resolved.runtime.offline,
-        "retention": "retain" if resolved.output.retain_media else "omit",
+        "source_assets": resolved.output.source_assets,
         "config": {
             "origin": resolved.config_file.origin,
             "path": str(resolved.config_file.path) if resolved.config_file.path else None,
@@ -107,7 +110,7 @@ def doctor_report(
     lines = [
         *(f"{key}: {report[key]}" for key in ("python", "vctx", "yt-dlp", "profile", "target")),
         f"offline: {str(report['offline']).lower()}",
-        f"retention: {report['retention']}",
+        f"source-assets: {report['source_assets']}",
         _config_line(report["config"]),
         f"cache.source: {report['cache']['source_state']} ({report['cache']['source_dir']})",
         f"cache.models: {report['cache']['model_dir']}",

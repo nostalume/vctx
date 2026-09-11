@@ -119,9 +119,7 @@ def retain_source_files(
             language = _token(subtitle.provenance.language or "und")
             extension = {"plain": "txt", "unknown": "txt"}.get(subtitle.format, subtitle.format)
             body = subtitle.original_bytes or subtitle.text.encode("utf-8")
-            artifact = Artifact(
-                f"assets/subtitle.{language}.{extension}", "subtitle", "text/plain", body
-            )
+            artifact = Artifact(f"subtitle.{language}.{extension}", "subtitle", "text/plain", body)
             written.append(write_artifact(lane, artifact))
             paths.append(lane / artifact.name)
         seen: set[str] = set()
@@ -138,7 +136,7 @@ def retain_source_files(
                 else "video"
             )
             extension = _token(item.container if item.container != "unknown" else "bin")
-            name = f"assets/{role}.{extension}"
+            name = f"{role}.{extension}"
             source = item.local_path.resolve()
             if not source.is_file() or source.stat().st_size == 0:
                 raise CacheError(f"source media is missing or empty: {source}")

@@ -24,6 +24,10 @@ def test_config_selection_is_single_ordered_and_doctor_is_read_only(
     for path in (workspace / "vctx.toml", environment, global_root / "config.toml", explicit):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("[cache]\nsource_dir='source'\nmodel_dir='models'\n", encoding="utf-8")
+    environment.write_text(
+        "[cache]\nsource_dir='source'\nmodel_dir='models'\n[output]\nsource_assets='complete'\n",
+        encoding="utf-8",
+    )
     (workspace / ".vctx.toml").write_text("invalid=true\n", encoding="utf-8")
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("VCTX_CONFIG", str(environment))
@@ -43,6 +47,7 @@ def test_config_selection_is_single_ordered_and_doctor_is_read_only(
     assert report["config"] == {"origin": "environment", "path": str(environment)}
     assert report["cache"]["source_dir"] == str(environment.parent / "source")
     assert report["cache"]["model_dir"] == str(environment.parent / "models")
+    assert report["source_assets"] == "complete"
     assert report["cache"]["source_state"] == "missing" and not any(
         (environment.parent / name).exists() for name in ("source", "models")
     )
@@ -54,6 +59,10 @@ def test_config_selection_is_single_ordered_and_doctor_is_read_only(
     }
     text = runner.invoke(app, ["doctor"])
     assert text.exit_code == 0 and "config:" in text.output and "cache.source:" in text.output
+    override_scope = json.loads(
+        runner.invoke(app, ["doctor", "--source-assets", "consumed", "--json"]).output
+    )
+    assert override_scope["source_assets"] == "consumed"
 
 
 def test_prompt_is_static_terse_agent_context(tmp_path: Path, monkeypatch) -> None:
@@ -94,7 +103,7 @@ def test_doctor_admits_explicit_asr_model_path_without_writes(tmp_path: Path, mo
 def test_asr_readiness_decision_consumes_only_observed_facts() -> None:
     readiness = decide_asr_readiness(
         CapabilityPolicy(enabled=True, use=ModelRefUse(ref="local:small")),
-        AsrInstanceConfig(type="local-faster-whisper", model="small", device="cuda"),
+        AsrInstanceConfig(type="local-faster-whisper", model="small"),
         AsrReadinessFacts(
             model_kind="managed",
             model_reference="small",

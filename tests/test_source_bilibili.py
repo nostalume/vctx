@@ -121,10 +121,11 @@ def test_bilibili_uses_typed_anonymous_api_and_actual_available_streams(
     )
 
     assert session.record.metadata.title == "Public video"
+    assert session.record.source_capabilities == {"audio", "video"}
     assert audio.local_path.read_bytes() == b"audio-high"
-    assert audio.media_type == "audio" and audio.format_id == "30280"
+    assert audio.capabilities == {"audio"} and audio.format_id == "30280"
     assert video.local_path.read_bytes() == b"video-32"
-    assert video.media_type == "video" and video.format_id == "32"
+    assert video.capabilities == {"video"} and video.format_id == "32"
     assert all("Cookie" not in request.headers for request in net.requests)
     assert all(
         "cdn.example" not in receipt.detail for receipt in session.receipts if receipt.detail
@@ -180,7 +181,7 @@ def test_bilibili_prefers_typed_anonymous_official_subtitle() -> None:
     )
     payload = session.transcript(permit=SubtitlePermit(network="allowed"))
 
-    assert session.record.has_subtitles
+    assert session.record.source_capabilities == {"audio", "video", "subtitle"}
     assert payload.provenance.method == "official_subtitles"
     assert "00:00:01,250 --> 00:00:02,500" in payload.text
 
