@@ -99,7 +99,7 @@ class YtDlpSession:
             )
             raise NoTranscriptError(f"no subtitles found for input: {self.record.metadata.id}")
         try:
-            text = _read_subtitle_text(candidate.url, net=self.net)
+            text = self._read_subtitle_text(candidate.url)
         except (NetError, UnicodeError, NoTranscriptError) as exc:
             attempts = exc.attempts if isinstance(exc, NetError) else 1
             self.receipts.append(
@@ -129,6 +129,40 @@ class YtDlpSession:
                 provider="yt-dlp",
             ),
         )
+
+    def _read_subtitle_text(self, url: str) -> str:
+        text = self._fetch_text(url)
+        if _is_hls_playlist(text):
+            return self._read_hls_vtt_playlist(url, text)
+        return text
+
+    def _fetch_text(self, url: str) -> str:
+        response = self.net.request(
+            NetRequest(
+                method="GET",
+                url=url,
+                timeout_s=30,
+                purpose="subtitle_fetch",
+                provider_id="yt-dlp",
+                retry=RetryPolicy(
+                    max_attempts=3,
+                    statuses=(429, 500, 502, 503, 504),
+                    retry_connect=True,
+                    retry_timeouts=True,
+                ),
+            )
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            raise NoTranscriptError(f"subtitle fetch failed: HTTP {response.status_code}")
+        return decode_subtitle(response.body, "utf-8-sig")
+
+    def _read_hls_vtt_playlist(self, playlist_url: str, playlist_text: str) -> str:
+        segments = [
+            _strip_vtt_header(self._fetch_text(segment_url))
+            for segment_url in _hls_segment_urls(playlist_url, playlist_text)
+        ]
+        cues = [segment.strip() for segment in segments if segment.strip()]
+        return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
 
     def media(self, *, request: MediaRequest, permit: MediaPermit) -> MediaAsset:
         if permit.network == "denied":
@@ -193,7 +227,7 @@ class YtDlpSourceAdapter:
             )
         yt_dlp = _yt_dlp()
         try:
-            info = _extract_info(value, options)
+            info = self._extract_info(value, options)
         except yt_dlp.utils.DownloadError as exc:
             raise ProviderError(f"yt-dlp observation failed: {exc}") from exc
         return YtDlpSession(
@@ -203,6 +237,19 @@ class YtDlpSourceAdapter:
             net=self._net,
             receipts=[EffectReceipt(operation="observe", status="succeeded", attempts=1)],
         )
+
+    def _extract_info(self, value: str, options: YtDlpSourceOptions) -> YtDlpInfo:
+        params: YtDlpParams = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "retries": 2,
+            "fragment_retries": 2,
+            "socket_timeout": 30,
+        }
+        _apply_source_options(params, options)
+        with _yt_dlp().YoutubeDL(params) as ydl:
+            return _info_dict(ydl.extract_info(value, download=False))
 
 
 def _download_params(request: MediaRequest, options: YtDlpSourceOptions) -> YtDlpParams:
@@ -378,21 +425,6 @@ def _downloaded_media_path(info: YtDlpInfo) -> Path | None:
     return Path(filepath) if filepath else None
 
 
-def _extract_info(value: str, options: YtDlpSourceOptions) -> YtDlpInfo:
-    params: YtDlpParams = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 30,
-    }
-    _apply_source_options(params, options)
-    with _yt_dlp().YoutubeDL(params) as ydl:
-        raw_info = ydl.extract_info(value, download=False)
-    return _info_dict(raw_info)
-
-
 def _yt_dlp() -> Any:
     return importlib.import_module("yt_dlp")
 
@@ -559,45 +591,8 @@ def _normalize_subtitle_ext(
     return "unknown"
 
 
-def _read_subtitle_text(url: str, *, net: NetRuntime) -> str:
-    text = _fetch_text(url, net=net)
-    if _is_hls_playlist(text):
-        return _read_hls_vtt_playlist(url, text, net=net)
-    return text
-
-
-def _fetch_text(url: str, *, net: NetRuntime) -> str:
-    response = net.request(
-        NetRequest(
-            method="GET",
-            url=url,
-            timeout_s=30,
-            purpose="subtitle_fetch",
-            provider_id="yt-dlp",
-            retry=RetryPolicy(
-                max_attempts=3,
-                statuses=(429, 500, 502, 503, 504),
-                retry_connect=True,
-                retry_timeouts=True,
-            ),
-        )
-    )
-    if response.status_code < 200 or response.status_code >= 300:
-        raise NoTranscriptError(f"subtitle fetch failed: HTTP {response.status_code}")
-    return decode_subtitle(response.body, "utf-8-sig")
-
-
 def _is_hls_playlist(text: str) -> bool:
     return text.lstrip().startswith("#EXTM3U")
-
-
-def _read_hls_vtt_playlist(playlist_url: str, playlist_text: str, *, net: NetRuntime) -> str:
-    segment_urls = _hls_segment_urls(playlist_url, playlist_text)
-    segments = [
-        _strip_vtt_header(_fetch_text(segment_url, net=net)) for segment_url in segment_urls
-    ]
-    cues = [segment.strip() for segment in segments if segment.strip()]
-    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
 
 
 def _hls_segment_urls(playlist_url: str, playlist_text: str) -> list[str]:

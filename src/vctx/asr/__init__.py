@@ -9,7 +9,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, Field
 
 from vctx.artifact.manifest import ManifestEffect
-from vctx.asr_faster_whisper import (
+from vctx.asr.faster_whisper import (
     InferenceStreamError,
     InvalidVendorResponse,
     InvalidVendorTimestamps,
@@ -25,7 +25,7 @@ from vctx.asr_faster_whisper import (
     load_bundled_cuda,
 )
 from vctx.config import AsrInstanceConfig, CapabilityPolicy
-from vctx.model_store import ModelLifecycleError, require_prepared_model
+from vctx.model.store import ModelLifecycleError, ModelStore
 from vctx.source.session import MediaAsset
 from vctx.transcript import (
     AsrProvenance,
@@ -303,7 +303,7 @@ class FasterWhisperAsrAdapter:
         if self.instance.cache == "disabled":
             return None, self._unavailable("missing_model", "disabled cache requires model path")
         try:
-            prepared = require_prepared_model("asr", self.cache_root, asr_model_id=self.model_id)
+            prepared = ModelStore(self.cache_root).require("asr", asr_model_id=self.model_id)
         except ModelLifecycleError as exc:
             code: AsrFailureCode = "corrupt_model" if "corrupt" in str(exc) else "missing_model"
             return None, self._unavailable(code, str(exc))
@@ -545,33 +545,29 @@ class AsrRuntimePool:
             self.local[key] = adapter
         return adapter
 
+    def run(
+        self,
+        plan: AsrPlan,
+        media: MediaAsset,
+        *,
+        instance: AsrInstanceConfig,
+        cache_root: Path,
+        progress: bool = False,
+        interval: tuple[float, float | None] | None = None,
+    ) -> AsrOutcome:
+        if plan.selected != "local" or instance.type != "local-faster-whisper":
+            raise ValueError(f"ASR plan is not executable: {plan.selected}")
+        adapter = self.faster_whisper(
+            instance=instance, model_id=plan.model_id, cache_root=cache_root
+        )
+        return adapter.transcribe(media, progress=progress, interval=interval)
+
     def close(self) -> None:
         for adapter in self.local.values():
             close = getattr(adapter, "close", None)
             if callable(close):
                 close()
         self.local.clear()
-
-
-def run_asr(
-    plan: AsrPlan,
-    media: MediaAsset,
-    *,
-    instance: AsrInstanceConfig,
-    cache_root: Path,
-    runtimes: AsrRuntimePool | None = None,
-    progress: bool = False,
-    interval: tuple[float, float | None] | None = None,
-) -> AsrOutcome:
-    if plan.selected == "local" and instance.type == "local-faster-whisper":
-        pool = runtimes or AsrRuntimePool()
-        adapter = pool.faster_whisper(
-            instance=instance, model_id=plan.model_id, cache_root=cache_root
-        )
-        if interval is None:
-            return adapter.transcribe(media, progress=progress)
-        return adapter.transcribe(media, progress=progress, interval=interval)
-    raise ValueError(f"ASR plan is not executable: {plan.selected}")
 
 
 def _clip_timestamps(interval: tuple[float, float | None]) -> str:

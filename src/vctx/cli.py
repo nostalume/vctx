@@ -130,13 +130,12 @@ def models_pull_command(
         int, typer.Option("--max-runtime", min=1, max=86400, help="Hub child limit in seconds.")
     ] = 3600,
 ) -> None:
-    from vctx.model_store import pull_models
+    from vctx.model.store import ModelStore
 
     cache_root, asr_model_id = _models(cache_dir, config, asr)
     receipts = _call(
-        lambda: pull_models(
+        lambda: ModelStore(cache_root).pull(
             capabilities,
-            cache_dir=cache_root,
             asr_model_id=asr_model_id,
             conservative=conservative,
             refresh=refresh,
@@ -154,12 +153,10 @@ def models_status_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    from vctx.model_store import model_status
+    from vctx.model.store import ModelStore
 
     cache_root, asr_model_id = _models(cache_dir, config, asr)
-    receipts = _call(
-        lambda: model_status(capabilities, cache_dir=cache_root, asr_model_id=asr_model_id)
-    )
+    receipts = _call(lambda: ModelStore(cache_root).status(capabilities, asr_model_id=asr_model_id))
     typer.echo(_render_models(receipts, json_output), nl=False)
 
 
@@ -171,12 +168,10 @@ def models_verify_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    from vctx.model_store import verify_models
+    from vctx.model.store import ModelStore
 
     cache_root, asr_model_id = _models(cache_dir, config, asr)
-    receipts = _call(
-        lambda: verify_models(capabilities, cache_dir=cache_root, asr_model_id=asr_model_id)
-    )
+    receipts = _call(lambda: ModelStore(cache_root).verify(capabilities, asr_model_id=asr_model_id))
     typer.echo(_render_models(receipts, json_output), nl=False)
 
 
@@ -194,15 +189,14 @@ def models_prune_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    from vctx.model_store import prune_model_cache
+    from vctx.model.store import ModelStore
 
     if not incomplete and not unreferenced:
         typer.echo("error: choose --incomplete and/or --unreferenced", err=True)
         raise typer.Exit(2)
     cache_root, _asr_model_id = _models(cache_dir, config, asr)
     report = _call(
-        lambda: prune_model_cache(
-            cache_root,
+        lambda: ModelStore(cache_root).prune(
             incomplete=incomplete,
             unreferenced=unreferenced,
             dry_run=dry_run,

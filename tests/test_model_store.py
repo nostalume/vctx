@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import vctx.model_store as model_store
+import vctx.model.download as model_download
+import vctx.model.store as model_store
 
 
 def test_model_lock_records_process_start_identity(tmp_path: Path) -> None:
@@ -32,8 +33,8 @@ def test_prune_recovers_lease_after_pid_reuse(
     )
     monkeypatch.setattr(model_store, "_process_state", lambda _pid: (True, "current-process"))
 
-    report = model_store.prune_model_cache(
-        tmp_path, incomplete=True, unreferenced=False, dry_run=False
+    report = model_store.ModelStore(tmp_path).prune(
+        incomplete=True, unreferenced=False, dry_run=False
     )
 
     assert report.incomplete == [f".incomplete/asr/{identity}"]
@@ -57,8 +58,8 @@ def test_prune_does_not_signal_live_windows_process(
         lambda *_args: pytest.fail("Windows PID probe sent a console control event"),
     )
 
-    report = model_store.prune_model_cache(
-        tmp_path, incomplete=True, unreferenced=False, dry_run=False
+    report = model_store.ModelStore(tmp_path).prune(
+        incomplete=True, unreferenced=False, dry_run=False
     )
 
     assert report.incomplete == []
@@ -66,7 +67,8 @@ def test_prune_does_not_signal_live_windows_process(
 
 
 def test_dead_model_lease_is_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    stage = model_store.incomplete_dir("asr", "small", tmp_path)
+    store = model_store.ModelStore(tmp_path)
+    stage = store.incomplete_dir("asr", "small")
     stage.parent.mkdir(parents=True)
     lock = stage.parent / f"{stage.name}.lock"
     lock.write_text(json.dumps({"pid": 2147483647, "created_ns": 0}), encoding="utf-8")
@@ -76,6 +78,6 @@ def test_dead_model_lease_is_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_path
         (target / "model.bin").write_bytes(b"model")
         (target / "config.json").write_text("{}", encoding="utf-8")
 
-    monkeypatch.setattr(model_store, "download_model", download)
-    assert model_store.pull_models(["asr"], cache_dir=tmp_path)[0].state == "ready"
+    monkeypatch.setattr(model_download, "download_model", download)
+    assert store.pull(["asr"])[0].state == "ready"
     assert not lock.exists()

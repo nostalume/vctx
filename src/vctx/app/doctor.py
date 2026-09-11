@@ -8,7 +8,7 @@ from typing import Any
 from vctx.ai import AiTask, CredentialRef, Keyring, select_ai_route
 from vctx.app.auth import AuthError, probe_credential_presence, system_keyring
 from vctx.asr import AsrReadinessFacts, decide_asr_readiness
-from vctx.asr_faster_whisper import bundled_cuda_state
+from vctx.asr.faster_whisper import bundled_cuda_state
 from vctx.config import (
     AsrInstanceConfig,
     CapabilityPolicy,
@@ -17,7 +17,7 @@ from vctx.config import (
     ResolvedConfig,
     load_resolved_config,
 )
-from vctx.model_store import model_status, package_version
+from vctx.model.store import ModelStore, package_version
 
 
 def doctor_report(
@@ -53,11 +53,7 @@ def doctor_report(
         _observe_asr_facts(resolved, asr_instance),
     )
     models = {
-        item.capability: item
-        for item in model_status(
-            ["ocr"],
-            cache_dir=resolved.cache.model_dir,
-        )
+        item.capability: item for item in ModelStore(resolved.cache.model_dir).status(["ocr"])
     }
     try:
         keyring: Keyring | None = system_keyring()
@@ -171,7 +167,7 @@ def _observe_asr_facts(resolved: ResolvedConfig, instance: AsrInstanceConfig) ->
             package_state=package_state,
             cuda_libraries=cuda_libraries,
         )
-    receipt = model_status(["asr"], cache_dir=resolved.cache.model_dir, asr_model_id=value)[0]
+    receipt = ModelStore(resolved.cache.model_dir).status(["asr"], asr_model_id=value)[0]
     return AsrReadinessFacts(
         model_kind="managed",
         model_reference=value,

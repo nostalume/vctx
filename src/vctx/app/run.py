@@ -27,7 +27,7 @@ from vctx.artifact.manifest import (
 from vctx.asr import AsrEnvironment, AsrRuntimePool
 from vctx.config import AsrInstanceConfig, CapabilityPolicy, PrepareRequest, ResolvedConfig
 from vctx.errors import CacheError, NoTranscriptError
-from vctx.model_store import ModelLifecycleError, require_prepared_model
+from vctx.model.store import ModelLifecycleError, ModelStore
 from vctx.net import HttpxNetRuntime, NetRuntime
 from vctx.source.admission import open_source, select_source
 from vctx.source.session import (
@@ -43,7 +43,7 @@ from vctx.source.session import (
 )
 from vctx.source.store import SourceStore
 from vctx.transcript import TranscriptPayload
-from vctx.visual.ocr import OcrAdmission, OcrRuntimePool
+from vctx.visual.processors import OcrAdmission, OcrRuntimePool
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +297,7 @@ def select_asr_instance(resolved: ResolvedConfig) -> AsrInstanceConfig | None:
 
 def _builtin_asr_ready(model_root: Path) -> bool:
     try:
-        require_prepared_model("asr", model_root, asr_model_id="small")
+        ModelStore(model_root).require("asr", asr_model_id="small")
     except ModelLifecycleError, OSError:
         return False
     return True

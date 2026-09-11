@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from vctx.app.prepare import SourcePrepared, prepare_source
+from vctx.app.prepare import PreparePipeline, SourcePrepared
 from vctx.app.progress import phase
-from vctx.app.run import RunRuntimes
+from vctx.app.run import RunRuntimes, open_prepare_run
 from vctx.artifact.bundle import write_manifest
 from vctx.artifact.manifest import Manifest, ManifestEffect, RunFailure, build_manifest
 from vctx.artifact.publish import PackPublisher, VerificationReport, verify_pack
@@ -88,12 +88,9 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
                         update={"inputs": [value], "out_dir": publisher.stage}
                     )
                     try:
-                        result = prepare_source(
-                            source_request,
-                            resolved,
-                            occupied,
+                        run = open_prepare_run(source_request, resolved, occupied, runtimes)
+                        result = PreparePipeline(run).prepare(
                             completed,
-                            runtimes,
                             previous_by_id,
                             publisher.reset_lane,
                             publisher.rollback_lane,

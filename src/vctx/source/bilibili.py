@@ -27,7 +27,7 @@ from vctx.source.session import (
     SubtitlePermit,
     VideoMetadata,
 )
-from vctx.source.transfer import LocatorExpired, download_ranged
+from vctx.source.transfer import LocatorExpired, RangeTransfer
 from vctx.transcript import TranscriptPayload
 
 _BV = re.compile(r"BV[0-9A-Za-z]{10}\Z")
@@ -104,20 +104,20 @@ class BilibiliSession:
         if request.temp_dir is None:
             raise ProviderError("Bilibili media fetch requires a cache temp directory")
         for attempt in range(2):
-            play = _playback(self.net, self.bvid, self.cid, self.source_url)
+            play = self._playback()
             stream = _select_stream(play, request)
             extension = _extension(stream)
             destination = request.temp_dir / (
                 f"bilibili__{self.bvid}__{request.kind}__{stream.id}.{extension}"
             )
             try:
-                path = download_ranged(
+                path = RangeTransfer(
                     self.net,
                     stream.base_url,
                     destination,
                     headers={"Referer": self.source_url, "User-Agent": _HEADERS["User-Agent"]},
                     refresh=request.refresh,
-                )
+                ).download()
                 break
             except LocatorExpired:
                 if attempt:
@@ -152,6 +152,22 @@ class BilibiliSession:
         )
         return asset
 
+    def _playback(self) -> _PlayData:
+        url = "https://api.bilibili.com/x/player/playurl?" + urlencode(
+            {"bvid": self.bvid, "cid": self.cid, "qn": 127, "fnval": 4048, "fourk": 1}
+        )
+        request = _api_request(url).model_copy(
+            update={"headers": {**_HEADERS, "Referer": self.source_url}}
+        )
+        response = self.net.request(request)
+        try:
+            envelope = _PlayEnvelope.model_validate_json(response.body)
+        except ValidationError as exc:
+            raise ProviderError("Bilibili playback returned an invalid response") from exc
+        if response.status_code != 200 or envelope.code != 0 or envelope.data is None:
+            raise ProviderError("Bilibili playback unavailable")
+        return envelope.data
+
 
 class BilibiliSourceAdapter:
     name = "bilibili"
@@ -175,7 +191,7 @@ class BilibiliSourceAdapter:
         bvid = bilibili_bvid(value)
         if bvid is None:
             raise ProviderError("unsupported Bilibili URL")
-        data = _view(self.net, bvid)
+        data = self._view(bvid)
         source_url = urlunparse(("https", "www.bilibili.com", f"/video/{bvid}", "", "", ""))
         source = SourceRef(kind="url", value=source_url)
         metadata = VideoMetadata(
@@ -209,6 +225,17 @@ class BilibiliSourceAdapter:
             receipts=[EffectReceipt(operation="observe", status="succeeded", attempts=1)],
         )
 
+    def _view(self, bvid: str) -> _ViewData:
+        url = "https://api.bilibili.com/x/web-interface/view?" + urlencode({"bvid": bvid})
+        response = self.net.request(_api_request(url))
+        try:
+            envelope = _ViewEnvelope.model_validate_json(response.body)
+        except ValidationError as exc:
+            raise ProviderError("Bilibili metadata returned an invalid response") from exc
+        if response.status_code != 200 or envelope.code != 0 or envelope.data is None:
+            raise ProviderError("Bilibili metadata unavailable")
+        return envelope.data
+
 
 def bilibili_bvid(value: str) -> str | None:
     parsed = urlparse(value)
@@ -221,33 +248,6 @@ def bilibili_bvid(value: str) -> str | None:
     if len(parts) != 2 or parts[0] != "video" or _BV.fullmatch(parts[1]) is None:
         return None
     return parts[1]
-
-
-def _view(net: NetRuntime, bvid: str) -> _ViewData:
-    url = "https://api.bilibili.com/x/web-interface/view?" + urlencode({"bvid": bvid})
-    response = net.request(_api_request(url))
-    try:
-        envelope = _ViewEnvelope.model_validate_json(response.body)
-    except ValidationError as exc:
-        raise ProviderError("Bilibili metadata returned an invalid response") from exc
-    if response.status_code != 200 or envelope.code != 0 or envelope.data is None:
-        raise ProviderError("Bilibili metadata unavailable")
-    return envelope.data
-
-
-def _playback(net: NetRuntime, bvid: str, cid: int, referer: str) -> _PlayData:
-    url = "https://api.bilibili.com/x/player/playurl?" + urlencode(
-        {"bvid": bvid, "cid": cid, "qn": 127, "fnval": 4048, "fourk": 1}
-    )
-    request = _api_request(url).model_copy(update={"headers": {**_HEADERS, "Referer": referer}})
-    response = net.request(request)
-    try:
-        envelope = _PlayEnvelope.model_validate_json(response.body)
-    except ValidationError as exc:
-        raise ProviderError("Bilibili playback returned an invalid response") from exc
-    if response.status_code != 200 or envelope.code != 0 or envelope.data is None:
-        raise ProviderError("Bilibili playback unavailable")
-    return envelope.data
 
 
 def _api_request(url: str) -> NetRequest:

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from vctx.config import ResolvedConfig
-from vctx.model_store import ModelLifecycleError, ModelReceipt
+from vctx.model.store import ModelLifecycleError, ModelReceipt
 
 
 def select_asr_model_id(resolved: ResolvedConfig) -> str:

@@ -88,8 +88,8 @@ def test_prepare_url_without_subtitles_downloads_media_and_runs_asr(
         def __init__(self, **kwargs: JsonValue) -> None:
             del kwargs
 
-        def transcribe(self, media_asset: MediaAsset, *, progress: bool = False) -> object:
-            assert progress is False
+        def transcribe(self, media_asset: MediaAsset, **options: object) -> object:
+            assert options == {"progress": False, "interval": None}
             assert media_asset.local_path.read_bytes() == b"fake downloaded audio"
             assert media_asset.local_path.parent == tmp_path / "cache" / "source" / "blobs"
             return asr_ready(media_asset.id, "URL ASR text.", model="tiny")

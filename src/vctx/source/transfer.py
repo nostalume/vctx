@@ -30,109 +30,150 @@ class TransferState(BaseModel):
     chunk_bytes: int = _CHUNK_BYTES
 
 
-def download_ranged(
-    net: NetRuntime,
-    url: str,
-    destination: Path,
-    *,
-    headers: dict[str, str] | None = None,
-    refresh: bool = False,
-) -> Path:
-    """Download a URL through bounded byte ranges without persisting its locator."""
+class RangeTransfer:
+    def __init__(
+        self,
+        net: NetRuntime,
+        url: str,
+        destination: Path,
+        *,
+        headers: dict[str, str] | None = None,
+        refresh: bool = False,
+    ) -> None:
+        self.net = net
+        self.url = url
+        self.destination = destination
+        self.headers = headers or {}
+        self.refresh = refresh
+        self.part = destination.with_name(f"{destination.name}.part")
+        self.state_path = destination.with_name(f"{destination.name}.ranges.json")
+        self.lock_path = destination.with_name(f"{destination.name}.lock")
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    part = destination.with_name(f"{destination.name}.part")
-    state_path = destination.with_name(f"{destination.name}.ranges.json")
-    lock_path = destination.with_name(f"{destination.name}.lock")
-    with _exclusive_lock(lock_path):
-        if destination.is_file() and not refresh:
-            return destination
-        if refresh:
-            destination.unlink(missing_ok=True)
-        first_stream = _request_range(net, url, 0, _CHUNK_BYTES - 1, headers or {})
-        first = next(first_stream)
-        if first.status_code == 200:
-            _write_whole(part, chain((first,), first_stream))
-            os.replace(part, destination)
-            state_path.unlink(missing_ok=True)
-            return destination
-        total, start, end = _range_facts(first)
-        validator = _header(first, "etag") or _header(first, "last-modified")
-        state = _load_state(state_path)
-        if (
-            state is None
-            or state.total != total
-            or state.validator != validator
-            or state.chunk_bytes != _CHUNK_BYTES
-        ):
-            state = TransferState(total=total, validator=validator)
-            with part.open("wb") as stream:
-                stream.truncate(total)
-        _write_range(part, chain((first,), first_stream), start, end, total)
-        _sync(part)
-        state.completed.add(start // _CHUNK_BYTES)
-        _save_state(state_path, state)
+    def download(self) -> Path:
+        """Download through bounded byte ranges without persisting the locator."""
 
-        missing = [
-            index
-            for index in range((total + _CHUNK_BYTES - 1) // _CHUNK_BYTES)
-            if index not in state.completed
-        ]
-        workers = _workers(total)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(_download_range, net, url, part, total, index, headers or {}): index
-                for index in missing
-            }
-            committed: list[int] = []
-            for future in as_completed(futures):
-                committed.append(future.result())
-                if len(committed) < workers:
-                    continue
-                _sync(part)
-                state.completed.update(committed)
-                _save_state(state_path, state)
-                committed.clear()
-            if committed:
-                _sync(part)
-                state.completed.update(committed)
-                _save_state(state_path, state)
-        if len(state.completed) != (total + _CHUNK_BYTES - 1) // _CHUNK_BYTES:
-            raise ProviderError("source range download is incomplete")
-        if part.stat().st_size != total:
-            raise ProviderError("source range download has an invalid size")
-        os.replace(part, destination)
-        state_path.unlink(missing_ok=True)
-        return destination
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        with _exclusive_lock(self.lock_path):
+            if self.destination.is_file() and not self.refresh:
+                return self.destination
+            if self.refresh:
+                self.destination.unlink(missing_ok=True)
+            first_stream = self._request(0, _CHUNK_BYTES - 1)
+            first = next(first_stream)
+            if first.status_code == 200:
+                self._write_whole(chain((first,), first_stream))
+                os.replace(self.part, self.destination)
+                self.state_path.unlink(missing_ok=True)
+                return self.destination
+            total, start, end = _range_facts(first)
+            validator = _header(first, "etag") or _header(first, "last-modified")
+            state = self._load_state()
+            if (
+                state is None
+                or state.total != total
+                or state.validator != validator
+                or state.chunk_bytes != _CHUNK_BYTES
+            ):
+                state = TransferState(total=total, validator=validator)
+                with self.part.open("wb") as stream:
+                    stream.truncate(total)
+            self._write_range(chain((first,), first_stream), start, end, total)
+            self._sync()
+            state.completed.add(start // _CHUNK_BYTES)
+            self._save_state(state)
 
+            missing = [
+                index
+                for index in range((total + _CHUNK_BYTES - 1) // _CHUNK_BYTES)
+                if index not in state.completed
+            ]
+            workers = _workers(total)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(self._download_range, total, index): index for index in missing
+                }
+                committed: list[int] = []
+                for future in as_completed(futures):
+                    committed.append(future.result())
+                    if len(committed) < workers:
+                        continue
+                    self._sync()
+                    state.completed.update(committed)
+                    self._save_state(state)
+                    committed.clear()
+                if committed:
+                    self._sync()
+                    state.completed.update(committed)
+                    self._save_state(state)
+            if len(state.completed) != (total + _CHUNK_BYTES - 1) // _CHUNK_BYTES:
+                raise ProviderError("source range download is incomplete")
+            if self.part.stat().st_size != total:
+                raise ProviderError("source range download has an invalid size")
+            os.replace(self.part, self.destination)
+            self.state_path.unlink(missing_ok=True)
+            return self.destination
 
-def _request_range(
-    net: NetRuntime, url: str, start: int, end: int, headers: dict[str, str]
-) -> Iterator[NetResponse]:
-    request = _range_request(url, start, end, headers)
-    if isinstance(net, StreamingNetRuntime):
-        return net.iter_request(request, block_size=_BLOCK_BYTES)
-    return iter((net.request(request),))
+    def _request(self, start: int, end: int) -> Iterator[NetResponse]:
+        request = _range_request(self.url, start, end, self.headers)
+        if isinstance(self.net, StreamingNetRuntime):
+            return self.net.iter_request(request, block_size=_BLOCK_BYTES)
+        return iter((self.net.request(request),))
 
+    def _download_range(self, total: int, index: int) -> int:
+        expected_start = index * _CHUNK_BYTES
+        responses = self._request(expected_start, min(total - 1, expected_start + _CHUNK_BYTES - 1))
+        first = next(responses)
+        actual_total, start, end = _range_facts(first)
+        if actual_total != total or start != expected_start:
+            raise ProviderError("source range response changed identity")
+        self._write_range(chain((first,), responses), start, end, total)
+        return index
 
-def _download_range(
-    net: NetRuntime,
-    url: str,
-    part: Path,
-    total: int,
-    index: int,
-    headers: dict[str, str],
-) -> int:
-    expected_start = index * _CHUNK_BYTES
-    responses = _request_range(
-        net, url, expected_start, min(total - 1, expected_start + _CHUNK_BYTES - 1), headers
-    )
-    first = next(responses)
-    actual_total, start, end = _range_facts(first)
-    if actual_total != total or start != expected_start:
-        raise ProviderError("source range response changed identity")
-    _write_range(part, chain((first,), responses), start, end, total)
-    return index
+    def _write_range(
+        self, responses: Iterator[NetResponse], start: int, end: int, total: int
+    ) -> None:
+        if end >= total:
+            raise ProviderError("source range exceeds expected size")
+        with self.part.open("r+b") as stream:
+            stream.seek(start)
+            written = 0
+            for response in responses:
+                size = len(response.body)
+                if written + size > end - start + 1:
+                    raise ProviderError("source range response has inconsistent bounds")
+                stream.write(response.body)
+                written += size
+            if written != end - start + 1:
+                raise ProviderError("source range response has inconsistent bounds")
+
+    def _write_whole(self, responses: Iterator[NetResponse]) -> None:
+        written = 0
+        with self.part.open("wb") as stream:
+            for response in responses:
+                stream.write(response.body)
+                written += len(response.body)
+            if not written:
+                raise ProviderError("source media response is empty")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _sync(self) -> None:
+        with self.part.open("r+b") as stream:
+            os.fsync(stream.fileno())
+
+    def _load_state(self) -> TransferState | None:
+        try:
+            return TransferState.model_validate_json(self.state_path.read_text(encoding="utf-8"))
+        except OSError, ValidationError, ValueError:
+            return None
+
+    def _save_state(self, state: TransferState) -> None:
+        temporary = self.state_path.with_name(f".{self.state_path.name}.tmp")
+        try:
+            temporary.write_text(state.model_dump_json(), encoding="utf-8")
+            os.replace(temporary, self.state_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _range_request(url: str, start: int, end: int, headers: dict[str, str]) -> NetRequest:
@@ -166,57 +207,6 @@ def _range_facts(response: NetResponse) -> tuple[int, int, int]:
     if end < start or end >= total:
         raise ProviderError("source range response has inconsistent bounds")
     return total, start, end
-
-
-def _write_range(
-    part: Path, responses: Iterator[NetResponse], start: int, end: int, total: int
-) -> None:
-    if end >= total:
-        raise ProviderError("source range exceeds expected size")
-    with part.open("r+b") as stream:
-        stream.seek(start)
-        written = 0
-        for response in responses:
-            size = len(response.body)
-            if written + size > end - start + 1:
-                raise ProviderError("source range response has inconsistent bounds")
-            stream.write(response.body)
-            written += size
-        if written != end - start + 1:
-            raise ProviderError("source range response has inconsistent bounds")
-
-
-def _write_whole(part: Path, responses: Iterator[NetResponse]) -> None:
-    written = 0
-    with part.open("wb") as stream:
-        for response in responses:
-            stream.write(response.body)
-            written += len(response.body)
-        if not written:
-            raise ProviderError("source media response is empty")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def _sync(path: Path) -> None:
-    with path.open("r+b") as stream:
-        os.fsync(stream.fileno())
-
-
-def _load_state(path: Path) -> TransferState | None:
-    try:
-        return TransferState.model_validate_json(path.read_text(encoding="utf-8"))
-    except OSError, ValidationError, ValueError:
-        return None
-
-
-def _save_state(path: Path, state: TransferState) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_text(state.model_dump_json(), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _header(response: NetResponse, name: str) -> str | None:

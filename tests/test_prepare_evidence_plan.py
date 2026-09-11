@@ -19,8 +19,8 @@ from vctx.summary import (
 )
 from vctx.transcript import Transcript
 from vctx.visual.frame import Frame, FrameBatch
-from vctx.visual.ocr import OcrOutcome, OcrRuntimePool, RapidOcr
 from vctx.visual.plan import EvidenceClaim, EvidencePlan, PlannedFrame
+from vctx.visual.processors import OcrOutcome, OcrRuntimePool, RapidOcr
 
 runner = CliRunner()
 
@@ -62,9 +62,9 @@ model = "planner"
         encoding="utf-8",
     )
 
-    def fake_transcribe(self: object, asset: MediaAsset, *, progress: bool = False) -> object:
+    def fake_transcribe(self: object, asset: MediaAsset, **options: object) -> object:
         del self
-        assert progress is False
+        assert options == {"progress": False, "interval": None}
         return asr_ready_segments(asset.id, [(0, 4, "原生文本")])
 
     def fake_plan(*_args: object) -> EvidencePlan:

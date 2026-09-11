@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-import vctx.model_store as model_store
+import vctx.model.store as model_store
 from vctx.cli import app
 
 runner = CliRunner()
@@ -30,7 +30,11 @@ def test_models_pull_maps_options_and_renders_receipt(
 ) -> None:
     observed: dict[str, object] = {}
 
-    def pull(capabilities: list[str] | None, **options: object) -> list[model_store.ModelReceipt]:
+    def pull(
+        _store: model_store.ModelStore,
+        capabilities: list[str] | None,
+        **options: object,
+    ) -> list[model_store.ModelReceipt]:
         observed.update(capabilities=capabilities, **options)
         return [
             model_store.ModelReceipt(
@@ -44,7 +48,7 @@ def test_models_pull_maps_options_and_renders_receipt(
             )
         ]
 
-    monkeypatch.setattr(model_store, "pull_models", pull)
+    monkeypatch.setattr(model_store.ModelStore, "pull", pull)
     result = runner.invoke(
         app,
         [
@@ -83,10 +87,10 @@ def test_models_verify_and_prune_render_public_results(
         bytes=8,
         package_version="test",
     )
-    monkeypatch.setattr(model_store, "verify_models", lambda *_args, **_kwargs: [receipt])
+    monkeypatch.setattr(model_store.ModelStore, "verify", lambda *_args, **_kwargs: [receipt])
     monkeypatch.setattr(
-        model_store,
-        "prune_model_cache",
+        model_store.ModelStore,
+        "prune",
         lambda *_args, **_kwargs: model_store.ModelPruneReport(
             dry_run=True, incomplete=[".incomplete/asr/model"], generations=[], bytes=8
         ),

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import base64
 import importlib
+import mimetypes
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from vctx.model_store import ModelLifecycleError, rapidocr_config_path, require_prepared_model
+from pydantic import BaseModel
+
+from vctx.ai import AiClient, AiImagePart, AiImageUrl, AiMessage, AiTextPart
+from vctx.model.store import ModelLifecycleError, ModelStore
 from vctx.visual.evidence import Observation
 from vctx.visual.frame import Frame
 
@@ -54,8 +60,9 @@ def _load_rapid(cache_root: Path) -> OcrAdmission:
         constructor = getattr(module, "RapidOCR", None)
         if not callable(constructor):
             raise RuntimeError("rapidocr does not expose callable RapidOCR")
-        require_prepared_model("ocr", cache_root)
-        engine = constructor(config_path=str(rapidocr_config_path(cache_root)))
+        store = ModelStore(cache_root)
+        store.require("ocr")
+        engine = constructor(config_path=str(store.rapidocr_config_path()))
         if not callable(engine):
             raise RuntimeError("rapidocr RapidOCR() did not return a callable engine")
         return RapidOcr(engine)
@@ -83,3 +90,62 @@ def _text(result: object) -> str:
             if text:
                 admitted.append(text)
     return "\n".join(admitted).strip()
+
+
+class VlmOutcome(Observation):
+    pass
+
+
+class _Description(BaseModel):
+    text: str
+
+
+class VisionProcessor:
+    def __init__(self, *, client: AiClient) -> None:
+        self.client = client
+
+    def observe(self, frame: Frame, *, ocr_text: str | None = None) -> VlmOutcome:
+        try:
+            media_type = mimetypes.guess_type(frame.path.name)[0] or "image/png"
+            image = base64.b64encode(frame.path.read_bytes()).decode("ascii")
+            prompt = (
+                "Describe source information visible in this frame that is not recoverable "
+                "from transcript text. Focus on diagrams, layout, labels, equations, and "
+                "actions. Be concise and factual."
+            )
+            if ocr_text:
+                prompt += f"\nOCR observation for context:\n{ocr_text}"
+            outcome = self.client.complete(
+                task="vision_description",
+                request_id=str(uuid.uuid4()),
+                result=_Description,
+                messages=[
+                    AiMessage(
+                        role="user",
+                        content=[
+                            AiTextPart(text=prompt),
+                            AiImagePart(
+                                image_url=AiImageUrl(url=f"data:{media_type};base64,{image}")
+                            ),
+                        ],
+                    )
+                ],
+            )
+        except (OSError, ValueError) as exc:
+            return VlmOutcome(
+                status="failed",
+                detail=f"{type(exc).__name__}: {exc}",
+                provider=self.client.instance.provider_id,
+            )
+        if outcome.kind == "failed":
+            return VlmOutcome(
+                status="failed",
+                detail=outcome.reason,
+                provider=outcome.receipt.provider,
+            )
+        text = outcome.value.text.strip()
+        return VlmOutcome(
+            status="ok" if text else "empty",
+            text=text or None,
+            provider=outcome.receipt.provider,
+        )
