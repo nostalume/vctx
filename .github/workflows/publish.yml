@@ -29,6 +29,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          version: "0.12.13"
           python-version: "3.14"
           enable-cache: true
 
@@ -193,14 +194,16 @@ jobs:
         shell: bash
         run: cd release/dist && sha256sum -c ../SHA256SUMS
 
-      - name: Publish with Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          packages-dir: release/dist/
-          attestations: true
-          print-hash: true
-          skip-existing: true
-          verify-metadata: true
+          version: "0.12.13"
+
+      - name: Publish with Trusted Publishing
+        run: >-
+          uv publish --trusted-publishing always
+          --check-url https://pypi.org/simple/vctx/
+          release/dist/*.whl release/dist/*.tar.gz
 
   registry-verify:
     name: Verify PyPI release identity

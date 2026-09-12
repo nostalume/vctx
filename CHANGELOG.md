@@ -3,6 +3,14 @@
 This file records user-visible changes to vctx. The current CLI and pack contract
 is documented in [docs/api.md](docs/api.md).
 
+## 0.4.1 — 2026-09-12
+
+### Fixed
+
+- This is the first published 0.4 release and includes every 0.4.0 change below.
+  The v0.4.0 tag uploaded no package; publication now uses the pinned uv Trusted
+  Publishing path already proven by v0.3.0.
+
 ## 0.4.0 — 2026-09-12
 
 ### Added
