@@ -3,6 +3,14 @@
 This file records user-visible changes to vctx. The current CLI and pack contract
 is documented in [docs/api.md](docs/api.md).
 
+## 0.4.2 — 2026-09-12
+
+### Fixed
+
+- Generate PEP 740 attestations before uploading distributions so PyPI exposes
+  verifiable release provenance. The v0.4.1 package bytes are valid but were
+  published without attestations.
+
 ## 0.4.1 — 2026-09-12
 
 ### Fixed
