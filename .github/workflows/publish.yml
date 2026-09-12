@@ -208,7 +208,7 @@ jobs:
         run: >-
           uv publish --trusted-publishing always
           --check-url https://pypi.org/simple/vctx/
-          release/dist/*.whl release/dist/*.tar.gz
+          release/dist/*
 
   registry-verify:
     name: Verify PyPI release identity
@@ -236,6 +236,7 @@ jobs:
           import os
           import pathlib
           import time
+          import urllib.parse
           import urllib.request
 
           version = os.environ["VCTX_VERSION"]
@@ -252,10 +253,22 @@ jobs:
                   continue
               observed = {item["filename"]: item["digests"]["sha256"] for item in payload["urls"]}
               if observed == expected:
-                  print(f"PyPI v{version} hashes match the release bundle")
-                  break
+                  try:
+                      for filename in expected:
+                          encoded = urllib.parse.quote(filename, safe="")
+                          url = f"https://pypi.org/integrity/vctx/{version}/{encoded}/provenance"
+                          with urllib.request.urlopen(url, timeout=30) as response:
+                              provenance = json.load(response)
+                          assert provenance.get("attestation_bundles"), f"empty provenance: {filename}"
+                  except Exception as error:
+                      provenance_error = error
+                  else:
+                      print(f"PyPI v{version} hashes and provenance match the release bundle")
+                      break
               if attempt == 17:
-                  raise AssertionError(f"PyPI files differ: {observed}")
+                  if observed != expected:
+                      raise AssertionError(f"PyPI files differ: {observed}")
+                  raise AssertionError(f"PyPI provenance unavailable: {provenance_error}")
               time.sleep(5)
           PY
 
