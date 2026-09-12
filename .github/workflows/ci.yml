@@ -17,13 +17,14 @@ jobs:
   quality:
     name: Quality and package
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.14"
           enable-cache: true
@@ -64,57 +65,92 @@ jobs:
         run: uv run pytest -q -W error::DeprecationWarning
 
       - name: Build package
-        run: uv build
+        run: uv build --no-sources
 
       - name: Inspect package contents
         shell: bash
         run: |
-          wheel=$(find dist -name '*.whl' -print -quit)
-          sdist=$(find dist -name '*.tar.gz' -print -quit)
-          python -m zipfile -l "$wheel" > wheel-files.txt
-          tar -tzf "$sdist" > sdist-files.txt
-          if grep -E '(^|/)(tests|\.agents|scripts|\.github)/|models/|transforms/' wheel-files.txt sdist-files.txt; then
-            echo "development residue or obsolete owners found in distributions" >&2
-            exit 1
-          fi
+          python - <<'PY'
+          import email.parser
+          import pathlib
+          import tarfile
+          import tomllib
+          import zipfile
+
+          root = pathlib.Path("dist")
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+          version = project["version"]
+          wheels = list(root.glob("*.whl"))
+          sdists = list(root.glob("*.tar.gz"))
+          assert [path.name for path in wheels] == [f"vctx-{version}-py3-none-any.whl"]
+          assert [path.name for path in sdists] == [f"vctx-{version}.tar.gz"]
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+              metadata = email.parser.Parser().parsestr(archive.read(metadata_name).decode())
+          assert metadata["Name"] == "vctx" and metadata["Version"] == version
+          assert metadata["Requires-Python"] == ">=3.14"
+          assert set(metadata.get_all("Provides-Extra", [])) == {"asr", "asr-cuda", "full", "visual"}
+          assert len(metadata.get_all("Project-URL", [])) == 5
+
+          with tarfile.open(sdists[0]) as archive:
+              sdist_names = archive.getnames()
+          required = {"LICENSE", "README.md", "CHANGELOG.md", "docs/api.md"}
+          projected = {"/".join(name.split("/")[1:]) for name in sdist_names}
+          assert required <= projected
+          forbidden = {".agents", ".github", "tests", "models", "transforms"}
+          for name in [*names, *sdist_names]:
+              assert not forbidden.intersection(pathlib.PurePosixPath(name).parts)
+          PY
 
       - name: Upload distributions
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: distributions
-          path: dist/*
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   support-profile:
     name: ${{ matrix.os }} / Python 3.14 / ${{ matrix.profile }}
     runs-on: ${{ matrix.os }}
     needs: quality
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-14]
         profile: [core, asr, visual, full]
+        include:
+          - os: windows-latest
+            profile: asr-cuda
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.14"
           enable-cache: true
 
       - name: Download distributions
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: distributions
           path: dist
 
       - name: Smoke installed profile
         shell: bash
+        env:
+          PROFILE: ${{ matrix.profile }}
         run: |
           wheel=$(find dist -name '*.whl' -print -quit)
-          profile="${{ matrix.profile }}"
+          profile="$PROFILE"
           requirement="$wheel"
           if [ "$profile" != core ]; then
             requirement="$wheel[$profile]"
@@ -129,8 +165,11 @@ jobs:
           uv run --isolated --no-project --with "$requirement" vctx render pack --format context > context.md
           uv run --isolated --no-project --with "$requirement" vctx render pack --format read > read.md
           test -s prompt.md && test -s context.md && test -s read.md
-          if [ "$profile" = asr ] || [ "$profile" = full ]; then
+          if [ "$profile" = asr ] || [ "$profile" = asr-cuda ] || [ "$profile" = full ]; then
             uv run --isolated --no-project --with "$requirement" python -c "import faster_whisper"
+          fi
+          if [ "$RUNNER_OS" = Windows ] && { [ "$profile" = asr-cuda ] || [ "$profile" = full ]; }; then
+            uv run --isolated --no-project --with "$requirement" python -c "from vctx.asr.faster_whisper import bundled_cuda_state; assert bundled_cuda_state() == 'bundled'"
           fi
           if [ "$profile" = visual ] || [ "$profile" = full ]; then
             uv run --isolated --no-project --with "$requirement" python -c "import av, onnxruntime, rapidocr; container = av.open('tests/fixtures/frame.mp4'); assert next(container.decode(video=0))"

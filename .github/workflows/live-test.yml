@@ -17,13 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.14"
       - name: Build and install artifact
         run: |
-          uv build --wheel
+          uv build --wheel --no-sources
           wheel=$(find dist -name '*.whl' -print -quit)
           uv venv integration-env
           uv pip install --python integration-env/bin/python "$wheel"
@@ -37,7 +37,12 @@ jobs:
           import json, pathlib
           root = pathlib.Path("pack")
           manifest = json.loads((root / "manifest.json").read_text())
-          assert manifest["schema_version"] == "3" and manifest["sources"]
-          lane = root / manifest["sources"][0]["path"]
+          assert manifest["schema_version"] == "5" and manifest["sources"]
+          source = manifest["sources"][0]
+          path = pathlib.PurePosixPath(source["path"])
+          assert path.parent == pathlib.PurePosixPath(".")
+          assert source["asset_scope"] == "consumed"
+          lane = root / path
           assert all((lane / name).is_file() for name in ("metadata.json", "transcript.json", "chunks.json"))
+          assert not (root / "sources").exists() and not (lane / "assets").exists()
           PY

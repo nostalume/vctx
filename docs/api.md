@@ -45,6 +45,36 @@ PyAV decodes video in-process. No host FFmpeg executable is required. Normal
 Use the `asr-cuda` extra on Windows for project-local CUDA 12/cuDNN 9 libraries. The
 runtime discovers them without mutating `PATH`; `doctor --json` reports their state.
 
+## Migrating from 0.3 to 0.4
+
+Upgrade a uv tool installation with `uv tool upgrade vctx`. Version 0.4 writes
+schema 5 and reads immutable schemas 3, 4, and 5. Schema-5 packs place
+`manifest.json` and direct source lanes at the root, with role-named source files
+beside canonical products. Consumers must follow manifest-relative paths instead
+of reconstructing schema-3 paths. Version 0.3 cannot read schema 5; preserve an old
+pack copy before downgrading.
+
+For normal retention configuration, replace `output.retain_media` with:
+
+```toml
+[output]
+source_assets = "consumed" # or "complete"
+```
+
+`consumed` preserves files acquired by product work. `complete` explicitly admits
+the additional network and storage cost of every audio, video, or native-subtitle
+role reported for the source revision. The hidden `--no-retain-media` option and
+`output.retain_media = false` remain a deprecated compatibility opt-out.
+
+Named ASR instances may still select a model, but `device` and `compute` are no
+longer accepted configuration fields. Use `transforms.asr.quality` for the
+user-visible speed/quality choice. Runtime device, compute mode, threads, and
+batching are selected automatically and recorded in transcript provenance.
+
+A same-revision prepare may extend an existing verified pack and fetch only
+missing roles. A changed source revision requires explicit `--overwrite`; corrupt,
+linked, or ambiguous output is refused rather than trusted as an upgrade base.
+
 ## Commands
 
 Use command-specific `--help` for the exact option grammar.

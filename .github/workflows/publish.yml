@@ -5,40 +5,49 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  pypi:
-    name: Build and publish to PyPI
+  build:
+    name: Build and inspect release
     runs-on: ubuntu-latest
-    environment: pypi
+    timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      registry_state: ${{ steps.registry.outputs.state }}
+      version: ${{ steps.identity.outputs.version }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout tagged revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.14"
           enable-cache: true
 
-      - name: Verify tag matches package version
+      - name: Verify release identity
+        id: identity
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          test "v$version" = "$GITHUB_REF_NAME"
+          test "v$version" = "$RELEASE_TAG"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "VCTX_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Sync dependencies
         run: uv sync --locked --dev --extra visual
+
+      - name: Ruff format
+        run: uv run ruff format --check src tests
 
       - name: Ruff
         run: uv run ruff check .
@@ -50,54 +59,259 @@ jobs:
         run: uv run pytest -q -W error::DeprecationWarning
 
       - name: Build distributions
-        run: uv build
+        run: |
+          uv build --no-sources --out-dir release/dist
+          rm -f release/dist/.gitignore
 
-      - name: Inspect and smoke built wheel
+      - name: Inspect release bundle
         shell: bash
         run: |
-          wheel=$(find dist -name '*.whl' -print -quit)
-          python -m zipfile -l "$wheel" > wheel-files.txt
-          if grep -E '(^|/)(tests|\.agents|scripts|\.github)/|models/|transforms/' wheel-files.txt; then
-            echo "development residue or obsolete owners found in wheel" >&2
-            exit 1
-          fi
-          uv run --isolated --no-project --with "$wheel" python -c "import vctx"
+          python - <<'PY'
+          import email.parser
+          import os
+          import pathlib
+          import tarfile
+          import zipfile
+
+          version = os.environ["VCTX_VERSION"]
+          root = pathlib.Path("release/dist")
+          wheel = root / f"vctx-{version}-py3-none-any.whl"
+          sdist = root / f"vctx-{version}.tar.gz"
+          assert sorted(path.name for path in root.iterdir()) == sorted((wheel.name, sdist.name))
+
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = archive.namelist()
+              metadata_name = next(name for name in wheel_names if name.endswith(".dist-info/METADATA"))
+              metadata = email.parser.Parser().parsestr(archive.read(metadata_name).decode())
+          assert metadata["Name"] == "vctx" and metadata["Version"] == version
+          assert metadata["Requires-Python"] == ">=3.14"
+          assert set(metadata.get_all("Provides-Extra", [])) == {"asr", "asr-cuda", "full", "visual"}
+          urls = dict(value.split(", ", 1) for value in metadata.get_all("Project-URL", []))
+          assert set(urls) == {"Homepage", "Documentation", "Source", "Issues", "Changelog"}
+          assert all(value.startswith("https://github.com/nostalume/vctx") for value in urls.values())
+
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+          projected = {"/".join(name.split("/")[1:]) for name in sdist_names}
+          required = {
+              "LICENSE",
+              "README.md",
+              "CHANGELOG.md",
+              "docs/api.md",
+              "docs/examples/README.md",
+              "pyproject.toml",
+          }
+          assert required <= projected
+          forbidden = {".agents", ".github", "tests", "models", "transforms"}
+          for name in [*wheel_names, *sdist_names]:
+              assert not forbidden.intersection(pathlib.PurePosixPath(name).parts)
+
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          start = next(index for index, line in enumerate(changelog) if line.startswith(f"## {version} "))
+          end = next(
+              (index for index in range(start + 1, len(changelog)) if changelog[index].startswith("## ")),
+              len(changelog),
+          )
+          pathlib.Path("release/RELEASE_NOTES.md").write_text(
+              "\n".join(changelog[start:end]).strip() + "\n", encoding="utf-8"
+          )
+          PY
+          (
+            cd release/dist
+            sha256sum "vctx-$VCTX_VERSION-py3-none-any.whl" "vctx-$VCTX_VERSION.tar.gz" > ../SHA256SUMS
+          )
+          test -s release/RELEASE_NOTES.md
+
+      - name: Smoke exact wheel
+        shell: bash
+        run: |
+          wheel="$GITHUB_WORKSPACE/release/dist/vctx-$VCTX_VERSION-py3-none-any.whl"
+          cd "$RUNNER_TEMP"
+          uv run --isolated --no-project --with "$wheel" python -c "import importlib.metadata; assert importlib.metadata.version('vctx') == '$VCTX_VERSION'"
           uv run --isolated --no-project --with "$wheel" vctx --help >/dev/null
 
-      - name: Retain release distributions
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-distributions
-          path: dist/*
+      - name: Admit existing PyPI state
+        id: registry
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
 
-      - name: Publish distributions to PyPI
-        run: uv publish --trusted-publishing always
+          version = os.environ["VCTX_VERSION"]
+          root = pathlib.Path("release/dist")
+          expected = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.iterdir()}
+          try:
+              with urllib.request.urlopen(f"https://pypi.org/pypi/vctx/{version}/json", timeout=30) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              observed = {}
+          else:
+              observed = {item["filename"]: item["digests"]["sha256"] for item in payload["urls"]}
+          assert set(observed) <= set(expected), f"unexpected PyPI files: {set(observed) - set(expected)}"
+          assert all(expected[name] == digest for name, digest in observed.items()), "PyPI hash conflict"
+          state = "complete" if set(observed) == set(expected) else "resume" if observed else "new"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"state={state}\n")
+          print(f"PyPI v{version} state: {state}")
+          PY
+
+      - name: Retain immutable release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-bundle
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  pypi:
+    name: Publish exact distributions to PyPI
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.registry_state != 'complete'
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/vctx/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Verify retained bytes
+        shell: bash
+        run: cd release/dist && sha256sum -c ../SHA256SUMS
+
+      - name: Publish with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        with:
+          packages-dir: release/dist/
+          attestations: true
+          print-hash: true
+          skip-existing: true
+          verify-metadata: true
+
+  registry-verify:
+    name: Verify PyPI release identity
+    runs-on: ubuntu-latest
+    needs: [build, pypi]
+    if: ${{ always() && needs.build.result == 'success' && (needs.pypi.result == 'success' || needs.pypi.result == 'skipped') }}
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Compare public PyPI hashes
+        env:
+          VCTX_VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.request
+
+          version = os.environ["VCTX_VERSION"]
+          root = pathlib.Path("release/dist")
+          expected = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.iterdir()}
+          for attempt in range(18):
+              try:
+                  with urllib.request.urlopen(f"https://pypi.org/pypi/vctx/{version}/json", timeout=30) as response:
+                      payload = json.load(response)
+              except Exception:
+                  if attempt == 17:
+                      raise
+                  time.sleep(5)
+                  continue
+              observed = {item["filename"]: item["digests"]["sha256"] for item in payload["urls"]}
+              if observed == expected:
+                  print(f"PyPI v{version} hashes match the release bundle")
+                  break
+              if attempt == 17:
+                  raise AssertionError(f"PyPI files differ: {observed}")
+              time.sleep(5)
+          PY
 
   github-release:
-    name: Create GitHub release
+    name: Create immutable GitHub release
     runs-on: ubuntu-latest
-    needs: pypi
+    needs: [build, registry-verify]
+    timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
-      - name: Download release distributions
-        uses: actions/download-artifact@v8
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: release-distributions
-          path: dist
+          name: release-bundle
+          path: release
 
-      - name: Create release and attach distributions
+      - name: Verify retained bytes
+        shell: bash
+        run: cd release/dist && sha256sum -c ../SHA256SUMS
+
+      - name: Create or verify release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VCTX_VERSION: ${{ needs.build.outputs.version }}
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          wheel="vctx-$VCTX_VERSION-py3-none-any.whl"
+          sdist="vctx-$VCTX_VERSION.tar.gz"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets,body,isDraft,isPrerelease > existing.json 2>/dev/null; then
+            python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          release = json.loads(pathlib.Path("existing.json").read_text())
+          version = os.environ["VCTX_VERSION"]
+          expected = {f"vctx-{version}-py3-none-any.whl", f"vctx-{version}.tar.gz", "SHA256SUMS"}
+          observed = {asset["name"] for asset in release["assets"]}
+          assert observed <= expected, f"unexpected release assets: {observed - expected}"
+          assert not release["isDraft"] and not release["isPrerelease"]
+          assert release["body"].strip() == pathlib.Path("release/RELEASE_NOTES.md").read_text().strip()
+          PY
+            mkdir existing-assets
+            if [ "$(jq '.assets | length' existing.json)" -gt 0 ]; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir existing-assets
+            fi
+            for name in "$wheel" "$sdist" SHA256SUMS; do
+              expected="release/dist/$name"
+              if [ "$name" = SHA256SUMS ]; then expected="release/$name"; fi
+              if [ -f "existing-assets/$name" ]; then
+                cmp "$expected" "existing-assets/$name"
+              else
+                gh release upload "$RELEASE_TAG" "$expected" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
+            gh release create "$RELEASE_TAG" \
+              "release/dist/$wheel" "release/dist/$sdist" release/SHA256SUMS \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --generate-notes \
-              --title "$GITHUB_REF_NAME"
+              --notes-file release/RELEASE_NOTES.md \
+              --title "$RELEASE_TAG"
           fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,assets

@@ -28,11 +28,15 @@ Smaller installs are available:
 ```console
 uv tool install vctx             # subtitles, URL acquisition, compatible AI
 uv tool install "vctx[asr]"      # core + faster-whisper
+uv tool install "vctx[asr-cuda]" # ASR + project-local CUDA libraries on Windows
 uv tool install "vctx[visual]"   # core + PyAV + RapidOCR
 ```
 
 The equivalent pip command is `python -m pip install "vctx[full]"` inside a
 Python 3.14 environment.
+
+Upgrade an existing tool installation with `uv tool upgrade vctx`. See the
+[changelog](CHANGELOG.md) before upgrading across a minor version.
 
 ## Usage
 
@@ -62,7 +66,8 @@ Source files live beside their products inside the output lane. The default
 `--source-assets complete` retains every audio, video, or native-subtitle role
 reported for the admitted source revision. A later complete request extends the
 same verified output, fetching only missing roles while preserving transcript
-quality and existing products.
+quality and existing products. Complete retention can download substantially more
+data; retained files live directly beside their products in the source lane.
 
 For an agent-oriented view:
 
@@ -112,7 +117,8 @@ vctx doctor --to summary --json
 
 More runnable configurations are under [docs/examples](docs/examples/README.md). The
 complete command behavior, every configuration field, path precedence, pack
-layout, and exit status are documented in [docs/api.md](docs/api.md).
+layout, migration guidance, and exit status are documented in
+[docs/api.md](docs/api.md).
 
 ## Workflow
 
