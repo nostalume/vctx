@@ -106,12 +106,7 @@ def retain_source_files(
     retain: bool,
 ) -> tuple[list[ArtifactRef], list[str]]:
     if not retain:
-        omissions = (
-            ["deprecated retention opt-out produced a nonportable pack"]
-            if subtitle is not None or media
-            else []
-        )
-        return [], omissions
+        return [], ["deprecated retention opt-out produced a nonportable pack"]
     written: list[ArtifactRef] = []
     paths: list[Path] = []
     try:
