@@ -542,6 +542,8 @@ def _windows_process_state(pid: int) -> tuple[bool, str | None]:
     import ctypes
     from ctypes import wintypes
 
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process inspection requires Windows")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]

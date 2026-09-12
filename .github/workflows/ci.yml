@@ -59,7 +59,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Ty
-        run: uv run ty check .
+        run: uv run ty check --python-platform all .
 
       - name: Pytest
         run: uv run pytest -q -W error::DeprecationWarning
