@@ -6,15 +6,14 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import vctx.model.store as model_store
 from vctx.cli import app
 
 runner = CliRunner()
 
 
 def test_models_status_is_network_free_and_machine_readable(tmp_path: Path) -> None:
-    result = runner.invoke(
-        app, ["models", "status", "--cache-dir", str(tmp_path), "--json"]
-    )
+    result = runner.invoke(app, ["models", "status", "--cache-dir", str(tmp_path), "--json"])
 
     assert result.exit_code == 0, result.output
     records = json.loads(result.output)
@@ -26,71 +25,96 @@ def test_models_status_is_network_free_and_machine_readable(tmp_path: Path) -> N
     assert all(not Path(item["cache_path"]).is_absolute() for item in records)
 
 
-def test_models_pull_uses_adapter_boundary_and_verify_detects_corruption(
+def test_models_status_maps_quality_intent_to_managed_model(tmp_path: Path) -> None:
+    config = tmp_path / "vctx.toml"
+    config.write_text('[transforms.asr]\nquality = "fast"\n', encoding="utf-8")
+    result = runner.invoke(app, ["models", "status", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)[0]["model_id"] == "tiny"
+
+
+def test_models_pull_maps_options_and_renders_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.app.models as models_module
+    observed: dict[str, object] = {}
 
-    def fake_pull(capability: str, model_id: str, cache_root: Path) -> Path:
-        model_dir = cache_root / capability / model_id
-        model_dir.mkdir(parents=True)
-        (model_dir / "weights.bin").write_bytes(b"prepared")
-        return model_dir
+    def pull(
+        _store: model_store.ModelStore,
+        capabilities: list[str] | None,
+        **options: object,
+    ) -> list[model_store.ModelReceipt]:
+        observed.update(capabilities=capabilities, **options)
+        return [
+            model_store.ModelReceipt(
+                capability="asr",
+                provider="faster-whisper",
+                model_id="tiny",
+                state="ready",
+                cache_path="generations/asr/model/generation",
+                bytes=8,
+                package_version="test",
+            )
+        ]
 
-    monkeypatch.setattr(models_module, "_pull_model", fake_pull)
-    pull = runner.invoke(
-        app,
-        ["models", "pull", "asr", "ocr", "--cache-dir", str(tmp_path), "--asr", "local:tiny"],
-    )
-    assert pull.exit_code == 0, pull.output
-    assert "asr: ready" in pull.output
-    assert "ocr: ready" in pull.output
-
-    verify = runner.invoke(
-        app,
-        [
-            "models", "verify", "asr", "ocr", "--cache-dir", str(tmp_path),
-            "--asr", "local:tiny", "--json",
-        ],
-    )
-    assert [item["state"] for item in json.loads(verify.output)] == ["ready", "ready"]
-
-    (tmp_path / "models" / "asr" / "tiny" / "weights.bin").write_bytes(b"corrupt")
-    corrupt = runner.invoke(
+    monkeypatch.setattr(model_store.ModelStore, "pull", pull)
+    result = runner.invoke(
         app,
         [
-            "models", "verify", "asr", "--cache-dir", str(tmp_path),
-            "--asr", "local:tiny", "--json",
+            "models",
+            "pull",
+            "asr",
+            "--cache-dir",
+            str(tmp_path),
+            "--asr",
+            "local:tiny",
+            "--conservative",
+            "--refresh",
+            "--max-runtime",
+            "90",
         ],
     )
-    assert json.loads(corrupt.output)[0]["state"] == "corrupt"
+
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith("asr: ready")
+    assert observed["capabilities"] == ["asr"]
+    assert observed["asr_model_id"] == "tiny"
+    assert observed["conservative"] is True
+    assert observed["refresh"] is True
+    assert observed["max_runtime"] == 90
 
 
-def test_asr_model_pull_preserves_previous_model_on_download_failure(
+def test_models_verify_and_prune_render_public_results(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import vctx.app.models as models_module
+    receipt = model_store.ModelReceipt(
+        capability="asr",
+        provider="faster-whisper",
+        model_id="small",
+        state="corrupt",
+        cache_path="generations/asr/model/generation",
+        bytes=8,
+        package_version="test",
+    )
+    monkeypatch.setattr(model_store.ModelStore, "verify", lambda *_args, **_kwargs: [receipt])
+    monkeypatch.setattr(
+        model_store.ModelStore,
+        "prune",
+        lambda *_args, **_kwargs: model_store.ModelPruneReport(
+            dry_run=True, incomplete=[".incomplete/asr/model"], generations=[], bytes=8
+        ),
+    )
 
-    fail = False
+    verify = runner.invoke(app, ["models", "verify", "asr", "--cache-dir", str(tmp_path), "--json"])
+    prune = runner.invoke(
+        app,
+        ["models", "prune", "--incomplete", "--dry-run", "--cache-dir", str(tmp_path)],
+    )
+    missing_mode = runner.invoke(app, ["models", "prune", "--cache-dir", str(tmp_path)])
 
-    def download_model(_model_id: str, *, output_dir: str) -> None:
-        target = Path(output_dir)
-        (target / "model.bin").write_bytes(b"replacement" if fail else b"original")
-        (target / "config.json").write_text("{}", encoding="utf-8")
-        if fail:
-            raise RuntimeError("interrupted download")
-
-    module = type("FakeWhisper", (), {"download_model": staticmethod(download_model)})
-    monkeypatch.setattr(models_module.importlib, "import_module", lambda _name: module)
-    args = ["models", "pull", "asr", "--cache-dir", str(tmp_path)]
-    first = runner.invoke(app, args)
-    assert first.exit_code == 0, first.output
-    target = tmp_path / "models" / "asr" / "small"
-    before = {path.name: path.read_bytes() for path in target.iterdir()}
-
-    fail = True
-    second = runner.invoke(app, args)
-
-    assert second.exit_code == 1
-    assert {path.name: path.read_bytes() for path in target.iterdir()} == before
-    assert not any(path.name.endswith((".stage", ".backup")) for path in target.parent.iterdir())
+    assert verify.exit_code == 0
+    assert json.loads(verify.output)[0]["state"] == "corrupt"
+    assert prune.exit_code == 0
+    assert prune.output == "would prune 1 model path(s), 8 bytes\n"
+    assert missing_mode.exit_code == 2
+    assert "choose --incomplete and/or --unreferenced" in missing_mode.output

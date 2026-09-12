@@ -35,8 +35,9 @@ cache = "persistent"
     )
     out_dir = tmp_path / "out"
 
-    def fake_transcribe(self: object, media_asset: MediaAsset) -> object:
+    def fake_transcribe(self: object, media_asset: MediaAsset, **options: object) -> object:
         del self
+        assert options == {"progress": False}
         return asr_ready(media_asset.id, "Hello from fake ASR.", model="tiny")
 
     monkeypatch.setattr(asr_module.FasterWhisperAsrAdapter, "transcribe", fake_transcribe)

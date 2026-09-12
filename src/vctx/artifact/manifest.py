@@ -9,7 +9,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from vctx.source.session import EffectReceipt, Revision, SourceRecord
+from vctx.options import SourceAssetScope
+from vctx.source.session import EffectReceipt, Revision, SourceCapability, SourceRecord
 
 StepStatus = Literal["ok", "skipped", "warning", "error"]
 RunStatus = Literal["ok", "partial", "error"]
@@ -25,6 +26,12 @@ _RESERVED = {
     "nul",
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
+}
+_SOURCE_CAPABILITIES: dict[str, set[SourceCapability]] = {
+    "source_audio": {"audio"},
+    "source_video": {"video"},
+    "source_media": {"audio", "video"},
+    "subtitle": {"subtitle"},
 }
 
 
@@ -153,6 +160,8 @@ class ManifestSource(ClosedModel):
     artifacts: list[ArtifactRef] = Field(max_length=1024)
     outcomes: list[ProductOutcome] = Field(max_length=128)
     effects: list[ManifestEffect] = Field(max_length=1024)
+    asset_scope: SourceAssetScope | None = None
+    source_capabilities: set[SourceCapability] | None = None
 
     @field_validator("key")
     @classmethod
@@ -165,8 +174,7 @@ class ManifestSource(ClosedModel):
 
     @model_validator(mode="after")
     def source_index_is_consistent(self) -> ManifestSource:
-        if self.path != self.key or PurePosixPath(self.path).parts != (self.key,):
-            raise ValueError("source path must equal its direct-child key")
+        _portable_path(self.path)
         paths = [artifact.path.casefold() for artifact in self.artifacts]
         if len(paths) != len(set(paths)):
             raise ValueError("artifact paths must be unique within a source lane")
@@ -179,9 +187,15 @@ class ManifestSource(ClosedModel):
                 raise ValueError("product outcome references an unlisted artifact")
         return self
 
+    def effective_asset_scope(self) -> SourceAssetScope:
+        retained = any(
+            item.product == "source-assets" and item.status == "ready" for item in self.outcomes
+        )
+        return self.asset_scope or ("consumed" if retained else "omitted")
+
 
 class Manifest(ClosedModel):
-    schema_version: Literal["3"] = "3"
+    schema_version: Literal["3", "4", "5"] = "5"
     tool: Literal["vctx"] = "vctx"
     tool_version: str = Field(min_length=1, max_length=64)
     pack_id: UUID
@@ -193,6 +207,21 @@ class Manifest(ClosedModel):
 
     @model_validator(mode="after")
     def sources_are_unique(self) -> Manifest:
+        for source in self.sources:
+            expected = source.key if self.schema_version in {"3", "5"} else f"sources/{source.key}"
+            if source.path != expected:
+                raise ValueError(f"schema-{self.schema_version} source path must equal {expected}")
+            scope_fields = {"asset_scope", "source_capabilities"}
+            present = scope_fields & source.model_fields_set
+            if self.schema_version == "5" and present != scope_fields:
+                raise ValueError("schema-5 sources require asset scope and capability evidence")
+            if self.schema_version != "5" and present:
+                raise ValueError("schema-3/4 sources cannot contain schema-5 fields")
+            if source.asset_scope == "complete" and (
+                source.source_capabilities is None
+                or not source.source_capabilities <= retained_capabilities(source.artifacts)
+            ):
+                raise ValueError("complete source assets do not cover source capabilities")
         for field in ("id", "key", "path"):
             values = [str(getattr(source, field)).casefold() for source in self.sources]
             if len(values) != len(set(values)):
@@ -206,9 +235,12 @@ class Manifest(ClosedModel):
 
 
 class ManifestBuilder:
-    def __init__(self, source: SourceRecord, key: str, *, offline: bool) -> None:
+    def __init__(
+        self, source: SourceRecord, key: str, *, offline: bool, asset_scope: SourceAssetScope
+    ) -> None:
         self.source = source
         self.key = key
+        self.asset_scope = asset_scope
         self.freshness: Freshness = (
             "immutable"
             if source.revision.kind == "immutable"
@@ -220,20 +252,12 @@ class ManifestBuilder:
         self.outcomes: dict[str, ProductOutcome] = {}
         self.omissions: list[str] = []
 
-    @classmethod
-    def start(cls, source: SourceRecord, key: str, *, offline: bool) -> ManifestBuilder:
-        return cls(source, key, offline=offline)
-
     def add_step(
         self, name: str, status: StepStatus, detail: str | None = None, receipt: object = None
     ) -> None:
         del receipt
-        mapped = {"ok": "succeeded", "warning": "warning", "error": "failed"}.get(
-            status, status
-        )
-        self.effects.append(
-            ManifestEffect(operation=name, status=mapped, diagnostic=detail)
-        )
+        mapped = {"ok": "succeeded", "warning": "warning", "error": "failed"}.get(status, status)
+        self.effects.append(ManifestEffect(operation=name, status=mapped, diagnostic=detail))
 
     def warn(self, message: str) -> None:
         self.omissions.append(message[:500])
@@ -273,6 +297,8 @@ class ManifestBuilder:
                 *(ManifestEffect.from_receipt(receipt) for receipt in receipts),
                 *self.effects,
             ],
+            asset_scope=self.asset_scope,
+            source_capabilities=self.source.source_capabilities,
         )
 
 
@@ -289,6 +315,31 @@ def source_key(source_id: str, occupied: dict[str, str] | None = None) -> str:
         suffix = hashlib.sha256(source_id.encode()).hexdigest()[:10]
         key = f"{key[:46].rstrip('-')}-{suffix}"
     return key
+
+
+def retained_capabilities(artifacts: list[ArtifactRef]) -> set[SourceCapability]:
+    return set().union(*(_SOURCE_CAPABILITIES.get(item.kind, set()) for item in artifacts))
+
+
+def schema_five_source(source: ManifestSource) -> ManifestSource:
+    paths = {artifact.path: artifact.path.removeprefix("assets/") for artifact in source.artifacts}
+    outcomes = [
+        outcome.model_copy(update={"artifacts": [paths[path] for path in outcome.artifacts]})
+        for outcome in source.outcomes
+        if outcome.product != "source-assets"
+    ]
+    return source.model_copy(
+        update={
+            "path": source.key,
+            "artifacts": [
+                artifact.model_copy(update={"path": paths[artifact.path]})
+                for artifact in source.artifacts
+            ],
+            "outcomes": outcomes,
+            "asset_scope": source.effective_asset_scope(),
+            "source_capabilities": source.source_capabilities,
+        }
+    )
 
 
 def build_manifest(
@@ -308,6 +359,7 @@ def build_manifest(
         status = "partial"
     else:
         status = "ok"
+    normalized = [schema_five_source(source) for source in sources]
     return Manifest(
         tool_version=tool_version,
         pack_id=previous.pack_id if previous else uuid4(),
@@ -315,7 +367,7 @@ def build_manifest(
         status=status,
         created_at=previous.created_at if previous else now,
         updated_at=now,
-        sources=sources,
+        sources=normalized,
     )
 
 

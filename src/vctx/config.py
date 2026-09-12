@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tomllib
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -19,21 +18,10 @@ from pydantic import (
 
 from vctx.ai import AiInstanceConfig
 from vctx.errors import ConfigError
+from vctx.options import MediaQuality, PrepareTarget, SourceAssets, SourceAssetScope
 
 type Projection = Literal["context", "read"]
-
-
-class PrepareTarget(StrEnum):
-    TRANSCRIPT = "transcript"
-    EVIDENCE = "evidence"
-    SUMMARY = "summary"
-
-
-class MediaQuality(StrEnum):
-    AUTO = "auto"
-    FAST = "fast"
-    BALANCED = "balanced"
-    HIGH = "high"
+type AsrQuality = Literal["fast", "balanced", "accurate"]
 
 
 class NoSourceSession(BaseModel):
@@ -121,34 +109,31 @@ PlaylistSelection = Annotated[
 ]
 
 
-class YtDlpSourceOptions(BaseModel):
+class ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+
+class YtDlpSourceOptions(ConfigModel):
     session: SourceSession = Field(default_factory=NoSourceSession)
     network: SourceNetwork = Field(default_factory=DirectSourceNetwork)
     playlist: PlaylistSelection = Field(default_factory=DefaultPlaylistSelection)
     subtitle_languages: list[str] = Field(default_factory=list)
 
 
-class RuntimeInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class RuntimeInput(ConfigModel):
     offline: bool = False
     env_files: list[Path] = Field(default_factory=list)
 
 
-class CacheInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CacheInput(ConfigModel):
     source_dir: Path | None = None
     model_dir: Path | None = None
 
 
-class SourceInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SourceInput(ConfigModel):
     yt_dlp: YtDlpSourceOptions = Field(default_factory=YtDlpSourceOptions)
     media_quality: MediaQuality = MediaQuality.AUTO
+
 
 class AutoUse(BaseModel):
     kind: Literal["auto"] = "auto"
@@ -206,13 +191,25 @@ class PrepareRequest(BaseModel):
     projections: set[Projection] | None = None
     target: PrepareTarget = PrepareTarget.TRANSCRIPT
     asr_use: TransformUse | str | None = None
+    asr_quality: AsrQuality | None = None
     ocr_use: TransformUse | str | None = None
     vision_use: TransformUse | str | None = None
     offline: bool | None = None
     config_path: Path | None = None
     subtitle_languages: list[str] = Field(default_factory=list)
     retain_media: bool | None = None
+    source_assets: SourceAssets | None = None
     media_quality: MediaQuality | None = None
+    start_seconds: float | None = Field(default=None, ge=0)
+    end_seconds: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def valid_interval(self) -> PrepareRequest:
+        if self.end_seconds is not None and self.start_seconds is None:
+            self.start_seconds = 0
+        if self.end_seconds is not None and self.end_seconds <= (self.start_seconds or 0):
+            raise ValueError("--end must be greater than --start")
+        return self
 
 
 class RuntimeConfig(BaseModel):
@@ -230,9 +227,7 @@ class SourceConfig(BaseModel):
     media_quality: MediaQuality
 
 
-class CapabilityPolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CapabilityPolicy(ConfigModel):
     enabled: bool
     use: TransformUse = Field(default_factory=AutoUse)
 
@@ -257,11 +252,13 @@ class CapabilityPolicy(BaseModel):
         return isinstance(self.use, AutoUse)
 
 
-class CapabilityInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class CapabilityInput(ConfigModel):
     enabled: StrictBool | None = None
     use: TransformUse = Field(default_factory=AutoUse)
+
+
+class AsrInput(CapabilityInput):
+    quality: AsrQuality = "balanced"
 
 
 def _capability_input(value: object) -> object:
@@ -269,17 +266,14 @@ def _capability_input(value: object) -> object:
 
 
 CapabilitySelection = Annotated[CapabilityInput, BeforeValidator(_capability_input)]
+AsrSelection = Annotated[AsrInput, BeforeValidator(_capability_input)]
 
 
-class TransformInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    asr: CapabilityInput = Field(default_factory=CapabilityInput)
+class TransformInput(ConfigModel):
+    asr: AsrSelection = Field(default_factory=AsrInput)
 
 
-class EvidenceInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class EvidenceInput(ConfigModel):
     planner: CapabilitySelection = Field(default_factory=CapabilityInput)
     vision: CapabilitySelection = Field(default_factory=CapabilityInput)
     ocr: CapabilitySelection = Field(default_factory=CapabilityInput)
@@ -291,9 +285,11 @@ class EvidenceConfig(BaseModel):
     ocr: CapabilityPolicy
 
 
-class SummaryInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class AsrPolicy(CapabilityPolicy):
+    quality: AsrQuality = "balanced"
 
+
+class SummaryInput(ConfigModel):
     use: TransformUse = Field(default_factory=AutoUse)
     language: str = "native"
 
@@ -307,38 +303,29 @@ class OutputConfig(BaseModel):
     projections: set[Projection]
     chunk_max_chars: int
     chunk_max_seconds: int | None
-    retain_media: bool = True
+    source_assets: SourceAssetScope = "consumed"
 
 
-class OutputInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class OutputInput(ConfigModel):
     projections: set[Projection] | None = None
     chunk_max_chars: int | None = None
     chunk_max_seconds: int | None = None
     retain_media: StrictBool | None = None
+    source_assets: SourceAssets | None = None
 
 
-class AsrInstanceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class AsrInstanceConfig(ConfigModel):
     type: AsrInstanceType
     model: str | None = None
-    device: Literal["auto", "cpu", "cuda"] = "auto"
-    compute: str = "auto"
     cache: InstanceCachePolicy = "persistent"
 
 
-class InstanceRegistry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class InstanceRegistry(ConfigModel):
     asr: dict[str, AsrInstanceConfig] = Field(default_factory=dict)
     ai: dict[str, AiInstanceConfig] = Field(default_factory=dict)
 
 
-class ConfigInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ConfigInput(ConfigModel):
     runtime: RuntimeInput = Field(default_factory=RuntimeInput)
     cache: CacheInput = Field(default_factory=CacheInput)
     source: SourceInput = Field(default_factory=SourceInput)
@@ -371,7 +358,7 @@ class ResolvedConfig(BaseModel):
     runtime: RuntimeConfig
     cache: CacheConfig
     source: SourceConfig
-    asr: CapabilityPolicy
+    asr: AsrPolicy
     evidence: EvidenceConfig
     summary: SummaryConfig
     output: OutputConfig
@@ -509,6 +496,11 @@ def _resolve_policy(
     return CapabilityPolicy(enabled=enabled, use=raw.use)
 
 
+def _resolve_asr_policy(raw: AsrInput, enabled: bool) -> AsrPolicy:
+    policy = _resolve_policy(raw, enabled)
+    return AsrPolicy(enabled=policy.enabled, use=policy.use, quality=raw.quality)
+
+
 def _resolve_use(use: TransformUse, enabled: bool) -> CapabilityPolicy:
     return CapabilityPolicy(
         enabled=enabled and not isinstance(use, DisabledUse),
@@ -584,7 +576,10 @@ def _resolve_config(
             update={"subtitle_languages": request.subtitle_languages}
         )
 
-    asr = _resolve_policy(_request_policy(config.transforms.asr, request.asr_use), True)
+    requested_asr = _request_policy(config.transforms.asr, request.asr_use)
+    if request.asr_quality is not None:
+        requested_asr = requested_asr.model_copy(update={"quality": request.asr_quality})
+    asr = _resolve_asr_policy(AsrInput.model_validate(requested_asr), True)
     evidence = EvidenceConfig(
         ocr=_resolve_policy(
             _request_policy(config.evidence.ocr, request.ocr_use),
@@ -602,6 +597,12 @@ def _resolve_config(
     )
     instances = _resolve_instance_registry(config.instances, path_context)
     _validate_instance_compatibility(evidence, summary, instances)
+
+    retain_media = _coalesce(request.retain_media, config.output.retain_media, default=True)
+    requested_assets = request.source_assets or config.output.source_assets or SourceAssets.CONSUMED
+    if not retain_media and requested_assets == SourceAssets.COMPLETE:
+        raise ValueError("complete source assets conflict with deprecated retention opt-out")
+    asset_scope: SourceAssetScope = requested_assets.value if retain_media else "omitted"
 
     return ResolvedConfig(
         target=target,
@@ -629,11 +630,7 @@ def _resolve_config(
                 config.output.chunk_max_seconds,
                 default=None,
             ),
-            retain_media=_coalesce(
-                request.retain_media,
-                config.output.retain_media,
-                default=True,
-            ),
+            source_assets=asset_scope,
         ),
         instances=instances,
     )

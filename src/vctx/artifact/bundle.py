@@ -99,42 +99,43 @@ def write_manifest(root: Path, manifest: Manifest) -> ArtifactRef:
 
 
 def retain_source_files(
-    media: MediaAsset | None,
+    media: Collection[MediaAsset],
     subtitle: TranscriptPayload | None,
     lane: Path,
     *,
     retain: bool,
 ) -> tuple[list[ArtifactRef], list[str]]:
     if not retain:
-        omissions = (
-            ["disabled by --no-retain-media/output.retain_media"]
-            if subtitle is not None or media is not None
-            else []
-        )
-        return [], omissions
+        return [], ["deprecated retention opt-out produced a nonportable pack"]
     written: list[ArtifactRef] = []
     paths: list[Path] = []
     try:
         if subtitle is not None:
             language = _token(subtitle.provenance.language or "und")
-            extension = {"plain": "txt", "unknown": "txt"}.get(
-                subtitle.format, subtitle.format
-            )
+            extension = {"plain": "txt", "unknown": "txt"}.get(subtitle.format, subtitle.format)
             body = subtitle.original_bytes or subtitle.text.encode("utf-8")
-            artifact = Artifact(
-                f"subtitle.{language}.{extension}", "subtitle", "text/plain", body
-            )
+            artifact = Artifact(f"subtitle.{language}.{extension}", "subtitle", "text/plain", body)
             written.append(write_artifact(lane, artifact))
             paths.append(lane / artifact.name)
-        if media is not None:
-            extension = _token(media.container if media.container != "unknown" else "bin")
-            name = f"media.{extension}"
-            source = media.local_path.resolve()
+        seen: set[str] = set()
+        for item in media:
+            identity = item.sha256 or str(item.local_path.resolve()).casefold()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            role = (
+                "media"
+                if {"audio", "video"} <= item.capabilities
+                else "audio"
+                if "audio" in item.capabilities
+                else "video"
+            )
+            extension = _token(item.container if item.container != "unknown" else "bin")
+            name = f"{role}.{extension}"
+            source = item.local_path.resolve()
             if not source.is_file() or source.stat().st_size == 0:
                 raise CacheError(f"source media is missing or empty: {source}")
-            reference = _copy_file(
-                source, lane / name, name, expected=getattr(media, "sha256", None)
-            )
+            reference = _copy_file(source, lane / name, name, expected=item.sha256)
             written.append(reference)
             paths.append(lane / name)
     except (OSError, CacheError) as exc:
@@ -145,7 +146,11 @@ def retain_source_files(
 
 
 def _copy_file(
-    source: Path, final: Path, name: str, *, expected: str | None = None
+    source: Path,
+    final: Path,
+    name: str,
+    *,
+    expected: str | None = None,
 ) -> ArtifactRef:
     final.parent.mkdir(parents=True, exist_ok=True)
     temporary = final.with_name(f".{final.name}.tmp")
@@ -163,11 +168,13 @@ def _copy_file(
     finally:
         temporary.unlink(missing_ok=True)
     return ArtifactRef(
-        kind="media",
+        kind=f"source_{Path(name).stem}",
         path=name,
         media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
         bytes=final.stat().st_size,
         sha256=digest.hexdigest(),
     )
+
+
 def _token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-_").lower() or "unknown"

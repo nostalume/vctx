@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import shutil
 from collections.abc import Mapping
 from copy import deepcopy
@@ -11,8 +12,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
-
-from pydantic import BaseModel
 
 from vctx.config import (
     BrowserSourceSession,
@@ -36,12 +35,18 @@ from vctx.source.session import (
     MediaRequest,
     ObservePermit,
     Revision,
+    SourceCapability,
     SourceRecord,
     SourceRef,
     SubtitlePermit,
     VideoMetadata,
 )
-from vctx.transcript import TranscriptPayload, TranscriptProvenance, detected_language
+from vctx.transcript import (
+    TranscriptPayload,
+    TranscriptProvenance,
+    decode_subtitle,
+    detected_language,
+)
 
 SubtitleKind = Literal["official_subtitles", "automatic_subtitles"]
 YtDlpScalar: TypeAlias = str | int | float | bool | None  # noqa: UP040
@@ -57,19 +62,7 @@ _VISUAL_HEIGHT_CAPS: dict[MediaProfile, int] = {
     "balanced": 720,
     "high": 1080,
 }
-
-
-class DownloadedMediaAsset(BaseModel):
-    id: str
-    source: SourceRef
-    local_path: Path
-    container: str = "unknown"
-    duration_seconds: float | None = None
-    media_type: Literal["audio", "video", "unknown"]
-    purpose: Literal["input", "asr", "visual"]
-    profile: MediaProfile | None = None
-    format_id: str
-    provider: str = "yt-dlp"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,7 +97,7 @@ class YtDlpSession:
             )
             raise NoTranscriptError(f"no subtitles found for input: {self.record.metadata.id}")
         try:
-            text = _read_subtitle_text(candidate.url, net=self.net)
+            text = self._read_subtitle_text(candidate.url)
         except (NetError, UnicodeError, NoTranscriptError) as exc:
             attempts = exc.attempts if isinstance(exc, NetError) else 1
             self.receipts.append(
@@ -135,6 +128,40 @@ class YtDlpSession:
             ),
         )
 
+    def _read_subtitle_text(self, url: str) -> str:
+        text = self._fetch_text(url)
+        if _is_hls_playlist(text):
+            return self._read_hls_vtt_playlist(url, text)
+        return text
+
+    def _fetch_text(self, url: str) -> str:
+        response = self.net.request(
+            NetRequest(
+                method="GET",
+                url=url,
+                timeout_s=30,
+                purpose="subtitle_fetch",
+                provider_id="yt-dlp",
+                retry=RetryPolicy(
+                    max_attempts=3,
+                    statuses=(429, 500, 502, 503, 504),
+                    retry_connect=True,
+                    retry_timeouts=True,
+                ),
+            )
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            raise NoTranscriptError(f"subtitle fetch failed: HTTP {response.status_code}")
+        return decode_subtitle(response.body, "utf-8-sig")
+
+    def _read_hls_vtt_playlist(self, playlist_url: str, playlist_text: str) -> str:
+        segments = [
+            _strip_vtt_header(self._fetch_text(segment_url))
+            for segment_url in _hls_segment_urls(playlist_url, playlist_text)
+        ]
+        cues = [segment.strip() for segment in segments if segment.strip()]
+        return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+
     def media(self, *, request: MediaRequest, permit: MediaPermit) -> MediaAsset:
         if permit.network == "denied":
             self.receipts.append(_media_receipt(request, status="denied"))
@@ -155,11 +182,9 @@ class YtDlpSession:
             with yt_dlp.YoutubeDL(params) as ydl:
                 raw_info = ydl.process_ie_result(deepcopy(self.info), download=True)
         except yt_dlp.utils.DownloadError as exc:
-            _cleanup_parts(planned.temp_dir)
             self.receipts.append(_media_receipt(request, status="failed", attempts=1))
             raise ProviderError(f"yt-dlp media fetch failed: {exc}") from exc
         except KeyboardInterrupt:
-            _cleanup_parts(planned.temp_dir)
             self.receipts.append(_media_receipt(request, status="failed", attempts=1))
             raise OperationCancelledError("media fetch cancelled") from None
         info = _info_dict(raw_info)
@@ -200,7 +225,7 @@ class YtDlpSourceAdapter:
             )
         yt_dlp = _yt_dlp()
         try:
-            info = _extract_info(value, options)
+            info = self._extract_info(value, options)
         except yt_dlp.utils.DownloadError as exc:
             raise ProviderError(f"yt-dlp observation failed: {exc}") from exc
         return YtDlpSession(
@@ -210,6 +235,19 @@ class YtDlpSourceAdapter:
             net=self._net,
             receipts=[EffectReceipt(operation="observe", status="succeeded", attempts=1)],
         )
+
+    def _extract_info(self, value: str, options: YtDlpSourceOptions) -> YtDlpInfo:
+        params: YtDlpParams = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "retries": 2,
+            "fragment_retries": 2,
+            "socket_timeout": 30,
+        }
+        _apply_source_options(params, options)
+        with _yt_dlp().YoutubeDL(params) as ydl:
+            return _info_dict(ydl.extract_info(value, download=False))
 
 
 def _download_params(request: MediaRequest, options: YtDlpSourceOptions) -> YtDlpParams:
@@ -224,6 +262,8 @@ def _download_params(request: MediaRequest, options: YtDlpSourceOptions) -> YtDl
         "continuedl": True,
         "part": True,
         "overwrites": False,
+        "concurrent_fragment_downloads": 8,
+        "progress_hooks": [_progress_hook],
     }
     _apply_source_options(params, options)
     if request.kind == "asr_audio":
@@ -298,11 +338,14 @@ def _has_space(path: Path, estimate: int) -> bool:
     return estimate <= max(0, usage.free - reserve)
 
 
-def _cleanup_parts(temp_dir: Path | None) -> None:
-    if temp_dir is None or not temp_dir.is_dir():
-        return
-    for part in temp_dir.glob("*.part"):
-        part.unlink(missing_ok=True)
+def _progress_hook(event: dict[str, object]) -> None:
+    status = event.get("status")
+    downloaded = event.get("downloaded_bytes")
+    total = event.get("total_bytes") or event.get("total_bytes_estimate")
+    if status == "downloading" and isinstance(downloaded, int) and isinstance(total, int):
+        logger.info("source.media progress=%s/%s", downloaded, total)
+    elif status == "finished":
+        logger.info("source.media progress=finished")
 
 
 def _media_receipt(
@@ -338,26 +381,28 @@ def _downloaded_asset(
     duration = _as_optional_float(info.get("duration"))
     source = SourceRef(kind="url", value=source_url)
     if request.kind == "asr_audio":
-        return DownloadedMediaAsset(
+        return MediaAsset(
             id=_media_id(info),
             source=source,
             local_path=path,
             container=container,
             duration_seconds=duration,
-            media_type="audio",
             purpose="asr",
             format_id=format_id,
+            provider="yt-dlp",
+            capabilities={"audio"},
         )
-    return DownloadedMediaAsset(
+    return MediaAsset(
         id=_media_id(info),
         source=source,
         local_path=path,
         container=container,
         duration_seconds=duration,
-        media_type="video",
         purpose="visual",
         profile=request.profile,
         format_id=format_id,
+        provider="yt-dlp",
+        capabilities={"video"},
     )
 
 
@@ -374,21 +419,6 @@ def _downloaded_media_path(info: YtDlpInfo) -> Path | None:
             return Path(path)
     filepath = _as_optional_str(info.get("filepath")) or _as_optional_str(info.get("_filename"))
     return Path(filepath) if filepath else None
-
-
-def _extract_info(value: str, options: YtDlpSourceOptions) -> YtDlpInfo:
-    params: YtDlpParams = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 30,
-    }
-    _apply_source_options(params, options)
-    with _yt_dlp().YoutubeDL(params) as ydl:
-        raw_info = ydl.extract_info(value, download=False)
-    return _info_dict(raw_info)
 
 
 def _yt_dlp() -> Any:
@@ -428,9 +458,18 @@ def _source_record(locator: str, info: YtDlpInfo) -> SourceRecord:
         observed_at=datetime.now(UTC),
         metadata=metadata,
         lifecycle=lifecycle,
-        has_subtitles=bool(fingerprint["subtitles"]),
-        has_media=bool(fingerprint["formats"]) or metadata.duration_seconds is not None,
+        source_capabilities=_source_capabilities(info),
     )
+
+
+def _source_capabilities(info: Mapping[str, YtDlpValue]) -> set[SourceCapability] | None:
+    capabilities: set[SourceCapability] = {"subtitle"} if _subtitle_facts(info) else set()
+    formats = [_mapping_value(value) for value in _list_value(info.get("formats"))]
+    if any(item and _as_optional_str(item.get("acodec")) != "none" for item in formats):
+        capabilities.add("audio")
+    if any(item and _as_optional_str(item.get("vcodec")) != "none" for item in formats):
+        capabilities.add("video")
+    return capabilities or None
 
 
 def _sanitize_url(value: str, *, extractor: str | None) -> str:
@@ -557,45 +596,8 @@ def _normalize_subtitle_ext(
     return "unknown"
 
 
-def _read_subtitle_text(url: str, *, net: NetRuntime) -> str:
-    text = _fetch_text(url, net=net)
-    if _is_hls_playlist(text):
-        return _read_hls_vtt_playlist(url, text, net=net)
-    return text
-
-
-def _fetch_text(url: str, *, net: NetRuntime) -> str:
-    response = net.request(
-        NetRequest(
-            method="GET",
-            url=url,
-            timeout_s=30,
-            purpose="subtitle_fetch",
-            provider_id="yt-dlp",
-            retry=RetryPolicy(
-                max_attempts=3,
-                statuses=(429, 500, 502, 503, 504),
-                retry_connect=True,
-                retry_timeouts=True,
-            ),
-        )
-    )
-    if response.status_code < 200 or response.status_code >= 300:
-        raise NoTranscriptError(f"subtitle fetch failed: HTTP {response.status_code}")
-    return response.body.decode("utf-8-sig")
-
-
 def _is_hls_playlist(text: str) -> bool:
     return text.lstrip().startswith("#EXTM3U")
-
-
-def _read_hls_vtt_playlist(playlist_url: str, playlist_text: str, *, net: NetRuntime) -> str:
-    segment_urls = _hls_segment_urls(playlist_url, playlist_text)
-    segments = [
-        _strip_vtt_header(_fetch_text(segment_url, net=net)) for segment_url in segment_urls
-    ]
-    cues = [segment.strip() for segment in segments if segment.strip()]
-    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
 
 
 def _hls_segment_urls(playlist_url: str, playlist_text: str) -> list[str]:

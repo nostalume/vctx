@@ -17,7 +17,13 @@ Files are selected one at a time and are never merged.
 vctx doctor --config docs/examples/local-full.toml --to evidence --json
 vctx models pull asr ocr --config docs/examples/local-full.toml
 vctx prepare VIDEO --out pack --to summary --config docs/examples/local-full.toml
+vctx prepare VIDEO --out pack --source-assets complete --config docs/examples/local-full.toml
 ```
+
+The last command explicitly retains every source role reported for the admitted
+revision. It may download much more data than the default `consumed` scope. Source
+audio, video, combined media, and native subtitles are stored directly beside the
+lane's canonical products and indexed only by `manifest.json`.
 
 Relative paths inside a config are resolved from that config's directory. Never
 put secret values in TOML: use `env:NAME`, `keyring:NAME`, or `vctx auth

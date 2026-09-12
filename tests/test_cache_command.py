@@ -10,6 +10,7 @@ from vctx.cli import app
 
 runner = CliRunner()
 
+
 def test_cache_status_missing_is_empty_and_read_only(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
 
@@ -17,6 +18,7 @@ def test_cache_status_missing_is_empty_and_read_only(tmp_path: Path) -> None:
 
     assert result.exit_code == 0 and not any(json.loads(result.output).values())
     assert not cache.exists()
+
 
 def test_cache_prune_dry_run_matches_real_orphan_cleanup_and_ignores_models(
     tmp_path: Path,
@@ -32,9 +34,7 @@ def test_cache_prune_dry_run_matches_real_orphan_cleanup_and_ignores_models(
     model.parent.mkdir()
     model.write_bytes(b"model")
 
-    dry = runner.invoke(
-        app, ["cache", "prune", "--cache-dir", str(cache), "--dry-run", "--json"]
-    )
+    dry = runner.invoke(app, ["cache", "prune", "--cache-dir", str(cache), "--dry-run", "--json"])
     real = runner.invoke(app, ["cache", "prune", "--cache-dir", str(cache), "--json"])
 
     assert dry.exit_code == real.exit_code == 0
@@ -54,6 +54,7 @@ def test_cache_prune_dry_run_matches_real_orphan_cleanup_and_ignores_models(
     assert model.read_bytes() == b"model"
     assert not list(blobs.iterdir()) and not list(temporary.iterdir())
 
+
 def test_cache_prune_rejects_invalid_age_and_unowned_blob_name(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     blobs = cache / "source" / "blobs"
@@ -61,15 +62,14 @@ def test_cache_prune_rejects_invalid_age_and_unowned_blob_name(tmp_path: Path) -
     suspect = blobs / "outside"
     suspect.write_bytes(b"keep")
 
-    age = runner.invoke(
-        app, ["cache", "prune", "--cache-dir", str(cache), "--age", "30", "--json"]
-    )
+    age = runner.invoke(app, ["cache", "prune", "--cache-dir", str(cache), "--age", "30", "--json"])
     prune = runner.invoke(app, ["cache", "prune", "--cache-dir", str(cache), "--json"])
 
     assert age.exit_code == 2
     assert "positive duration" in age.output
     assert prune.exit_code == 5
     assert suspect.read_bytes() == b"keep"
+
 
 def test_cache_status_reports_corrupt_catalog_without_replacing_it(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
@@ -81,6 +81,7 @@ def test_cache_status_reports_corrupt_catalog_without_replacing_it(tmp_path: Pat
 
     assert result.exit_code == 5
     assert catalog.read_bytes() == b"not sqlite"
+
 
 def test_cache_prune_reports_deletion_failure_and_keeps_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -104,6 +105,7 @@ def test_cache_prune_reports_deletion_failure_and_keeps_candidate(
     assert receipt["selected"] == 1 and receipt["removed"] == 0
     assert receipt["reclaimed_bytes"] == 0 and receipt["failures"]
     assert blob.read_bytes() == b"keep"
+
 
 def test_cli_cache_base_overrides_config(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)

@@ -19,10 +19,19 @@ from vctx.summary import (
 )
 from vctx.transcript import Transcript
 from vctx.visual.frame import Frame, FrameBatch
-from vctx.visual.ocr import OcrOutcome, OcrRuntimePool, RapidOcr
 from vctx.visual.plan import EvidenceClaim, EvidencePlan, PlannedFrame
+from vctx.visual.processors import OcrOutcome, OcrRuntimePool, RapidOcr
 
 runner = CliRunner()
+
+
+class _EmptyKeyring:
+    priority = 1
+
+    def get_password(self, _service: str, _account: str) -> None:
+        return None
+
+
 _PNG = b"\x89PNG\r\n\x1a\nfixture"
 
 
@@ -53,8 +62,9 @@ model = "planner"
         encoding="utf-8",
     )
 
-    def fake_transcribe(self: object, asset: MediaAsset) -> object:
+    def fake_transcribe(self: object, asset: MediaAsset, **options: object) -> object:
         del self
+        assert options == {"progress": False}
         return asr_ready_segments(asset.id, [(0, 4, "原生文本")])
 
     def fake_plan(*_args: object) -> EvidencePlan:
@@ -164,8 +174,10 @@ model = "planner"
 
 @pytest.mark.parametrize("target", ["evidence", "summary"])
 def test_model_target_without_route_is_transcript_only_partial(
-    tmp_path: Path, target: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
 ) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("vctx.app.run.system_keyring", lambda: _EmptyKeyring())
     subtitle = tmp_path / "lecture.srt"
     subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\nNo model inference.\n", encoding="utf-8")
     out = tmp_path / "out"
@@ -186,9 +198,7 @@ def test_model_target_without_route_is_transcript_only_partial(
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     lane = out / manifest["sources"][0]["path"]
     assert manifest["sources"][0]["status"] == "partial"
-    outcome = next(
-        item for item in manifest["sources"][0]["outcomes"] if item["product"] == target
-    )
+    outcome = next(item for item in manifest["sources"][0]["outcomes"] if item["product"] == target)
     assert outcome["status"] == "unavailable"
     assert not (lane / "evidence-plan.json").exists()
     assert not (lane / "evidence.json").exists()
@@ -200,9 +210,7 @@ def test_summary_target_publishes_cited_summary_with_earlier_products(
     import vctx.app.evidence as evidence_app
 
     subtitle = tmp_path / "lecture.srt"
-    subtitle.write_text(
-        "1\n00:00:00,000 --> 00:00:02,000\nSource words.\n", encoding="utf-8"
-    )
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\nSource words.\n", encoding="utf-8")
     config = tmp_path / "vctx.toml"
     config.write_text(
         """

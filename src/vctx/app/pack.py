@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from vctx.app.prepare import SourcePrepared, prepare_source
+from vctx.app.prepare import PreparePipeline, SourcePrepared
 from vctx.app.progress import phase
-from vctx.app.run import RunRuntimes
+from vctx.app.run import RunRuntimes, open_prepare_run
 from vctx.artifact.bundle import write_manifest
 from vctx.artifact.manifest import Manifest, ManifestEffect, RunFailure, build_manifest
 from vctx.artifact.publish import PackPublisher, VerificationReport, verify_pack
@@ -30,9 +30,7 @@ class PrepareResult:
     def render_cli(self) -> str:
         label = "partial context pack" if self.manifest.status == "partial" else "context pack"
         config = (
-            str(self.config_path)
-            if self.config_path is not None
-            else "built-in defaults + CLI"
+            str(self.config_path) if self.config_path is not None else "built-in defaults + CLI"
         )
         lines = [
             f"Wrote {label}: {self.out_dir}",
@@ -90,15 +88,11 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
                         update={"inputs": [value], "out_dir": publisher.stage}
                     )
                     try:
-                        result = prepare_source(
-                            source_request,
-                            resolved,
-                            occupied,
+                        run = open_prepare_run(source_request, resolved, occupied, runtimes)
+                        result = PreparePipeline(run).prepare(
                             completed,
-                            runtimes,
                             previous_by_id,
-                            publisher.reset_lane,
-                            publisher.rollback_lane,
+                            publisher,
                         )
                     except OperationCancelledError:
                         raise
@@ -110,7 +104,7 @@ def prepare_context_pack(request: PrepareRequest) -> PrepareResult:
                         if disputed is not None:
                             results.remove(disputed)
                             failures.append(_run_failure(disputed.input_value, exc))
-                        publisher.rollback_lane(exc.key)
+                        publisher.reset_lane(exc.key)
                         failures.append(_run_failure(value, exc))
                         continue
                     except VctxError as exc:

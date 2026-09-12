@@ -47,7 +47,14 @@ def test_prepare_url_without_subtitles_writes_metadata_partial_pack(
 
     result = runner.invoke(
         app,
-        ["prepare", "https://video.example/watch?v=abc", "--out", str(out_dir)],
+        [
+            "prepare",
+            "https://video.example/watch?v=abc",
+            "--out",
+            str(out_dir),
+            "--asr",
+            "none",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -108,14 +115,10 @@ def test_prepare_offline_url_cache_miss_has_no_effect_or_partial_pack(
 
 def test_prepare_offline_accepts_local_input(tmp_path: Path) -> None:
     source = tmp_path / "local.srt"
-    source.write_text(
-        "1\n00:00:00,000 --> 00:00:01,000\nlocal only\n", encoding="utf-8"
-    )
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\nlocal only\n", encoding="utf-8")
     out_dir = tmp_path / "out"
 
-    result = runner.invoke(
-        app, ["prepare", str(source), "--out", str(out_dir), "--offline"]
-    )
+    result = runner.invoke(app, ["prepare", str(source), "--out", str(out_dir), "--offline"])
 
     assert result.exit_code == 0, result.output
     assert (out_dir / "manifest.json").exists()

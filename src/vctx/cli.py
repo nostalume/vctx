@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, Annotated, Any
 import typer
 
 from vctx.errors import VctxError
+from vctx.options import MediaQuality, PrepareTarget, SourceAssets
 
 if TYPE_CHECKING:
     from vctx.app.auth import OpenRouterAuth
     from vctx.net import NetRuntime
+
 
 class RenderFormat(StrEnum):
     CONTEXT = "context"
@@ -20,17 +22,11 @@ class RenderFormat(StrEnum):
     TRANSCRIPT = "transcript"
 
 
-class PrepareTarget(StrEnum):
-    TRANSCRIPT = "transcript"
-    EVIDENCE = "evidence"
-    SUMMARY = "summary"
-
-
-class MediaQuality(StrEnum):
-    AUTO = "auto"
+class AsrQualityOption(StrEnum):
     FAST = "fast"
     BALANCED = "balanced"
-    HIGH = "high"
+    ACCURATE = "accurate"
+
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 models_app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
@@ -118,9 +114,7 @@ def cache_prune_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     report = _call(
-        lambda: _cache(cache_dir, config).prune(
-            age=age, all_records=all_records, dry_run=dry_run
-        )
+        lambda: _cache(cache_dir, config).prune(age=age, all_records=all_records, dry_run=dry_run)
     )
     typer.echo(_render_cache(report, json_output), nl=False)
 
@@ -132,8 +126,28 @@ def models_pull_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
+    conservative: Annotated[
+        bool, typer.Option("--conservative", help="Disable high-performance Xet mode.")
+    ] = False,
+    refresh: Annotated[
+        bool, typer.Option("--refresh", help="Revalidate and download again.")
+    ] = False,
+    max_runtime: Annotated[
+        int, typer.Option("--max-runtime", min=1, max=86400, help="Hub child limit in seconds.")
+    ] = 3600,
 ) -> None:
-    receipts = _call(lambda: _models(cache_dir, config, asr).pull(capabilities))
+    from vctx.model.store import ModelStore
+
+    cache_root, asr_model_id = _models(cache_dir, config, asr)
+    receipts = _call(
+        lambda: ModelStore(cache_root).pull(
+            capabilities,
+            asr_model_id=asr_model_id,
+            conservative=conservative,
+            refresh=refresh,
+            max_runtime=max_runtime,
+        )
+    )
     typer.echo(_render_models(receipts, json_output), nl=False)
 
 
@@ -145,7 +159,10 @@ def models_status_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    receipts = _call(lambda: _models(cache_dir, config, asr).status(capabilities))
+    from vctx.model.store import ModelStore
+
+    cache_root, asr_model_id = _models(cache_dir, config, asr)
+    receipts = _call(lambda: ModelStore(cache_root).status(capabilities, asr_model_id=asr_model_id))
     typer.echo(_render_models(receipts, json_output), nl=False)
 
 
@@ -157,8 +174,45 @@ def models_verify_command(
     config: Annotated[Path | None, typer.Option("--config")] = None,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
 ) -> None:
-    receipts = _call(lambda: _models(cache_dir, config, asr).verify(capabilities))
+    from vctx.model.store import ModelStore
+
+    cache_root, asr_model_id = _models(cache_dir, config, asr)
+    receipts = _call(lambda: ModelStore(cache_root).verify(capabilities, asr_model_id=asr_model_id))
     typer.echo(_render_models(receipts, json_output), nl=False)
+
+
+@models_app.command("prune")
+def models_prune_command(
+    incomplete: Annotated[
+        bool, typer.Option("--incomplete", help="Remove recoverable incomplete pulls.")
+    ] = False,
+    unreferenced: Annotated[
+        bool, typer.Option("--unreferenced", help="Remove generations with no receipt.")
+    ] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    asr: Annotated[str | None, typer.Option("--asr")] = None,
+) -> None:
+    from vctx.model.store import ModelStore
+
+    if not incomplete and not unreferenced:
+        typer.echo("error: choose --incomplete and/or --unreferenced", err=True)
+        raise typer.Exit(2)
+    cache_root, _asr_model_id = _models(cache_dir, config, asr)
+    report = _call(
+        lambda: ModelStore(cache_root).prune(
+            incomplete=incomplete,
+            unreferenced=unreferenced,
+            dry_run=dry_run,
+        )
+    )
+    if json_output:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    action = "would prune" if dry_run else "pruned"
+    typer.echo(f"{action} {report.count} model path(s), {report.bytes} bytes")
 
 
 @app.command("prepare")
@@ -172,28 +226,36 @@ def prepare_command(
     media_quality: Annotated[MediaQuality | None, typer.Option("--media-quality")] = None,
     target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
     asr: Annotated[str | None, typer.Option("--asr", help="ASR selector.")] = None,
+    asr_quality: Annotated[
+        AsrQualityOption | None, typer.Option("--asr-quality", help="Transcript quality intent.")
+    ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision", help="Vision selector.")] = None,
-    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    source_assets: Annotated[
+        SourceAssets | None,
+        typer.Option("--source-assets", help="Retain consumed or complete source assets."),
+    ] = None,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     offline: Annotated[bool | None, typer.Option("--offline", help="Deny network routes.")] = None,
     config: Annotated[Path | None, typer.Option("--config", help="TOML config file.")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", help="INFO logs to stderr.")] = False,
     debug: Annotated[bool, typer.Option("--debug", help="DEBUG logs to stderr.")] = False,
     log_file: Annotated[Path | None, typer.Option("--log-file", help="Write logs to file.")] = None,
+    profile_json: Annotated[
+        Path | None, typer.Option("--profile-json", help="Write JSONL phase events.")
+    ] = None,
+    max_runtime: Annotated[
+        int | None,
+        typer.Option("--max-runtime", min=1, max=86400, help="Hard wall-clock limit in seconds."),
+    ] = None,
+    start: Annotated[
+        float | None, typer.Option("--start", min=0, help="ASR start in seconds.")
+    ] = None,
+    end: Annotated[float | None, typer.Option("--end", min=0, help="ASR end in seconds.")] = None,
 ) -> None:
-    from vctx.app.pack import prepare_context_pack
     from vctx.app.progress import configure_logging
-    from vctx.config import (
-        MediaQuality as ConfigMediaQuality,
-    )
-    from vctx.config import (
-        PrepareRequest,
-    )
-    from vctx.config import (
-        PrepareTarget as ConfigPrepareTarget,
-    )
+    from vctx.config import PrepareRequest
 
-    configure_logging(verbose=verbose, debug=debug, log_file=log_file)
     request = PrepareRequest(
         inputs=inputs,
         out_dir=out,
@@ -201,16 +263,46 @@ def prepare_command(
         chunk_max_chars=chunk_max_chars,
         chunk_max_seconds=chunk_max_seconds,
         cache_dir=cache_dir,
-        media_quality=(
-            ConfigMediaQuality(media_quality.value) if media_quality is not None else None
-        ),
-        target=ConfigPrepareTarget(target.value),
+        media_quality=media_quality,
+        target=target,
         asr_use=asr,
+        asr_quality=asr_quality.value if asr_quality is not None else None,
         ocr_use=ocr,
         vision_use=vision,
+        source_assets=source_assets,
         retain_media=False if no_retain_media else None,
         offline=offline,
         config_path=config,
+        start_seconds=start,
+        end_seconds=end,
+    )
+    if max_runtime is not None:
+        from vctx.prepare_worker import supervise_prepare
+
+        outcome = supervise_prepare(
+            request,
+            timeout_s=max_runtime,
+            verbose=verbose,
+            debug=debug,
+            log_file=log_file,
+            profile_json=profile_json,
+            stderr_sink=lambda block: typer.echo(
+                block.decode(errors="replace"), err=True, nl=False
+            ),
+        )
+        if outcome.returncode == 124:
+            typer.echo("error: deadline_exceeded: prepare exceeded --max-runtime", err=True)
+        if outcome.returncode:
+            raise typer.Exit(outcome.returncode)
+        typer.echo(outcome.stdout.decode(errors="replace"), nl=False)
+        return
+    from vctx.app.pack import prepare_context_pack
+
+    configure_logging(
+        verbose=verbose,
+        debug=debug,
+        log_file=log_file,
+        profile_json=profile_json,
     )
     result = _call(lambda: prepare_context_pack(request))
     typer.echo(result.render_cli(), nl=False)
@@ -268,7 +360,9 @@ def render_command(
 
 
 @app.command("verify")
-def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3 context pack.")]) -> None:
+def verify_command(
+    pack: Annotated[Path, typer.Argument(help="Schema-3/4/5 context pack.")],
+) -> None:
     from vctx.app.pack import verify_context_pack
 
     report = _call(lambda: verify_context_pack(pack))
@@ -282,25 +376,30 @@ def verify_command(pack: Annotated[Path, typer.Argument(help="Schema-3 context p
 def doctor_command(
     target: Annotated[PrepareTarget, typer.Option("--to")] = PrepareTarget.TRANSCRIPT,
     asr: Annotated[str | None, typer.Option("--asr")] = None,
+    asr_quality: Annotated[
+        AsrQualityOption | None, typer.Option("--asr-quality", help="Transcript quality intent.")
+    ] = None,
     ocr: Annotated[str | None, typer.Option("--ocr")] = None,
     vision: Annotated[str | None, typer.Option("--vision")] = None,
+    source_assets: Annotated[SourceAssets | None, typer.Option("--source-assets")] = None,
     offline: Annotated[bool | None, typer.Option("--offline")] = None,
-    no_retain_media: Annotated[bool, typer.Option("--no-retain-media")] = False,
+    no_retain_media: Annotated[bool, typer.Option("--no-retain-media", hidden=True)] = False,
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     from vctx.app.doctor import doctor_report
-    from vctx.config import PrepareTarget as ConfigPrepareTarget
 
     typer.echo(
         doctor_report(
             config_path=config,
             cache_dir=cache_dir,
-            target=ConfigPrepareTarget(target.value),
+            target=target,
             asr=asr,
+            asr_quality=asr_quality.value if asr_quality is not None else None,
             ocr=ocr,
             vision=vision,
+            source_assets=source_assets,
             offline=offline,
             retain_media=False if no_retain_media else None,
             json_output=json_output,
@@ -323,8 +422,11 @@ def _resolved(cache_dir: Path | None, config: Path | None, *, asr: str | None = 
 
     return load_resolved_config(
         PrepareRequest(
-            inputs=["operation"], out_dir=Path("."), cache_dir=cache_dir,
-            config_path=config, asr_use=asr,
+            inputs=["operation"],
+            out_dir=Path("."),
+            cache_dir=cache_dir,
+            config_path=config,
+            asr_use=asr,
         )
     )
 
@@ -336,9 +438,10 @@ def _cache(cache_dir: Path | None, config: Path | None):
 
 
 def _models(cache_dir: Path | None, config: Path | None, asr: str | None):
-    from vctx.app.models import Models
+    from vctx.app.models import select_asr_model_id
 
-    return Models.open(_resolved(cache_dir, config, asr=asr))
+    resolved = _resolved(cache_dir, config, asr=asr)
+    return resolved.cache.model_dir, select_asr_model_id(resolved)
 
 
 def _render_models(receipts: Any, json_output: bool) -> str:

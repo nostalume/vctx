@@ -32,3 +32,8 @@ def test_source_selection_is_syntax_only_and_opening_owns_filesystem_effect(
             options=YtDlpSourceOptions(),
             net=_NoNetwork(),
         )
+
+
+def test_exact_public_bilibili_video_is_selected_before_ytdlp() -> None:
+    assert select_source("https://www.bilibili.com/video/BV1Tpbj6eEDZ") == "bilibili"
+    assert select_source("https://www.bilibili.example/video/BV1Tpbj6eEDZ") == "yt-dlp"

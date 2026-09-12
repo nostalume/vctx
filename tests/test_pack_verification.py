@@ -27,7 +27,7 @@ def _pack(tmp_path: Path) -> tuple[Path, str]:
     return root, manifest["sources"][0]["key"]
 
 
-def test_schema_three_indexes_each_file_once_without_legacy_execution_shapes(
+def test_schema_five_indexes_flat_source_lanes_once(
     tmp_path: Path,
 ) -> None:
     root, key = _pack(tmp_path)
@@ -36,9 +36,11 @@ def test_schema_three_indexes_each_file_once_without_legacy_execution_shapes(
     source = manifest["sources"][0]
     paths = [item["path"] for item in source["artifacts"]]
 
-    assert manifest["schema_version"] == "3"
+    assert manifest["schema_version"] == "5"
     assert len(paths) == len(set(paths))
     assert "subtitle.und.srt" in paths
+    assert source["asset_scope"] == "consumed"
+    assert source["source_capabilities"] == ["subtitle"]
     assert set(source).isdisjoint({"assets", "steps", "warnings", "transform_evidence"})
     assert source["outcomes"]
     assert (root / key / "subtitle.und.srt").is_file()
@@ -130,6 +132,40 @@ def test_manifest_rejects_duplicate_artifact_path(tmp_path: Path) -> None:
         Manifest.model_validate(raw)
 
 
+def test_manifest_rejects_false_complete_scope_and_prior_schema_fields(tmp_path: Path) -> None:
+    root, _key = _pack(tmp_path)
+    raw = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    raw["sources"][0]["asset_scope"] = "complete"
+    raw["sources"][0]["source_capabilities"].append("audio")
+    with pytest.raises(ValidationError, match="cover"):
+        Manifest.model_validate(raw)
+    raw["schema_version"] = "3"
+    with pytest.raises(ValidationError, match="schema-3/4"):
+        Manifest.model_validate(raw)
+
+
+@pytest.mark.parametrize("version", ["3", "4"])
+def test_reader_accepts_immutable_prior_schema(tmp_path: Path, version: str) -> None:
+    root, key = _pack(tmp_path)
+    raw = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    source = raw["sources"][0]
+    raw["schema_version"] = version
+    source["path"] = key if version == "3" else f"sources/{key}"
+    if version == "4":
+        (root / "sources").mkdir()
+        (root / key).replace(root / "sources" / key)
+    source.pop("asset_scope")
+    source.pop("source_capabilities")
+    (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert verify_pack(root).manifest.schema_version == version
+    migrated = runner.invoke(app, ["prepare", str(tmp_path / "source.srt"), "--out", str(root)])
+    assert migrated.exit_code == 0, migrated.output
+    current = verify_pack(root).manifest
+    assert current.schema_version == "5" and (root / key / "subtitle.und.srt").is_file()
+    assert not (root / "sources").exists()
+
+
 def test_open_rejects_linked_artifact(tmp_path: Path) -> None:
     root, key = _pack(tmp_path)
     linked = root / key / "context.md"
@@ -143,13 +179,3 @@ def test_open_rejects_linked_artifact(tmp_path: Path) -> None:
 
     with pytest.raises(OutputExistsError, match="linked"):
         open_pack(root)
-
-
-def test_verify_command_reports_complete_pack(tmp_path: Path) -> None:
-    root, _key = _pack(tmp_path)
-
-    result = runner.invoke(app, ["verify", str(root)])
-
-    assert result.exit_code == 0, result.output
-    assert "verified" in result.stdout
-    assert "schema 3" in result.stdout

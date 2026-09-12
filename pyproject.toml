@@ -1,6 +1,6 @@
 [project]
 name = "vctx"
-version = "0.3.0"
+version = "0.4.0"
 description = "Video to context pack CLI for AI agents and automation."
 readme = "README.md"
 license = "MIT"
@@ -20,12 +20,24 @@ dependencies = [
     "yt-dlp>=2026.3.17",
 ]
 
+[project.urls]
+Homepage = "https://github.com/nostalume/vctx"
+Documentation = "https://github.com/nostalume/vctx/blob/main/docs/api.md"
+Source = "https://github.com/nostalume/vctx"
+Issues = "https://github.com/nostalume/vctx/issues"
+Changelog = "https://github.com/nostalume/vctx/blob/main/CHANGELOG.md"
+
 [project.scripts]
 vctx = "vctx.cli:main"
 
 [project.optional-dependencies]
 asr = [
     "faster-whisper>=1.2.1",
+]
+asr-cuda = [
+    "faster-whisper>=1.2.1",
+    "nvidia-cublas-cu12>=12.9.2.10; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12>=9.25.1.1; sys_platform == 'win32'",
 ]
 visual = [
     "av>=18.0.0",
@@ -36,6 +48,8 @@ visual = [
 full = [
     "av>=18.0.0",
     "faster-whisper>=1.2.1",
+    "nvidia-cublas-cu12>=12.9.2.10; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12>=9.25.1.1; sys_platform == 'win32'",
     "onnxruntime>=1.20.0",
     "pillow>=12.0.0",
     "rapidocr>=3.4.2",
@@ -63,6 +77,7 @@ include = [
     "src/vctx",
     "LICENSE",
     "README.md",
+    "CHANGELOG.md",
     "docs/api.md",
     "docs/examples",
     "pyproject.toml",

@@ -1,7 +1,7 @@
 # vctx CLI and artifact contract
 
 `vctx` is a one-shot context compiler. Its stable integration surfaces are the
-installed CLI and schema-3 output pack. Python modules are internal.
+installed CLI and schema-5 output pack. Python modules are internal.
 
 ## Workflow
 
@@ -38,17 +38,50 @@ uv tool install "vctx[full]"
 | core | Local/URL subtitles, source cache, compatible AI routes |
 | asr | Core plus local faster-whisper |
 | visual | Core plus PyAV frames and RapidOCR |
-| full | Normalized union of ASR and visual |
+| full | ASR (including Windows CUDA libraries) and visual capabilities |
 
 PyAV decodes video in-process. No host FFmpeg executable is required. Normal
 `prepare` never downloads models; use `models pull` explicitly.
+Use the `asr-cuda` extra on Windows for project-local CUDA 12/cuDNN 9 libraries. The
+runtime discovers them without mutating `PATH`; `doctor --json` reports their state.
+
+## Migrating from 0.3 to 0.4
+
+Upgrade a uv tool installation with `uv tool upgrade vctx`. Version 0.4 writes
+schema 5 and reads immutable schemas 3, 4, and 5. Schema-5 packs place
+`manifest.json` and direct source lanes at the root, with role-named source files
+beside canonical products. Consumers must follow manifest-relative paths instead
+of reconstructing schema-3 paths. Version 0.3 cannot read schema 5; preserve an old
+pack copy before downgrading.
+
+For normal retention configuration, replace `output.retain_media` with:
+
+```toml
+[output]
+source_assets = "consumed" # or "complete"
+```
+
+`consumed` preserves files acquired by product work. `complete` explicitly admits
+the additional network and storage cost of every audio, video, or native-subtitle
+role reported for the source revision. The hidden `--no-retain-media` option and
+`output.retain_media = false` remain a deprecated compatibility opt-out.
+
+Named ASR instances may still select a model, but `device` and `compute` are no
+longer accepted configuration fields. Use `transforms.asr.quality` for the
+user-visible speed/quality choice. Runtime device, compute mode, threads, and
+batching are selected automatically and recorded in transcript provenance.
+
+A same-revision prepare may extend an existing verified pack and fetch only
+missing roles. A changed source revision requires explicit `--overwrite`; corrupt,
+linked, or ambiguous output is refused rather than trusted as an upgrade base.
 
 ## Commands
 
 Use command-specific `--help` for the exact option grammar.
 
 Closed CLI string values are complete here: `--to` accepts `transcript`,
-`evidence`, or `summary`; `--media-quality` accepts `auto`, `fast`, `balanced`,
+`evidence`, or `summary`; `--asr-quality` accepts `fast`, `balanced`, or `accurate`;
+`--media-quality` accepts `auto`, `fast`, `balanced`,
 or `high`; `render --format` accepts `context`, `read`, or `transcript`; and model
 capabilities are `asr` and `ocr`. Capability selectors have their own complete
 grammar under [Selectors](#selectors).
@@ -65,8 +98,12 @@ Important options:
 | --- | --- |
 | `--to transcript|evidence|summary` | Highest requested product; transcript is default |
 | `--asr`, `--ocr`, `--vision` | Override one capability selector |
+| `--asr-quality fast|balanced|accurate` | Transcript speed/quality intent; balanced is default |
 | `--media-quality auto|fast|balanced|high` | URL visual media policy |
-| `--no-retain-media` | Make output depend on external/cache media |
+| `--source-assets consumed|complete` | Retain used roles or every reported source role |
+| `--max-runtime SECONDS` | Hard 1..86400 second wall-clock limit; expiry exits 124 |
+| `--profile-json FILE` | Stream bounded JSONL phase events to a diagnostic file |
+| `--start SECONDS`, `--end SECONDS` | Transcribe only the selected absolute interval |
 | `--offline` | Deny network routes |
 | `--overwrite` | Refresh/rebuild rather than reuse admitted work |
 | `--cache-dir DIR` | One-run base for `source/` and `models/` |
@@ -79,15 +116,23 @@ Examples:
 ```console
 vctx prepare captions.srt --out pack
 vctx prepare lecture.mp4 --out pack --to evidence
-vctx prepare URL --out pack --to summary --config docs/examples/local-full.toml
+vctx prepare URL --out pack --to summary --max-runtime 1800 --config docs/examples/local-full.toml
 vctx prepare part-1.vtt part-2.vtt --out course
 ```
 
-The default retains source media/subtitles when available. Multiple inputs get
-independent lanes and are never combined into one summary. Updating a verified
-pack adds new lanes, reuses satisfied matching revisions, and replaces only
-changed/upgraded lanes. Publication swaps one complete filesystem generation.
-Unknown or corrupt existing output is refused, including with `--overwrite`.
+The default `consumed` scope retains source media/subtitles acquired by product
+work. `complete` acquires every audio, video, or native-subtitle capability
+reported for the admitted finite revision; one combined representation covers
+audio and video. Multiple inputs get independent lanes and are never combined
+into one summary. Updating a verified pack adds new lanes, reuses satisfied
+matching revisions, and fetches only missing roles when raising a lane to
+complete. A changed revision conflicts unless `--overwrite` is explicit.
+Publication swaps one complete filesystem generation. Unknown or corrupt
+existing output is refused, including with `--overwrite`.
+
+When `--max-runtime` expires, vctx terminates the worker process tree and prints
+the stable `deadline_exceeded` category. A prior complete pack is preserved; an
+interrupted private stage is never published.
 
 Expected negative outcomes may still publish useful partial products. The
 manifest status and per-product outcomes distinguish ready, partial, unavailable,
@@ -139,13 +184,18 @@ in `--help`; observed run facts stay in `manifest.json`.
 ### Models
 
 ```console
-vctx models pull [asr] [ocr] [--json]
+vctx models pull [asr] [ocr] [--refresh] [--max-runtime SECONDS] [--json]
 vctx models status [asr] [ocr] [--json]
 vctx models verify [asr] [ocr] [--json]
+vctx models prune [--incomplete] [--unreferenced] [--dry-run] [--json]
 ```
 
-All accept `--config`, `--cache-dir`, and `--asr`. Pull is the only normal model
-download path. Status reads receipts; verify hashes prepared model contents.
+All accept `--config`, `--cache-dir`, and `--asr`. Pull reuses an exact ready
+model without network or content reads; `--refresh` explicitly downloads again,
+and `--max-runtime` bounds the Hub child. Status reads per-model receipts; verify
+streams model contents and refreshes trusted file facts. Prune removes only
+inactive incomplete workspaces or immutable generations not referenced by any
+valid receipt; `--dry-run` reports the same admitted targets without deletion.
 
 ### Source cache
 
@@ -157,6 +207,9 @@ vctx cache prune [--dry-run] [--age 30d | --all] [--json]
 Both accept `--config` and `--cache-dir`. Plain prune removes orphan blobs and
 temporary files. `--age` retires old records; `--all` retires every record.
 Source-cache commands never touch model storage.
+
+Local, cached, and remote subtitle inputs are limited to 8 MiB of encoded text;
+the source boundary refuses larger input before decoding it.
 
 ### OpenRouter authentication
 
@@ -235,6 +288,7 @@ string is not an enum and is validated by its owning provider or adapter.
 | Field | Type/default | Behavior |
 | --- | --- | --- |
 | `transforms.asr.use` | selector, `auto` | Chooses speech recognition when a usable native subtitle is unavailable. ASR is eligible for every target. |
+| `transforms.asr.quality` | `fast`, `balanced`, or `accurate`; `balanced` | Chooses an already prepared managed model. It never downloads one. |
 | `transforms.asr.enabled` | strict boolean, inferred | Advanced explicit gate. `false` forces `use = "none"`; `true` cannot be combined with `none`. |
 | `evidence.planner.use` | selector, `auto` | Chooses the AI transcript-to-frame-request planner. Eligible for evidence and summary targets. |
 | `evidence.planner.enabled` | strict boolean, inferred | Explicitly gates the planner. |
@@ -247,7 +301,7 @@ string is not an enum and is validated by its owning provider or adapter.
 | `output.projections` | set of `context`, `read`; both | Markdown projections published in every source lane. Canonical JSON remains authoritative. |
 | `output.chunk_max_chars` | integer, `6000` | Maximum transcript characters per canonical chunk. |
 | `output.chunk_max_seconds` | integer or omitted | Optional maximum time span per chunk. Omission disables the time limit. |
-| `output.retain_media` | strict boolean, `true` | Copies admitted media into its source lane for a portable, recognition-friendly pack. CLI `--no-retain-media` disables it once. |
+| `output.source_assets` | `consumed` or `complete`; `consumed` | Retains only assets acquired by requested products, or acquires every source capability reported for the admitted revision. |
 
 Each evidence policy accepts a terse string, for example `ocr = "none"`, or an
 explicit table exposing its `enabled` and `use` fields:
@@ -276,24 +330,16 @@ all stages. A specific `none` remains disabled even when its target is enabled.
 `--asr`, `--ocr`, and `--vision` use the same selector grammar and override the
 selected file. Planner and summary remain config-controlled.
 
-#### ASR instances
+#### Expert ASR compatibility
 
 ```toml
-[instances.asr.local]
-type = "local-faster-whisper"
-model = "small"
-device = "auto"
-compute = "auto"
-cache = "persistent"
+[transforms.asr]
+use = "path:C:/models/faster-whisper-custom"
 ```
 
-| Field | Type/default | Behavior |
-| --- | --- | --- |
-| `type` | required; `local-faster-whisper` | Adapter implementation. No other instance type is currently admitted. |
-| `model` | open string, `small` | faster-whisper model ID or `path:PATH`. It is not an enum; `path:...` is resolved from the config directory. |
-| `device` | `auto`, `cpu`, or `cuda`; `auto` | Inference device selection. |
-| `compute` | open string, `auto` | faster-whisper/CTranslate2 compute type forwarded to the adapter; accepted values depend on the installed runtime and device. |
-| `cache` | `persistent` or `disabled`; `persistent` | Uses managed model storage. `disabled` requires `model` to resolve to an existing local model directory. |
+Named instances and explicit model references remain an expert compatibility path.
+Execution device, compute mode, threading, and batching are selected internally
+and recorded in transcript provenance; they are not configuration surfaces.
 
 #### OpenAI-compatible AI instances
 
@@ -337,6 +383,7 @@ cache base/
     index.sqlite3
     blobs/<sha256>
     tmp/
+      asr/                    # disposable bounded interval inputs
   models/
 ```
 
@@ -351,6 +398,10 @@ output never share mutable file identity. No silent eviction occurs.
 PACK/
   manifest.json
   <source-key>/
+    audio.<ext>            # acquired audio-only representation
+    video.<ext>            # acquired video-only representation
+    media.<ext>            # one combined audio/video representation
+    subtitle.<lang>.<ext>  # acquired native subtitle
     metadata.json
     transcript.json
     chunks.json
@@ -359,13 +410,11 @@ PACK/
     summary.json             # when produced
     context.md               # selected projection
     read.md                  # selected projection
-    subtitle.<lang>.<ext>    # retained when available
-    media.<ext>              # retained when available
-    frames/
-      frame-0001.png         # when captured
+    frames/frame-0001.png    # when captured
 ```
 
-Only `manifest.json` is at the pack root. Each source lane is a direct child.
+Only `manifest.json` and its direct source lanes are at the pack root.
+`manifest.json` is the sole source index; each source path is its stable key.
 Every artifact reference is relative, portable, size/digest indexed, and owned by
 one source. Repeated prepares aggregate independent lanes, not their content.
 
@@ -378,11 +427,13 @@ Closed manifest string values are:
 
 | Field | Values |
 | --- | --- |
-| `schema_version` | `3` |
+| `schema_version` | `5` for new packs; immutable schemas `3` and `4` remain readable |
 | `tool` | `vctx` |
 | manifest/source `status` | `ok`, `partial`, `error` |
 | source `kind` | `url`, `file` |
 | source `freshness` | `immutable`, `observed-online`, `unverified-offline` |
+| source `asset_scope` | `omitted`, `consumed`, `complete` |
+| source `source_capabilities` | a bounded set of `audio`, `video`, `subtitle`, or unknown |
 | outcome `status` | `ready`, `partial`, `unavailable` |
 
 Artifact `kind`, product name, requested target, effect operation/status, model,
@@ -409,6 +460,6 @@ uses manifest/run identity rather than directory naming hints.
 
 ## Stability
 
-Stable surfaces are command behavior, config grammar/precedence, schema-3 pack
+Stable surfaces are command behavior, config grammar/precedence, schema-3/4/5 pack
 layout, canonical product schemas, relative artifact references, and exit
 categories. Internal Python ownership and human-readable prose may evolve.

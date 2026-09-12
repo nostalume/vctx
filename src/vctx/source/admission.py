@@ -7,13 +7,14 @@ from urllib.parse import urlparse
 from vctx.config import YtDlpSourceOptions
 from vctx.errors import CacheError, UnsupportedSourceError
 from vctx.net import NetRuntime
+from vctx.source.bilibili import BilibiliSourceAdapter, bilibili_bvid
 from vctx.source.local import LocalFileSourceAdapter
 from vctx.source.session import ObservePermit, SourceSession
 from vctx.source.store import SourceStore
 from vctx.source.ytdlp import YtDlpSourceAdapter
 
 SourceClaim = Literal["exact", "fallback", "unsupported"]
-SourceSelection = Literal["local-file", "yt-dlp"]
+SourceSelection = Literal["local-file", "bilibili", "yt-dlp"]
 
 
 class SourceAdapter(Protocol):
@@ -29,6 +30,8 @@ class SourceAdapter(Protocol):
 def select_source(value: str) -> SourceSelection:
     if LocalFileSourceAdapter().claim(value) == "exact":
         return "local-file"
+    if bilibili_bvid(value) is not None:
+        return "bilibili"
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return "yt-dlp"
@@ -50,9 +53,13 @@ def open_source(
         cached = store.get(value)
         if cached is not None:
             return cached
-    adapter: SourceAdapter = (
-        LocalFileSourceAdapter() if selection == "local-file" else YtDlpSourceAdapter(net=net)
-    )
+    adapter: SourceAdapter
+    if selection == "local-file":
+        adapter = LocalFileSourceAdapter()
+    elif selection == "bilibili":
+        adapter = BilibiliSourceAdapter(net=net)
+    else:
+        adapter = YtDlpSourceAdapter(net=net)
     session = adapter.observe(value, permit=permit, options=options)
     if store is None or session.record.metadata.source.kind != "url":
         return session

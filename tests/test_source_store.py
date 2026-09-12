@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 import pytest
 
@@ -15,7 +15,6 @@ from vctx.source.session import (
     EffectReceipt,
     MediaAsset,
     MediaPermit,
-    MediaProfile,
     MediaRequest,
     Revision,
     SourceRecord,
@@ -48,28 +47,14 @@ class _Session:
         assert self.media_path is not None
         self.media_calls += 1
         purpose = "asr" if isinstance(request, AsrAudioRequest) else "visual"
-        return _Media(
+        return MediaAsset(
             id=self.record.source_id,
             source=self.record.metadata.source,
             local_path=self.media_path,
-            media_type="audio" if purpose == "asr" else "video",
+            capabilities={"audio"} if purpose == "asr" else {"video"},
             purpose=purpose,
             profile=request.profile if isinstance(request, VisualVideoRequest) else None,
         )
-
-
-@dataclass(frozen=True)
-class _Media:
-    id: str
-    source: SourceRef
-    local_path: Path
-    media_type: Literal["audio", "video", "unknown"]
-    purpose: Literal["input", "asr", "visual"]
-    profile: MediaProfile | None
-    container: str = "webm"
-    duration_seconds: float | None = 10.0
-    format_id: str = "fixture-format"
-    provider: str = "fixture"
 
 
 def _session() -> _Session:
@@ -79,10 +64,7 @@ def _session() -> _Session:
             source_id="example__abc",
             revision=Revision(kind="observed", value="revision"),
             observed_at=datetime(2026, 1, 1, tzinfo=UTC),
-            metadata=VideoMetadata(
-                id="example__abc", source=source, title="Lecture"
-            ),
-            has_subtitles=True,
+            metadata=VideoMetadata(id="example__abc", source=source, title="Lecture"),
         ),
         payload=TranscriptPayload(
             text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n",
@@ -154,7 +136,8 @@ def test_source_store_serializes_concurrent_publication(tmp_path: Path) -> None:
 
 
 def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     store = SourceStore(tmp_path / "source")
     locator = "https://video.example/watch?v=abc"
     session = _session()
@@ -171,16 +154,17 @@ def test_source_store_reuses_exact_media_by_purpose_and_profile_offline(
     )
     cached = store.get(locator)
     assert cached is not None
-    offline_audio = cached.media(
-        request=AsrAudioRequest(), permit=MediaPermit(network="denied")
-    )
+    offline_audio = cached.media(request=AsrAudioRequest(), permit=MediaPermit(network="denied"))
     assert (offline_audio.local_path, offline_audio.purpose) == (audio.local_path, "asr")
 
     reobserved = _session()
     reobserved.record.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    reobserved.record.source_capabilities = {"audio", "video"}
     online_again = store.wrap(locator, cast(SourceSession, reobserved))
     reused = online_again.media(request=AsrAudioRequest(), permit=permit)
     assert (reused.local_path, reobserved.media_calls) == (audio.local_path, 0)
+    refreshed = store.get(locator)
+    assert refreshed is not None and refreshed.record.source_capabilities == {"audio", "video"}
 
     with pytest.raises(OfflineSourceError, match="offline media cache miss"):
         cached.media(
@@ -225,3 +209,24 @@ def test_source_store_prune_refuses_busy_catalog_without_changes(tmp_path: Path)
             store.prune(all_records=True)
 
     assert store.get("source") is not None
+
+
+def test_store_adopts_controlled_media_without_second_full_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = SourceStore(tmp_path / "source")
+    session = _session()
+    session.media_path = store.root / "tmp" / "lease" / "audio.m4a"
+    session.media_path.parent.mkdir(parents=True)
+    session.media_path.write_bytes(b"controlled-media")
+    tracked = store.wrap("source", cast(SourceSession, session))
+    monkeypatch.setattr(
+        SourceStore,
+        "_put_stream",
+        lambda *_args: pytest.fail("controlled media was copied through a second stream"),
+    )
+
+    asset = tracked.media(request=AsrAudioRequest(), permit=MediaPermit(network="allowed"))
+
+    assert asset.local_path.read_bytes() == b"controlled-media"
+    assert not session.media_path.exists()

@@ -132,14 +132,22 @@ def test_merge_does_not_depend_on_window_completion_order() -> None:
         for window in windows
     ]
 
-    forward = PlanLinearizer(
-        index,
-        [WindowDraft(window=window, result=result) for window, result in results],
-    ).build([]).model_dump_json()
-    reverse = PlanLinearizer(
-        index,
-        [WindowDraft(window=window, result=result) for window, result in reversed(results)],
-    ).build([]).model_dump_json()
+    forward = (
+        PlanLinearizer(
+            index,
+            [WindowDraft(window=window, result=result) for window, result in results],
+        )
+        .build([])
+        .model_dump_json()
+    )
+    reverse = (
+        PlanLinearizer(
+            index,
+            [WindowDraft(window=window, result=result) for window, result in reversed(results)],
+        )
+        .build([])
+        .model_dump_json()
+    )
 
     assert forward == reverse
 

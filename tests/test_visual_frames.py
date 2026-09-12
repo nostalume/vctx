@@ -6,8 +6,7 @@ from typing import cast
 
 import pytest
 
-from vctx.source.local import LocalMediaAsset
-from vctx.source.session import SourceRef
+from vctx.source.session import MediaAsset, SourceRef
 from vctx.visual.frame import FrameError, capture
 from vctx.visual.plan import PlannedFrame
 
@@ -17,13 +16,13 @@ pytest.importorskip("av")
 FIXTURE = Path(__file__).parent / "fixtures" / "frame.mp4"
 
 
-def _media(path: Path = FIXTURE) -> LocalMediaAsset:
-    return LocalMediaAsset(
+def _media(path: Path = FIXTURE) -> MediaAsset:
+    return MediaAsset(
         id="media-1",
         source=SourceRef(kind="file", value=str(path)),
         local_path=path,
         container="mp4",
-        media_type="video",
+        capabilities={"video"},
         purpose="visual",
     )
 

@@ -81,9 +81,7 @@ def render_pack(
     return RenderResult(None, target)
 
 
-def _select_source(
-    sources: list[ManifestSource], source_key: str | None
-) -> ManifestSource:
+def _select_source(sources: list[ManifestSource], source_key: str | None) -> ManifestSource:
     if source_key is not None:
         selected = next((source for source in sources if source.key == source_key), None)
         if selected is None:
@@ -104,22 +102,24 @@ def _required_kinds(source: ManifestSource, format: RenderFormat) -> set[str]:
     return kinds | ({"evidence", "summary"} & available)
 
 
-def _frame_links(
-    lane: Path, evidence: Evidence | None, out: Path | None
-) -> dict[str, str]:
+def _frame_links(lane: Path, evidence: Evidence | None, out: Path | None) -> dict[str, str]:
     if evidence is None:
         return {}
     base = out.resolve().parent if out is not None else Path.cwd().resolve()
     return {
-        capture.artifact_path: _relative_link(lane / capture.artifact_path, base)
+        capture.artifact_path: _relative_link(
+            lane / capture.artifact_path, base, allow_absolute=out is None
+        )
         for capture in evidence.captures
     }
 
 
-def _relative_link(target: Path, base: Path) -> str:
+def _relative_link(target: Path, base: Path, *, allow_absolute: bool = False) -> str:
     try:
         relative = os.path.relpath(target.resolve(), start=base)
     except ValueError as exc:
+        if allow_absolute:
+            return quote(target.resolve().as_posix(), safe="/-._~:")
         raise RenderWriteError(
             "render destination cannot express pack assets as relative links"
         ) from exc

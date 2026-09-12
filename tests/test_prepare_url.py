@@ -66,9 +66,7 @@ class ConflictingYoutubeDL(FakeYoutubeDL):
             "duration": duration,
             "webpage_url": value,
             "extractor": "example",
-            "subtitles": {
-                "en": [{"ext": "vtt", "url": "https://cdn.example/shared.vtt"}]
-            },
+            "subtitles": {"en": [{"ext": "vtt", "url": "https://cdn.example/shared.vtt"}]},
             "automatic_captions": {},
         }
 
@@ -133,12 +131,9 @@ def test_prepare_url_with_official_subtitles_writes_full_context_pack(
     }
     assert "manifest-secret" not in json.dumps(manifest)
     assert manifest["status"] == "ok"
-    assert manifest["schema_version"] == "3"
+    assert manifest["schema_version"] == "5"
 
-
-    subtitle_asset = next(
-        item for item in source_entry["artifacts"] if item["kind"] == "subtitle"
-    )
+    subtitle_asset = next(item for item in source_entry["artifacts"] if item["kind"] == "subtitle")
     assert subtitle_asset["kind"] == "subtitle"
     assert subtitle_asset["path"] == "subtitle.en.vtt"
     assert (lane / subtitle_asset["path"]).read_text(encoding="utf-8") == (
@@ -176,15 +171,11 @@ def test_batch_rejects_conflicting_revisions_independently_of_input_order(
     import vctx.app.run as run_module
     import vctx.source.ytdlp as module
 
-    FakeSubtitleRuntime.response_text = (
-        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nShared source.\n"
-    )
+    FakeSubtitleRuntime.response_text = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nShared source.\n"
     monkeypatch.setattr(module._yt_dlp(), "YoutubeDL", ConflictingYoutubeDL)
     monkeypatch.setattr(run_module, "HttpxNetRuntime", FakeSubtitleRuntime)
     local = tmp_path / "independent.srt"
-    local.write_text(
-        "1\n00:00:00,000 --> 00:00:01,000\nIndependent.\n", encoding="utf-8"
-    )
+    local.write_text("1\n00:00:00,000 --> 00:00:01,000\nIndependent.\n", encoding="utf-8")
     out = tmp_path / "out"
 
     result = runner.invoke(

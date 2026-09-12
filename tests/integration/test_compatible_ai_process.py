@@ -16,23 +16,36 @@ class _CompatibleAi(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.calls.append(body)
-        system = " ".join(
-            item["content"] for item in body["messages"] if item["role"] == "system"
-        )
+        system = " ".join(item["content"] for item in body["messages"] if item["role"] == "system")
         value = (
-            {"overview": "Grounded overview", "points": [{
-                "text": "Grounded point", "basis": "transcript",
-                "segment_ids": ["seg_000001"], "capture_ids": [],
-            }]}
+            {
+                "overview": "Grounded overview",
+                "points": [
+                    {
+                        "text": "Grounded point",
+                        "basis": "transcript",
+                        "segment_ids": ["seg_000001"],
+                        "capture_ids": [],
+                    }
+                ],
+            }
             if "Summarize" in system
-            else {"claims": [{
-                "ref": "claim", "kind": "fact", "text": "Grounded claim",
-                "segment_ids": ["seg_000001"],
-            }], "relations": [], "frames": []}
+            else {
+                "claims": [
+                    {
+                        "ref": "claim",
+                        "kind": "fact",
+                        "text": "Grounded claim",
+                        "segment_ids": ["seg_000001"],
+                    }
+                ],
+                "relations": [],
+                "frames": [],
+            }
         )
-        response = json.dumps({
-            "model": "fixture", "choices": [{"message": {"content": json.dumps(value)}}]
-        }).encode()
+        response = json.dumps(
+            {"model": "fixture", "choices": [{"message": {"content": json.dumps(value)}}]}
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
@@ -52,16 +65,30 @@ def test_local_compatible_ai_drives_planner_and_summary_process(tmp_path: Path) 
     source, config, pack = tmp_path / "source.srt", tmp_path / "vctx.toml", tmp_path / "pack"
     source.write_text("1\n00:00:00,000 --> 00:00:01,000\nGround this.\n", encoding="utf-8")
     config.write_text(
-        f'''[evidence]\nplanner="instance:local"\nocr="none"\nvision="none"
+        f"""[evidence]\nplanner="instance:local"\nocr="none"\nvision="none"
 [summary]\nuse="instance:local"
 [instances.ai.local]\nbase_url="http://127.0.0.1:{server.server_port}/v1"
-model="fixture"\nformat="json"\n''', encoding="utf-8",
+model="fixture"\nformat="json"\n""",
+        encoding="utf-8",
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", "from vctx.cli import main;main()", "prepare", str(source),
-             "--out", str(pack), "--to", "summary", "--config", str(config)],
-            capture_output=True, text=True, timeout=30,
+            [
+                sys.executable,
+                "-c",
+                "from vctx.cli import main;main()",
+                "prepare",
+                str(source),
+                "--out",
+                str(pack),
+                "--to",
+                "summary",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
     finally:
         server.shutdown()
@@ -85,9 +112,22 @@ def test_opt_in_real_ai_preserves_grounding(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     result = subprocess.run(
-        [sys.executable, "-c", "from vctx.cli import main;main()", "prepare", str(source),
-         "--out", str(pack), "--to", "summary", "--config", str(config)],
-        capture_output=True, text=True, timeout=120,
+        [
+            sys.executable,
+            "-c",
+            "from vctx.cli import main;main()",
+            "prepare",
+            str(source),
+            "--out",
+            str(pack),
+            "--to",
+            "summary",
+            "--config",
+            str(config),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))

@@ -28,11 +28,15 @@ Smaller installs are available:
 ```console
 uv tool install vctx             # subtitles, URL acquisition, compatible AI
 uv tool install "vctx[asr]"      # core + faster-whisper
+uv tool install "vctx[asr-cuda]" # ASR + project-local CUDA libraries on Windows
 uv tool install "vctx[visual]"   # core + PyAV + RapidOCR
 ```
 
 The equivalent pip command is `python -m pip install "vctx[full]"` inside a
 Python 3.14 environment.
+
+Upgrade an existing tool installation with `uv tool upgrade vctx`. See the
+[changelog](CHANGELOG.md) before upgrading across a minor version.
 
 ## Usage
 
@@ -42,16 +46,28 @@ then render the view needed by a person or agent:
 ```console
 vctx auth openrouter login
 vctx models pull asr ocr
-vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary
+vctx prepare ./lecture.mp4 --out ./lecture-pack --to summary --source-assets complete --max-runtime 1800
 vctx verify ./lecture-pack
 vctx render ./lecture-pack --format read --out ./lecture.md
 ```
+
+On Windows with an NVIDIA GPU, `vctx[full]` includes acceleration. For an ASR-only
+install, use `vctx[asr-cuda]`. vctx selects admitted acceleration automatically and
+falls back to CPU before output is emitted; it does not require `PATH` edits.
 
 `prepare` defaults to `--to transcript`. `--to evidence` adds transcript-anchored
 frame planning and observations; `--to summary` adds a citation-constrained
 summary. The stages are monotonic, so a later target retains all safe earlier
 products. Multiple inputs become independent source directories and are never
 combined into one summary.
+
+Source files live beside their products inside the output lane. The default
+`--source-assets consumed` retains only assets needed by the requested work;
+`--source-assets complete` retains every audio, video, or native-subtitle role
+reported for the admitted source revision. A later complete request extends the
+same verified output, fetching only missing roles while preserving transcript
+quality and existing products. Complete retention can download substantially more
+data; retained files live directly beside their products in the source lane.
 
 For an agent-oriented view:
 
@@ -70,14 +86,7 @@ source_dir = ".cache/vctx/source"
 model_dir = ".cache/vctx/models"
 
 [transforms.asr]
-use = "instance:local"
-
-[instances.asr.local]
-type = "local-faster-whisper"
-model = "small"
-device = "auto"
-compute = "auto"
-cache = "persistent"
+quality = "balanced"
 
 [evidence]
 planner = "auto"
@@ -90,7 +99,6 @@ language = "native"
 
 [output]
 projections = ["context", "read"]
-retain_media = true
 ```
 
 For zero-TOML online planning and summaries, authenticate once with `vctx auth
@@ -109,7 +117,8 @@ vctx doctor --to summary --json
 
 More runnable configurations are under [docs/examples](docs/examples/README.md). The
 complete command behavior, every configuration field, path precedence, pack
-layout, and exit status are documented in [docs/api.md](docs/api.md).
+layout, migration guidance, and exit status are documented in
+[docs/api.md](docs/api.md).
 
 ## Workflow
 
@@ -117,7 +126,7 @@ layout, and exit status are documented in [docs/api.md](docs/api.md).
 INPUT...
   -> admit and acquire each source
   -> transcript -> evidence -> summary
-  -> canonical schema-3 JSON + selected Markdown projections
+  -> canonical schema-5 JSON + selected Markdown projections
   -> atomic PACK publication
   -> verify PACK
   -> render context | read | transcript

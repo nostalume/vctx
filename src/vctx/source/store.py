@@ -19,20 +19,20 @@ from vctx.source.session import (
     EffectReceipt,
     MediaAsset,
     MediaPermit,
-    MediaProfile,
     MediaRequest,
     SourceRecord,
-    SourceRef,
     SourceSession,
     SubtitlePermit,
 )
-from vctx.transcript import TranscriptPayload
+from vctx.transcript import MAX_SUBTITLE_BYTES, TranscriptPayload
 
 _SCHEMA_VERSION = 4
+
 
 class BlobRef(BaseModel):
     sha256: str
     size: int
+
 
 class CacheInventory(BaseModel):
     records: int = 0
@@ -40,6 +40,7 @@ class CacheInventory(BaseModel):
     blobs: int = 0
     temporary: int = 0
     bytes: int = 0
+
 
 class PruneReceipt(BaseModel):
     dry_run: bool
@@ -49,20 +50,6 @@ class PruneReceipt(BaseModel):
     reclaimed_bytes: int
     failures: list[str]
 
-class MediaEntry(BaseModel):
-    id: str
-    source: SourceRef
-    container: str
-    duration_seconds: float | None
-    media_type: Literal["audio", "video", "unknown"]
-    purpose: Literal["input", "asr", "visual"]
-    profile: MediaProfile | None
-    format_id: str
-    provider: str
-
-class StoredMediaAsset(MediaEntry):
-    local_path: Path
-    sha256: str
 
 @dataclass
 class CachedSourceSession:
@@ -71,9 +58,9 @@ class CachedSourceSession:
     store: SourceStore
     record_id: str
     name: str = "source-store"
-    receipts: list[EffectReceipt] = field(default_factory=lambda: [
-        EffectReceipt(operation="observe", status="cache_hit")
-    ])
+    receipts: list[EffectReceipt] = field(
+        default_factory=lambda: [EffectReceipt(operation="observe", status="cache_hit")]
+    )
 
     def transcript(self, *, permit: SubtitlePermit) -> TranscriptPayload:
         del permit
@@ -89,10 +76,9 @@ class CachedSourceSession:
         asset = None if request.refresh else self.store.get_media(self.record_id, request)
         if asset is None:
             raise OfflineSourceError("offline media cache miss")
-        self.receipts.append(
-            _media_receipt(request, status="cache_hit", selected=asset.format_id)
-        )
+        self.receipts.append(_media_receipt(request, status="cache_hit", selected=asset.format_id))
         return asset
+
 
 @dataclass
 class StoredSourceSession:
@@ -132,6 +118,7 @@ class StoredSourceSession:
             if temp.is_relative_to((self.store.root / "tmp").resolve()):
                 temp.unlink(missing_ok=True)
         return stored
+
 
 @dataclass(frozen=True)
 class SourceStore:
@@ -191,7 +178,8 @@ class SourceStore:
                         f"SELECT record_id, body, {column} FROM source_record"
                     ).fetchall()
                     selected_ids = {
-                        key for key, body, used in rows
+                        key
+                        for key, body, used in rows
                         if all_records or (before is not None and _used_at(body, used) < before)
                     }
                     clause, values = "", ()
@@ -199,7 +187,8 @@ class SourceStore:
                         marks = ",".join("?" for _ in selected_ids)
                         clause, values = f" WHERE record_id NOT IN ({marks})", tuple(selected_ids)
                     referenced = {
-                        row[0] for row in connection.execute(
+                        row[0]
+                        for row in connection.execute(
                             f"SELECT DISTINCT digest FROM asset{clause}", values
                         )
                     }
@@ -228,8 +217,12 @@ class SourceStore:
                 except OSError as exc:
                     failures.append(f"{path.name}: {exc}")
         return PruneReceipt(
-            dry_run=dry_run, examined=len(rows) + len(blobs) + len(temporary),
-            selected=selected, removed=removed, reclaimed_bytes=reclaimed, failures=failures
+            dry_run=dry_run,
+            examined=len(rows) + len(blobs) + len(temporary),
+            selected=selected,
+            removed=removed,
+            reclaimed_bytes=reclaimed,
+            failures=failures,
         )
 
     def get(self, locator: str) -> CachedSourceSession | None:
@@ -252,15 +245,18 @@ class SourceStore:
                 ).fetchone()
                 subtitle = None
                 if asset is not None:
+                    if asset[1] > MAX_SUBTITLE_BYTES * 3:
+                        raise CacheError("cached subtitle envelope exceeds byte limit")
                     subtitle = TranscriptPayload.model_validate_json(
                         self._verified_blob(*asset).read_bytes()
                     )
                 cached = CachedSourceSession(
                     record=record, subtitle=subtitle, store=self, record_id=record_id
                 )
-            with suppress(OSError, sqlite3.Error), sqlite3.connect(
-                self.database, timeout=0.05
-            ) as connection:
+            with (
+                suppress(OSError, sqlite3.Error),
+                sqlite3.connect(self.database, timeout=0.05) as connection,
+            ):
                 connection.execute(
                     "UPDATE source_record SET last_used_at=? WHERE record_id=?",
                     (datetime.now(UTC).isoformat(), record_id),
@@ -276,7 +272,8 @@ class SourceStore:
             with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO source_record(record_id, body, last_used_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(record_id) DO UPDATE SET last_used_at=excluded.last_used_at",
+                    "ON CONFLICT(record_id) DO UPDATE SET "
+                    "body=excluded.body, last_used_at=excluded.last_used_at",
                     (record_id, body.decode(), datetime.now(UTC).isoformat()),
                 )
                 connection.execute(
@@ -304,7 +301,7 @@ class SourceStore:
             raise CacheError(f"source asset publication failed: {exc}") from exc
         return blob
 
-    def get_media(self, record_id: str, request: MediaRequest) -> StoredMediaAsset | None:
+    def get_media(self, record_id: str, request: MediaRequest) -> MediaAsset | None:
         if not self.database.is_file():
             return None
         try:
@@ -320,31 +317,22 @@ class SourceStore:
                     return None
                 digest, size, body = row
                 path = self._verified_blob(digest, size)
-                entry = MediaEntry.model_validate_json(body)
-                return StoredMediaAsset(**entry.model_dump(), local_path=path, sha256=digest)
+                values = json.loads(body)
+                return MediaAsset.model_validate({**values, "local_path": path, "sha256": digest})
         except (OSError, sqlite3.Error, ValueError) as exc:
             raise CacheError(f"invalid source media cache: {exc}") from exc
 
     def put_media(
         self, record: SourceRecord, request: MediaRequest, asset: MediaAsset
-    ) -> StoredMediaAsset:
+    ) -> MediaAsset:
         purpose = "asr" if request.kind == "asr_audio" else "visual"
         if asset.purpose != purpose:
             raise CacheError("media purpose does not match its request")
         try:
             blob = self._put_path(asset.local_path)
             record_id = _record_id(record)
-            entry = MediaEntry(
-                id=asset.id,
-                source=asset.source,
-                container=asset.container,
-                duration_seconds=asset.duration_seconds,
-                media_type=asset.media_type,
-                purpose=asset.purpose,
-                profile=asset.profile,
-                format_id=asset.format_id,
-                provider=asset.provider,
-            )
+            entry = _admit_media_asset(asset)
+            body = entry.model_dump(mode="json", exclude={"local_path", "sha256"})
             with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO asset(record_id, kind, digest, size, body) "
@@ -355,13 +343,14 @@ class SourceStore:
                         _media_key(request),
                         blob.sha256,
                         blob.size,
-                        _canonical_json(entry).decode(),
+                        json.dumps(body, sort_keys=True, separators=(",", ":")),
                     ),
                 )
-            return StoredMediaAsset(
-                **entry.model_dump(),
-                local_path=self.root / "blobs" / blob.sha256,
-                sha256=blob.sha256,
+            return entry.model_copy(
+                update={
+                    "local_path": self.root / "blobs" / blob.sha256,
+                    "sha256": blob.sha256,
+                }
             )
         except (OSError, sqlite3.Error) as exc:
             raise CacheError(f"source media publication failed: {exc}") from exc
@@ -382,6 +371,18 @@ class SourceStore:
     def _put_path(self, source: Path) -> BlobRef:
         if not source.is_file():
             raise CacheError(f"media asset is missing: {source}")
+        controlled = source.resolve().is_relative_to((self.root / "tmp").resolve())
+        if controlled and not source.is_symlink() and source.stat().st_nlink == 1:
+            digest = _file_digest(source)
+            size = source.stat().st_size
+            destination = self.root / "blobs" / digest
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                source.unlink()
+            else:
+                os.replace(source, destination)
+            self._remember_verified(digest, destination)
+            return BlobRef(sha256=digest, size=size)
         with source.open("rb") as reader:
             return self._put_stream(reader)
 
@@ -464,9 +465,11 @@ class SourceStore:
                 ).fetchone()
         except sqlite3.OperationalError:
             return False
-        return row is not None and row[:2] == (stat.st_size, stat.st_mtime_ns) and tuple(
-            map(str, row[2:])
-        ) == (str(stat.st_dev), str(stat.st_ino))
+        return (
+            row is not None
+            and row[:2] == (stat.st_size, stat.st_mtime_ns)
+            and tuple(map(str, row[2:])) == (str(stat.st_dev), str(stat.st_ino))
+        )
 
     def _remember_verified(self, digest: str, path: Path) -> None:
         stat = path.stat()
@@ -478,15 +481,19 @@ class SourceStore:
                 (digest, stat.st_size, stat.st_mtime_ns, str(stat.st_dev), str(stat.st_ino)),
             )
 
+
 def _canonical_json(model: BaseModel) -> bytes:
     return json.dumps(model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+
 
 def _digest(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
+
 def _record_id(record: SourceRecord) -> str:
     identity = {"source_id": record.source_id, "revision": record.revision.model_dump(mode="json")}
     return _digest(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
+
 
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
@@ -495,8 +502,15 @@ def _file_digest(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
+
 def _media_key(request: MediaRequest) -> str:
     return "media:asr" if request.kind == "asr_audio" else f"media:visual:{request.profile}"
+
+
+def _admit_media_asset(asset: MediaAsset) -> MediaAsset:
+    capabilities = {value for value in asset.capabilities if value in {"audio", "video"}}
+    return asset.model_copy(update={"capabilities": capabilities})
+
 
 def _media_receipt(
     request: MediaRequest,
@@ -512,6 +526,7 @@ def _media_receipt(
         requested_policy=requested,
         selected_policy=selected,
     )
+
 
 def _owned_files(
     root: Path, name: str, *, recursive: bool = False, digests: bool = False
@@ -538,6 +553,8 @@ def _owned_files(
     if invalid_digest:
         raise CacheError(f"invalid source blob name under: {directory}")
     return files
+
+
 def _used_at(body: str, last_used: str | None) -> datetime:
     if last_used:
         return datetime.fromisoformat(last_used)

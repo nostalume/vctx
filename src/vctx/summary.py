@@ -47,7 +47,9 @@ class DraftPoint(ClosedModel):
     @model_validator(mode="after")
     def basis_matches_citations(self) -> DraftPoint:
         expected = {
-            (True, False): "transcript", (False, True): "visual", (True, True): "mixed"
+            (True, False): "transcript",
+            (False, True): "visual",
+            (True, True): "mixed",
         }.get((bool(self.segment_ids), bool(self.capture_ids)))
         if expected is None or self.basis != expected:
             raise ValueError("summary point basis must match its original citations")
@@ -117,7 +119,8 @@ class SummaryPacket(ClosedModel):
         ]
         capture_claims = (
             {capture.id: set(capture.claim_ids) for capture in evidence.captures}
-            if evidence is not None else {}
+            if evidence is not None
+            else {}
         )
         claims = [
             PacketClaim(
@@ -180,9 +183,7 @@ class SummaryPacket(ClosedModel):
                 if unknown:
                     raise ValueError(f"summary point cites unknown {label}: {min(unknown)}")
             points.append(
-                SummaryPoint(
-                    id=f"point-{position:04d}", **point.model_dump(exclude={"id"})
-                )
+                SummaryPoint(id=f"point-{position:04d}", **point.model_dump(exclude={"id"}))
             )
         covered_segments = sorted(
             {item for point in points for item in point.segment_ids}, key=segment_order.__getitem__
@@ -257,7 +258,8 @@ class SummaryWriter:
         split = packet.split()
         if split is None:
             return SummaryOutcome(
-                status="unavailable", omissions=["summary input exceeds provider context"],
+                status="unavailable",
+                omissions=["summary input exceeds provider context"],
                 receipts=receipts,
             )
         queue = deque(split)
@@ -267,9 +269,7 @@ class SummaryWriter:
         while queue:
             part = queue.popleft()
             group += 1
-            outcome = self._call(
-                part.model_dump_json(), language, f"summary-group-{group:04d}"
-            )
+            outcome = self._call(part.model_dump_json(), language, f"summary-group-{group:04d}")
             receipts.append(outcome.receipt)
             if outcome.kind == "ok":
                 try:
@@ -318,9 +318,7 @@ class SummaryWriter:
             complete=False,
         )
 
-    def _call(
-        self, body: str, language: str, request_id: str, *, reduction: bool = False
-    ):
+    def _call(self, body: str, language: str, request_id: str, *, reduction: bool = False):
         return self.client.complete(
             task="summary",
             request_id=request_id,
@@ -347,9 +345,7 @@ class SummaryWriter:
                 complete=complete,
             )
         except ValueError as exc:
-            return SummaryOutcome(
-                status="unavailable", omissions=[str(exc)], receipts=receipts
-            )
+            return SummaryOutcome(status="unavailable", omissions=[str(exc)], receipts=receipts)
         status = "ready" if summary.coverage.status == "complete" else "partial"
         return SummaryOutcome(
             status=status, summary=summary, omissions=summary.coverage.omissions, receipts=receipts

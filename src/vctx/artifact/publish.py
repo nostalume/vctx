@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from vctx.artifact.manifest import ArtifactRef, Manifest, ManifestSource
+from vctx.artifact.manifest import ArtifactRef, Manifest, ManifestSource, schema_five_source
 from vctx.errors import OutputExistsError
 
 
@@ -58,8 +58,11 @@ class PackPublisher:
             raise OutputExistsError(f"unsafe source lane: {key}")
         self._discard(lane)
 
-    def rollback_lane(self, key: str) -> None:
-        self.reset_lane(key)
+    def hydrate_lane(self, source: ManifestSource) -> ManifestSource:
+        projected = schema_five_source(source)
+        self.reset_lane(projected.key)
+        self._copy_lane(self.target / source.path, self.stage / projected.path, source, projected)
+        return projected
 
     def commit(self, manifest: Manifest) -> None:
         self._write_marker(state="ready", current=manifest)
@@ -118,17 +121,49 @@ class PackPublisher:
         self.marker.unlink(missing_ok=True)
 
     def _complete_stage(self, manifest: Manifest) -> None:
+        previous_by_key = (
+            {source.key: source for source in self.previous.sources}
+            if self.previous is not None
+            else {}
+        )
         for source in manifest.sources:
             lane = self.stage / source.path
             if lane.exists():
                 continue
-            previous = self.backup / source.path
+            prior = previous_by_key.get(source.key)
+            previous = self.backup / (prior.path if prior is not None else source.path)
             if not previous.is_dir() or _linked(previous):
                 raise OutputExistsError(f"prior source lane is unavailable: {source.key}")
+            projected = prior is not None and (
+                prior.path != source.path
+                or [item.path for item in prior.artifacts]
+                != [item.path for item in source.artifacts]
+            )
+            if projected:
+                self._copy_lane(previous, lane, prior, source)
+                continue
             try:
+                lane.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(previous, lane)
             except OSError:
+                lane.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(previous, lane, copy_function=shutil.copy2)
+
+    @staticmethod
+    def _copy_lane(origin: Path, lane: Path, old: ManifestSource, new: ManifestSource) -> None:
+        if len(old.artifacts) != len(new.artifacts) or _linked(origin):
+            raise OutputExistsError(f"prior source lane is unavailable: {old.key}")
+        try:
+            lane.mkdir(parents=True)
+            for before, after in zip(old.artifacts, new.artifacts, strict=True):
+                source = origin / before.path
+                target = lane / after.path
+                if _linked(source) or not source.is_file():
+                    raise OutputExistsError(f"prior source artifact is unavailable: {before.path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        except OSError as exc:
+            raise OutputExistsError(f"prior source lane cannot be copied: {old.key}") from exc
 
     def _restore_previous(self, container: Path) -> None:
         try:
@@ -138,6 +173,8 @@ class PackPublisher:
             for source in previous.sources:
                 destination = self.backup / source.path
                 candidate = container / source.path
+                if not candidate.exists():
+                    candidate = container / "sources" / source.key
                 if not destination.exists() and candidate.is_dir() and not _linked(candidate):
                     os.replace(candidate, destination)
             self._discard(container)
@@ -171,7 +208,6 @@ class PackPublisher:
 
 
 def open_pack(root: Path) -> Manifest:
-    """Open a structurally safe schema-3 pack without reading artifact bytes."""
     manifest_path = root / "manifest.json"
     try:
         if _linked(root) or _linked(manifest_path) or not manifest_path.is_file():
@@ -198,7 +234,6 @@ def open_pack(root: Path) -> Manifest:
 
 
 def verify_required(root: Path, source_key: str, kinds: set[str]) -> dict[str, Any]:
-    """Verify and decode only requested products and their typed dependencies."""
     manifest = open_pack(root)
     source = next((item for item in manifest.sources if item.key == source_key), None)
     if source is None:
@@ -241,12 +276,20 @@ def verify_required(root: Path, source_key: str, kinds: set[str]) -> dict[str, A
 
 
 def verify_pack(root: Path) -> VerificationReport:
-    """Verify every listed byte, every known product, and the complete file tree."""
     try:
         manifest = open_pack(root)
-        expected_root = {"manifest.json", *(source.path for source in manifest.sources)}
+        expected_root = (
+            {"manifest.json", "sources"}
+            if manifest.schema_version == "4"
+            else {"manifest.json", *(source.path for source in manifest.sources)}
+        )
         if {entry.name for entry in root.iterdir()} != expected_root:
             raise ValueError("pack root contains unlisted or missing entries")
+        if manifest.schema_version == "4":
+            indexed = {source.key for source in manifest.sources}
+            actual = {entry.name for entry in (root / "sources").iterdir()}
+            if actual != indexed:
+                raise ValueError("pack sources directory contains unlisted or missing lanes")
         unchecked: set[str] = set()
         for source in manifest.sources:
             _verify_complete_lane(root / source.path, source)
@@ -279,14 +322,15 @@ def _read_artifact(lane: Path, ref: ArtifactRef, *, decode: bool) -> Any:
     path = lane / Path(ref.path)
     if _linked(path) or not path.is_file() or path.stat().st_nlink != 1:
         raise ValueError("source artifact is missing or linked")
-    if path.stat().st_size != ref.bytes or _hash_file(path) != ref.sha256:
+    digest, prefix = _hash_file(path)
+    if path.stat().st_size != ref.bytes or digest != ref.sha256:
         raise ValueError(f"source artifact failed integrity verification: {ref.path}")
     if not decode:
         return None
     if ref.kind in {"context", "read"}:
         return path.read_text(encoding="utf-8")
     if ref.kind == "visual_frame":
-        if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+        if prefix != b"\x89PNG\r\n\x1a\n":
             raise ValueError("visual frame is not a PNG")
         return ref.path
     loaders: dict[str, type[BaseModel]] = _json_loaders()
@@ -341,9 +385,11 @@ def _validate_relations(
         if summary.source_id != transcript.source_id:
             raise ValueError("summary belongs to another transcript")
         segments = {segment.id for segment in transcript.segments}
-        captures = {
-            capture.id for capture in loaded.get("evidence", ()).captures
-        } if "evidence" in loaded else set()
+        captures = (
+            {capture.id for capture in loaded.get("evidence", ()).captures}
+            if "evidence" in loaded
+            else set()
+        )
         for point in summary.points:
             if not set(point.segment_ids) <= segments or not set(point.capture_ids) <= captures:
                 raise ValueError("summary citation does not resolve to canonical products")
@@ -376,16 +422,19 @@ def _verify_complete_lane(lane: Path, source: ManifestSource) -> None:
         )
 
 
-def _hash_file(path: Path) -> str:
+def _hash_file(path: Path) -> tuple[str, bytes]:
     digest = hashlib.sha256()
+    prefix = b""
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if not prefix:
+                prefix = block[:8]
             digest.update(block)
-    return digest.hexdigest()
+    return digest.hexdigest(), prefix
 
 
 def _pack_error(root: Path, exc: Exception) -> OutputExistsError:
-    return OutputExistsError(f"output is not a verified vctx schema-3 pack: {root} ({exc})")
+    return OutputExistsError(f"output is not a verified vctx schema-3/4/5 pack: {root} ({exc})")
 
 
 def _linked(path: Path) -> bool:

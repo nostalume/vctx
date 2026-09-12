@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from vctx.transcript import TranscriptPayload
 
 type MediaProfile = Literal["auto", "fast", "balanced", "high"]
+
 
 class SourceRef(BaseModel):
     kind: Literal["url", "file"]
@@ -25,24 +27,34 @@ class VideoMetadata(BaseModel):
     extractor: str | None = None
     raw_provider: str | None = None
 
+
 type SourceId = str
+type SourceCapability = Literal["audio", "video", "subtitle"]
+
+
 class Revision(BaseModel):
     kind: Literal["immutable", "observed"]
     value: str
+
+
 class SourceRecord(BaseModel):
     source_id: SourceId
     revision: Revision
     observed_at: datetime
     metadata: VideoMetadata
     lifecycle: Literal["finite", "live", "upcoming"] = "finite"
-    has_subtitles: bool = False
-    has_media: bool = False
+    source_capabilities: set[SourceCapability] | None = None
+
 
 class ObservePermit(BaseModel):
     operation: Literal["prepare", "metadata"]
     network: Literal["allowed", "denied"]
+
+
 class SubtitlePermit(BaseModel):
     network: Literal["allowed", "denied"]
+
+
 class MediaPermit(BaseModel):
     network: Literal["allowed", "denied"]
 
@@ -63,17 +75,36 @@ class VisualVideoRequest(BaseModel):
 type MediaRequest = AsrAudioRequest | VisualVideoRequest
 
 
-class MediaAsset(Protocol):
+class MediaAsset(BaseModel):
     id: str
     source: SourceRef
     local_path: Path
-    container: str
-    duration_seconds: float | None
-    media_type: Literal["audio", "video", "unknown"]
-    purpose: Literal["input", "asr", "visual"]
-    profile: MediaProfile | None
-    format_id: str
-    provider: str
+    container: str = "unknown"
+    duration_seconds: float | None = None
+    purpose: Literal["input", "asr", "visual"] = "input"
+    profile: MediaProfile | None = None
+    format_id: str = "unknown"
+    provider: str = "unknown"
+    capabilities: set[Literal["audio", "video"]] = Field(default_factory=set)
+    sha256: str | None = None
+
+
+@dataclass
+class MediaRegistry:
+    assets: dict[str, MediaAsset] = field(default_factory=dict)
+
+    def find(self, request: MediaRequest) -> MediaAsset | None:
+        capability = "audio" if request.kind == "asr_audio" else "video"
+        exact = self.assets.get("asr" if request.kind == "asr_audio" else "visual")
+        if exact is not None and capability in exact.capabilities:
+            return exact
+        return next(
+            (asset for asset in self.assets.values() if capability in asset.capabilities), None
+        )
+
+    def adopt(self, asset: MediaAsset) -> MediaAsset:
+        self.assets[asset.purpose] = asset
+        return asset
 
 
 class EffectReceipt(BaseModel):

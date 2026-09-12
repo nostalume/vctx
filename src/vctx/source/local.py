@@ -6,24 +6,28 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
-
 from vctx.config import YtDlpSourceOptions
 from vctx.errors import NoTranscriptError
 from vctx.source.session import (
     EffectReceipt,
     MediaAsset,
     MediaPermit,
-    MediaProfile,
     MediaRequest,
     ObservePermit,
     Revision,
+    SourceCapability,
     SourceRecord,
     SourceRef,
     SubtitlePermit,
     VideoMetadata,
 )
-from vctx.transcript import TranscriptPayload, TranscriptProvenance, UnknownLanguage
+from vctx.transcript import (
+    MAX_SUBTITLE_BYTES,
+    TranscriptPayload,
+    TranscriptProvenance,
+    UnknownLanguage,
+    decode_subtitle,
+)
 
 SUPPORTED_TRANSCRIPT_SUFFIXES: dict[str, Literal["srt", "vtt"]] = {".srt": "srt", ".vtt": "vtt"}
 SUPPORTED_MEDIA_SUFFIXES = {".wav", ".mp3", ".m4a", ".mp4", ".webm"}
@@ -37,19 +41,6 @@ def _file_digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-class LocalMediaAsset(BaseModel):
-    id: str
-    source: SourceRef
-    local_path: Path
-    container: str = "unknown"
-    duration_seconds: float | None = None
-    media_type: Literal["audio", "video", "unknown"] = "unknown"
-    purpose: Literal["input", "asr", "visual"] = "input"
-    profile: MediaProfile | None = None
-    format_id: str = "local"
-    provider: str = "local-file"
 
 
 @dataclass
@@ -67,9 +58,10 @@ class LocalFileSession:
                 EffectReceipt(operation="subtitle", status="failed", purpose="transcript")
             )
             raise NoTranscriptError("no transcript found for media input")
-        original = self.path.read_bytes()
+        with self.path.open("rb") as stream:
+            original = stream.read(MAX_SUBTITLE_BYTES + 1)
         payload = TranscriptPayload(
-            text=original.decode("utf-8"),
+            text=decode_subtitle(original),
             original_bytes=original,
             format=fmt,
             provenance=TranscriptProvenance(
@@ -95,17 +87,19 @@ class LocalFileSession:
         if suffix not in SUPPORTED_MEDIA_SUFFIXES:
             self.receipts.append(EffectReceipt(operation="media", status="failed", purpose="input"))
             raise NoTranscriptError("no media found for input")
-        media_type: Literal["audio", "video", "unknown"] = "unknown"
-        if suffix in AUDIO_SUFFIXES:
-            media_type = "audio"
-        elif suffix in VIDEO_SUFFIXES:
-            media_type = "video"
-        asset = LocalMediaAsset(
+        capabilities: set[Literal["audio", "video"]] = (
+            {"audio"} if suffix in AUDIO_SUFFIXES else {"audio", "video"}
+        )
+        asset = MediaAsset(
             id=f"local__{self.path.stem}",
             source=SourceRef(kind="file", value=str(self.path)),
             local_path=self.path,
-            media_type=media_type,
             container=suffix.removeprefix("."),
+            purpose="input",
+            profile=None,
+            format_id="local",
+            provider="local-file",
+            capabilities=capabilities,
         )
         self.receipts.append(
             EffectReceipt(
@@ -138,6 +132,14 @@ class LocalFileSourceAdapter:
             title=path.stem,
             raw_provider="local-file",
         )
+        suffix = path.suffix.lower()
+        capabilities: set[SourceCapability] = (
+            {"subtitle"}
+            if suffix in SUPPORTED_TRANSCRIPT_SUFFIXES
+            else {"audio"}
+            if suffix in AUDIO_SUFFIXES
+            else {"audio", "video"}
+        )
         return LocalFileSession(
             path=path,
             record=SourceRecord(
@@ -145,8 +147,7 @@ class LocalFileSourceAdapter:
                 revision=Revision(kind="immutable", value=_file_digest(path)),
                 observed_at=datetime.now(UTC),
                 metadata=metadata,
-                has_subtitles=path.suffix.lower() in SUPPORTED_TRANSCRIPT_SUFFIXES,
-                has_media=path.suffix.lower() in SUPPORTED_MEDIA_SUFFIXES,
+                source_capabilities=capabilities,
             ),
             receipts=[EffectReceipt(operation="observe", status="succeeded")],
         )

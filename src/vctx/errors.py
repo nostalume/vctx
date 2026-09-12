@@ -46,8 +46,18 @@ class ProviderError(VctxError):
     exit_code = 7
 
 
+class SourceAssetsError(VctxError):
+    def __init__(self, cause: VctxError) -> None:
+        super().__init__(f"complete source assets unavailable: {cause}")
+        self.exit_code = cause.exit_code
+
+
 class OperationCancelledError(VctxError):
     exit_code = 130
+
+
+class DeadlineExceededError(VctxError):
+    exit_code = 124
 
 
 class EmptyChunksError(VctxError):
